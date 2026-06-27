@@ -2,7 +2,9 @@
 #define LWIPOPTS_H_
 
 // ─── lwIP configuration for SideTNFS ─────────────────────────────────────────
-// Bare-metal (no RTOS). DHCP for IP. UDP only (TNFS uses UDP port 16384).
+// Bare-metal (no RTOS).  DHCP for IP assignment.
+// UDP is the production protocol (TNFS uses UDP port 16384).
+// TCP + DNS are enabled for the debug HTTP connectivity test.
 
 #define NO_SYS                      1
 #define LWIP_SOCKET                 0
@@ -10,8 +12,9 @@
 
 // Memory
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    4000
-#define PBUF_POOL_SIZE              12
+#define MEM_SIZE                    8000
+#define PBUF_POOL_SIZE              24
+#define MEMP_NUM_ARP_QUEUE          4
 
 // Protocols
 #define LWIP_ARP                    1
@@ -20,9 +23,20 @@
 #define LWIP_DHCP                   1
 #define LWIP_IPV4                   1
 #define LWIP_UDP                    1
-#define LWIP_TCP                    0
-#define LWIP_DNS                    0
+#define LWIP_TCP                    1
+#define LWIP_DNS                    1
 #define LWIP_RAW                    0
+
+// TCP sizing — standard Pico W values; only actively used by the debug HTTP test
+#define TCP_MSS                     1460
+#define TCP_WND                     (8 * TCP_MSS)
+#define TCP_SND_BUF                 (8 * TCP_MSS)
+#define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
+#define MEMP_NUM_TCP_SEG            32
+
+// DNS
+#define DNS_TABLE_SIZE              4
+#define DNS_MAX_SERVERS             2
 
 // Callbacks used by the CYW43 driver
 #define LWIP_NETIF_STATUS_CALLBACK  1

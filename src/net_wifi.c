@@ -1,5 +1,6 @@
 #include "include/net_wifi.h"
 #include "include/debug.h"
+#include "include/net_test.h"
 #include "wifi_config.h"
 
 #include <stdio.h>
@@ -53,6 +54,9 @@ void net_wifi_poll(void)
             LOG("[WiFi] Connected, IP: %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
         else
             LOG("[WiFi] Connected (IP not yet assigned)\n");
+#ifdef SIDETNFS_DEBUG
+        net_test_start();
+#endif
         return;
     }
 

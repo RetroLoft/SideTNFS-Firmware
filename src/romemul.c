@@ -19,7 +19,7 @@ static int init_monitor_rom3(PIO pio)
 {
     uint offsetMonitorROM3 = pio_add_program(pio, &monitor_rom3_program);
     uint smMonitorROM3 = pio_claim_unused_sm(pio, true);
-    monitor_rom4_program_init(pio, smMonitorROM3, offsetMonitorROM3, SAMPLE_DIV_FREQ);
+    monitor_rom3_program_init(pio, smMonitorROM3, offsetMonitorROM3, SAMPLE_DIV_FREQ);
     pio_sm_set_enabled(pio, smMonitorROM3, true);
     DPRINTF("ROM3 signal monitor initialized.\n");
     return smMonitorROM3;

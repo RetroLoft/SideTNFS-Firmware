@@ -33,6 +33,7 @@ add_executable(sidetnfs
     src/gemdrvemul.c
     src/fs_memory.c
     src/net_wifi.c
+    src/net_test.c
     src/firmware/firmware_gemdrvemul.c
 )
 

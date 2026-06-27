@@ -5,44 +5,35 @@
 
 int main(void)
 {
-    // Overclock to 225 MHz at 1.10 V for reliable ROM bus timing
-    set_sys_clock_khz(RP2040_CLOCK_FREQ_KHZ, true);
+    // Voltage must be raised before the clock, not after.
     vreg_set_voltage(RP2040_VOLTAGE);
+    set_sys_clock_khz(RP2040_CLOCK_FREQ_KHZ, true);
 
+#ifdef SIDETNFS_DEBUG
     stdio_init_all();
     setvbuf(stdout, NULL, _IONBF, 1);
-#ifdef SIDETNFS_DEBUG
     // Give USB host up to 3 s to enumerate; proceed regardless.
-    // Skipped in production builds so the ROM emulator starts immediately.
     for (int i = 0; i < 30 && !stdio_usb_connected(); i++)
         sleep_ms(100);
+    LOG("SIDETNFS booting...\n");
 #endif
 
-    LOG("SIDETNFS booting...\n");
-
-    // Init CYW43 (required on Pico W to access board GPIO, and for WiFi)
-    if (cyw43_arch_init())
-    {
-        LOG("cyw43_arch_init failed\n");
-        return -1;
-    }
-
-    // Start async WiFi connection — returns immediately, runs in background IRQ.
-    // GEMDRIVE C: works regardless of whether WiFi succeeds.
-    net_wifi_start();
-
-    // Copy the 68k GEMDRIVE driver firmware to ROM_IN_RAM (ROM4 bank)
+    // ROM emulator must be live before anything else so the Atari never
+    // sees an empty cartridge slot, regardless of WiFi outcome.
     COPY_FIRMWARE_TO_RAM((uint16_t *)gemdrvemulROM, gemdrvemulROM_length);
-
-    // Initialise the protocol parser (allocates payload buffer)
     init_protocol_parser();
-
-    // Start ROM emulator: PIO + DMA chain + IRQ handler for ROM3 commands
     init_romemul(NULL, gemdrvemul_dma_irq_handler_lookup_callback, false);
 
-    LOG("ROM emulator running. Entering GEMDRIVE loop.\n");
+    LOG("ROM emulator running. Starting WiFi...\n");
 
-    // Enter the GEMDRIVE command dispatch loop — never returns
+    // WiFi is best-effort: C: keeps working even if CYW43 init fails.
+    if (cyw43_arch_init()) {
+        LOG("cyw43_arch_init failed — continuing without WiFi\n");
+    } else {
+        net_wifi_start();
+    }
+
+    // Enter the GEMDRIVE command dispatch loop — never returns.
     init_gemdrvemul();
 
     return 0;
