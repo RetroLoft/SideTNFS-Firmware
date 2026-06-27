@@ -44,10 +44,13 @@ target_include_directories(sidetnfs PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+# -DSIDETNFS_DEBUG=ON  → USB serial, all LOG()/DPRINTF() output, 3-s USB wait (default)
+# -DSIDETNFS_DEBUG=OFF → no USB, no logging, ROM emulator starts immediately
+option(SIDETNFS_DEBUG        "Enable USB serial, debug logging, USB enumeration wait" ON)
 option(DIAGNOSTIC_PASSTHROUGH "Patch 68k handler to bypass exec_trapped_handler (pure pass-through)" OFF)
 
 target_compile_definitions(sidetnfs PRIVATE
-    _DEBUG=1
+    $<$<BOOL:${SIDETNFS_DEBUG}>:SIDETNFS_DEBUG=1>
     $<$<BOOL:${DIAGNOSTIC_PASSTHROUGH}>:DIAGNOSTIC_PASSTHROUGH=1>
 )
 
@@ -62,7 +65,11 @@ target_link_libraries(sidetnfs
 
 pico_set_linker_script(sidetnfs ${CMAKE_CURRENT_SOURCE_DIR}/memmap_sidetnfs.ld)
 
-pico_enable_stdio_usb(sidetnfs 1)
+if(SIDETNFS_DEBUG)
+    pico_enable_stdio_usb(sidetnfs 1)
+else()
+    pico_enable_stdio_usb(sidetnfs 0)
+endif()
 pico_enable_stdio_uart(sidetnfs 0)
 
 pico_add_extra_outputs(sidetnfs)

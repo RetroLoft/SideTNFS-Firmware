@@ -1,4 +1,5 @@
 #include "include/net_wifi.h"
+#include "include/debug.h"
 #include "wifi_config.h"
 
 #include <stdio.h>
@@ -22,11 +23,11 @@ static uint32_t wifi_last_poll   = 0;
 
 void net_wifi_start(void)
 {
-    printf("[WiFi] Starting (SSID: %s)...\n", WIFI_SSID);
+    LOG("[WiFi] Starting (SSID: %s)...\n", WIFI_SSID);
     cyw43_arch_enable_sta_mode();
     int err = cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
     if (err) {
-        printf("[WiFi] Failed to start connection (err=%d)\n", err);
+        LOG("[WiFi] Failed to start connection (err=%d)\n", err);
         wifi_done = true;
         return;
     }
@@ -49,22 +50,22 @@ void net_wifi_poll(void)
         wifi_done = true;
         struct netif *n = netif_list;
         if (n)
-            printf("[WiFi] Connected, IP: %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
+            LOG("[WiFi] Connected, IP: %s\n", ip4addr_ntoa(netif_ip4_addr(n)));
         else
-            printf("[WiFi] Connected (IP not yet assigned)\n");
+            LOG("[WiFi] Connected (IP not yet assigned)\n");
         return;
     }
 
     if (status < 0) {
         wifi_done = true;
-        printf("[WiFi] Failed (status=%d) — continuing with memory backend\n", status);
+        LOG("[WiFi] Failed (status=%d) — continuing with memory backend\n", status);
         return;
     }
 
     // Still trying — check timeout
     if (now - wifi_start_ms >= WIFI_TIMEOUT_MS) {
         wifi_done = true;
-        printf("[WiFi] Timeout after %d s — continuing with memory backend\n",
+        LOG("[WiFi] Timeout after %d s — continuing with memory backend\n",
                WIFI_TIMEOUT_MS / 1000);
     }
 }

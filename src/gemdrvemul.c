@@ -218,7 +218,7 @@ void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void)
 
 void init_gemdrvemul(void)
 {
-    printf("SIDETNFS GEMDRIVE emulator starting (M2 backend interface)\n");
+    LOG("SIDETNFS GEMDRIVE emulator starting (M2 backend interface)\n");
 
     dpath_string[0] = '\\';
     dpath_string[1] = '\0';
@@ -255,7 +255,7 @@ void init_gemdrvemul(void)
 #ifdef DIAGNOSTIC_PASSTHROUGH
     *((volatile uint16_t *)(code + 0x0806)) = 0x4E71;
     *((volatile uint16_t *)(code + 0x0828)) = 0x4E71;
-    printf("DIAGNOSTIC: gemdrive_trap patched → pure pass-through (both variants)\n");
+    LOG("DIAGNOSTIC: gemdrive_trap patched → pure pass-through (both variants)\n");
 #endif
 
     static uint32_t seed_counter = 1;
@@ -273,13 +273,13 @@ void init_gemdrvemul(void)
         if (cmd == 0xFFFF)
             continue;
 
-        printf("[DISPATCH] 0x%04x\n", cmd);
+        LOG("[DISPATCH] 0x%04x\n", cmd);
         switch (cmd)
         {
         // ── Handshake ──────────────────────────────────────────────────────
         case GEMDRVEMUL_PING:
         {
-            printf("[CMD] PING\n");
+            LOG("[CMD] PING\n");
             *((volatile uint16_t *)(mem + GEMDRVEMUL_PING_STATUS)) = 0x1;
             write_random_token(mem);
             active_command_id = 0xFFFF;
@@ -301,14 +301,14 @@ void init_gemdrvemul(void)
             payloadPtr += 2;
             uint32_t xbra_addr = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             uint32_t xbra_offset = xbra_addr - ATARI_ROM4_START_ADDRESS;
-            printf("[CMD] SAVE_VECTORS: raw_old=0x%08lx xbra_atari=0x%08lx offset=0x%04lx\n",
+            LOG("[CMD] SAVE_VECTORS: raw_old=0x%08lx xbra_atari=0x%08lx offset=0x%04lx\n",
                    (unsigned long)old_addr, (unsigned long)xbra_addr, (unsigned long)xbra_offset);
             if (xbra_offset < 0x10000) {
                 *((volatile uint16_t *)(code + xbra_offset))     = old_addr & 0xFFFF;
                 *((volatile uint16_t *)(code + xbra_offset + 2)) = old_addr >> 16;
-                printf("[CMD] SAVE_VECTORS: old_handler patched at ROM4+0x%04lx\n", (unsigned long)xbra_offset);
+                LOG("[CMD] SAVE_VECTORS: old_handler patched at ROM4+0x%04lx\n", (unsigned long)xbra_offset);
             } else {
-                printf("[CMD] SAVE_VECTORS: ERROR xbra_offset 0x%04lx out of ROM4 range!\n", (unsigned long)xbra_offset);
+                LOG("[CMD] SAVE_VECTORS: ERROR xbra_offset 0x%04lx out of ROM4 range!\n", (unsigned long)xbra_offset);
             }
             write_random_token(mem);
             active_command_id = 0xFFFF;
@@ -320,7 +320,7 @@ void init_gemdrvemul(void)
             uint32_t xbios_old = ((uint32_t)payloadPtr[0] << 16) | payloadPtr[1];
             *((volatile uint16_t *)(mem + GEMDRVEMUL_OLD_XBIOS_TRAP))     = xbios_old & 0xFFFF;
             *((volatile uint16_t *)(mem + GEMDRVEMUL_OLD_XBIOS_TRAP + 2)) = xbios_old >> 16;
-            printf("[CMD] SAVE_XBIOS_VECTOR %08lx\n", (unsigned long)xbios_old);
+            LOG("[CMD] SAVE_XBIOS_VECTOR %08lx\n", (unsigned long)xbios_old);
             write_random_token(mem);
             active_command_id = 0xFFFF;
             break;
@@ -328,7 +328,7 @@ void init_gemdrvemul(void)
 
         case GEMDRVEMUL_SHOW_VECTOR_CALL:
         {
-            printf("[CMD] SHOW_VECTOR_CALL %04x\n", (uint16_t)payloadPtr[0]);
+            LOG("[CMD] SHOW_VECTOR_CALL %04x\n", (uint16_t)payloadPtr[0]);
             write_random_token(mem);
             active_command_id = 0xFFFF;
             break;
@@ -337,7 +337,7 @@ void init_gemdrvemul(void)
         // ── Reentry guards ─────────────────────────────────────────────────
         case GEMDRVEMUL_REENTRY_LOCK:
         {
-            printf("[CHKPT] REENTRY_LOCK → handler entered, GEMDOS vector OK\n");
+            LOG("[CHKPT] REENTRY_LOCK → handler entered, GEMDOS vector OK\n");
             *((volatile uint16_t *)(mem + GEMDRVEMUL_REENTRY_TRAP)) = 0xFFFF;
             write_random_token(mem);
             active_command_id = 0xFFFF;
@@ -346,7 +346,7 @@ void init_gemdrvemul(void)
 
         case GEMDRVEMUL_REENTRY_UNLOCK:
         {
-            printf("[CHKPT] REENTRY_UNLOCK\n");
+            LOG("[CHKPT] REENTRY_UNLOCK\n");
             *((volatile uint16_t *)(mem + GEMDRVEMUL_REENTRY_TRAP)) = 0x0;
             write_random_token(mem);
             active_command_id = 0xFFFF;
@@ -376,7 +376,7 @@ void init_gemdrvemul(void)
             payloadPtr += 2;
             uint32_t val = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             set_shared_var(idx, val, mem);
-            printf("[CMD] SET_SHARED_VAR[%lu]=0x%08lx\n", (unsigned long)idx, (unsigned long)val);
+            LOG("[CMD] SET_SHARED_VAR[%lu]=0x%08lx\n", (unsigned long)idx, (unsigned long)val);
             write_random_token(mem);
             active_command_id = 0xFFFF;
             break;
@@ -421,9 +421,9 @@ void init_gemdrvemul(void)
 
         case GEMDRVEMUL_DSETPATH_CALL:
         {
-            printf("[DSETPATH_RAW psize=%u]", payload_size_received);
-            for (int _i = 0; _i < 20; _i++) printf(" %04x", payloadPtr[_i]);
-            printf("\n");
+            LOG("[DSETPATH_RAW psize=%u]", payload_size_received);
+            for (int _i = 0; _i < 20; _i++) LOG(" %04x", payloadPtr[_i]);
+            LOG("\n");
             payloadPtr += 6;
             char new_path[MAX_FOLDER_LENGTH] = {0};
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, new_path, MAX_FOLDER_LENGTH);
@@ -559,9 +559,9 @@ void init_gemdrvemul(void)
         // ── File open/close/seek/read ──────────────────────────────────────
         case GEMDRVEMUL_FOPEN_CALL:
         {
-            printf("[FOPEN_RAW psize=%u]", payload_size_received);
-            for (int _i = 0; _i < 20; _i++) printf(" %04x", payloadPtr[_i]);
-            printf("\n");
+            LOG("[FOPEN_RAW psize=%u]", payload_size_received);
+            for (int _i = 0; _i < 20; _i++) LOG(" %04x", payloadPtr[_i]);
+            LOG("\n");
             uint16_t mode = payloadPtr[0];
             payloadPtr += 6;  // skip mode + 5 address/padding words
             char filename[MAX_FOLDER_LENGTH] = {0};
@@ -752,9 +752,9 @@ void init_gemdrvemul(void)
 
         case GEMDRVEMUL_PEXEC_CALL:
         {
-            printf("[PEXEC_RAW psize=%u]", payload_size_received);
-            for (int _i = 0; _i < 10; _i++) printf(" %04x", payloadPtr[_i]);
-            printf("\n");
+            LOG("[PEXEC_RAW psize=%u]", payload_size_received);
+            for (int _i = 0; _i < 10; _i++) LOG(" %04x", payloadPtr[_i]);
+            LOG("\n");
             // WRITE_AND_SWAP_LONGWORD swaps the two 16-bit words before storing,
             // so the 68k reads back the original value. The ROM checks
             // CMPI.W #0, $FB4184 (reads the HIGH WORD of PEXEC_MODE).
@@ -767,7 +767,7 @@ void init_gemdrvemul(void)
         }
 
         default:
-            printf("[CMD] Unhandled cmd 0x%04x — clearing\n", cmd);
+            LOG("[CMD] Unhandled cmd 0x%04x — clearing\n", cmd);
             write_random_token(mem);
             active_command_id = 0xFFFF;
             break;
