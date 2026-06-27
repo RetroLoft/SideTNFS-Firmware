@@ -1,6 +1,7 @@
 #include "include/gemdrvemul.h"
 #include "include/fs_backend.h"
 #include "include/net_wifi.h"
+#include "include/net_test.h"
 
 // ─── Atari GEMDRIVE protocol layer ───────────────────────────────────────────
 //   Handles the ROM3 command/response protocol with the Atari 68k firmware.
@@ -264,6 +265,19 @@ void init_gemdrvemul(void)
     {
         *((volatile uint32_t *)(mem + GEMDRVEMUL_RANDOM_TOKEN_SEED)) = ++seed_counter;
         tight_loop_contents();
+
+#ifdef SIDETNFS_DEBUG
+        // Banner printed once on the first loop iteration.  By this point the
+        // GEMDRIVE loop is running and USB is accepting data, so these lines
+        // will always be visible even if the terminal was opened after boot.
+        static bool banner_shown = false;
+        if (!banner_shown) {
+            banner_shown = true;
+            LOG("--- SIDETNFS GEMDRIVE ready, C: active ---\n");
+            net_wifi_log_status();
+            net_test_log_result();
+        }
+#endif
 
         // Check WiFi status once per second; logs connect/fail/timeout.
         // No-op after WiFi is resolved (connected or failed).

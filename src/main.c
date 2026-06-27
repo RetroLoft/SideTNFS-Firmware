@@ -15,6 +15,9 @@ int main(void)
     // Give USB host up to 3 s to enumerate; proceed regardless.
     for (int i = 0; i < 30 && !stdio_usb_connected(); i++)
         sleep_ms(100);
+    // Brief extra settle — USB CDC may signal connected before the host terminal
+    // has fully opened the port and is ready to receive characters.
+    sleep_ms(500);
     LOG("SIDETNFS booting...\n");
 #endif
 

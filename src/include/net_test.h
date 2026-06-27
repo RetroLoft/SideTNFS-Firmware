@@ -8,6 +8,8 @@
 
 #ifdef SIDETNFS_DEBUG
 void net_test_start(void);
+// Log the most recent test result unconditionally (replays last known state).
+void net_test_log_result(void);
 #endif
 
 #endif // NET_TEST_H_

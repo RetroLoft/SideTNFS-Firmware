@@ -21,4 +21,9 @@ void net_wifi_start(void);
 // Safe to call on every iteration of the GEMDRIVE command loop.
 void net_wifi_poll(void);
 
+// Log the most recent WiFi status line unconditionally.
+// Safe to call at any time; replays the last known state.
+// Useful for the GEMDRIVE startup banner (USB may not have been ready earlier).
+void net_wifi_log_status(void);
+
 #endif // NET_WIFI_H_
