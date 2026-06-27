@@ -31,6 +31,7 @@ add_executable(sidetnfs
     src/tprotocol.c
     src/romemul.c
     src/gemdrvemul.c
+    src/fs_memory.c
     src/firmware/firmware_gemdrvemul.c
 )
 
