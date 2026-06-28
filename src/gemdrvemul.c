@@ -2,6 +2,8 @@
 #include "include/fs_backend.h"
 #include "include/net_wifi.h"
 #include "include/net_test.h"
+#include "include/net_udp_test.h"
+#include "include/tnfs_test.h"
 
 // ─── Atari GEMDRIVE protocol layer ───────────────────────────────────────────
 //   Handles the ROM3 command/response protocol with the Atari 68k firmware.
@@ -92,6 +94,39 @@ static void split_fspec(const char *fspec, char *dir, char *pattern)
         dir[0] = '\\'; dir[1] = '\0';
         str_upper(fspec, pattern, MAX_FOLDER_LENGTH);
     }
+}
+
+// ── Atari string extraction ───────────────────────────────────────────────────
+
+// The 68k sends strings big-endian over a 16-bit bus; each uint16_t in the Pico
+// SRAM has its bytes byte-swapped relative to ASCII order.  This helper unpacks
+// word by word, stops at the first NUL byte, and always NUL-terminates dst.
+// max_words: hard upper bound on source words to read (payload safety bound).
+static void copy_atari_str(const uint16_t *src, int max_words,
+                            char *dst, int dst_size)
+{
+    int out = 0;
+    for (int w = 0; w < max_words; w++) {
+        char hi = (char)((src[w] >> 8) & 0xFF);
+        char lo = (char)(src[w] & 0xFF);
+        if (hi == '\0' || out >= dst_size - 1) break;
+        dst[out++] = hi;
+        if (lo == '\0' || out >= dst_size - 1) break;
+        dst[out++] = lo;
+    }
+    dst[out] = '\0';
+}
+
+// Words consumed before the string argument in every string-bearing command:
+// handle_protocol_command skips 2 words (random token), then each handler
+// advances payloadPtr by 6 words of header fields.  Total = 8.
+#define CMD_STR_OFFSET_WORDS 8
+
+static inline int str_max_words(uint16_t psize)
+{
+    int avail = (int)(psize / 2) - CMD_STR_OFFSET_WORDS;
+    if (avail <= 0) return 0;
+    return avail < MAX_FOLDER_LENGTH / 2 ? avail : MAX_FOLDER_LENGTH / 2;
 }
 
 // ── DTA slot management ───────────────────────────────────────────────────────
@@ -282,6 +317,8 @@ void init_gemdrvemul(void)
                     LOG("--- SIDETNFS GEMDRIVE ready, C: active ---\n");
                     net_wifi_log_status();
                     net_test_log_result();
+                    net_udp_test_log_result();
+                    tnfs_test_log_result();
                 }
                 prev_usb = cur_usb;
             }
@@ -291,6 +328,8 @@ void init_gemdrvemul(void)
         // Check WiFi status once per second; logs connect/fail/timeout.
         // No-op after WiFi is resolved (connected or failed).
         net_wifi_poll();
+        net_udp_test_poll();
+        tnfs_test_poll();
 
         uint16_t cmd = active_command_id;
         if (cmd == 0xFFFF)
@@ -449,7 +488,8 @@ void init_gemdrvemul(void)
             LOG("\n");
             payloadPtr += 6;
             char new_path[MAX_FOLDER_LENGTH] = {0};
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, new_path, MAX_FOLDER_LENGTH);
+            copy_atari_str(payloadPtr, str_max_words(payload_size_received),
+                           new_path, sizeof(new_path));
             DPRINTF("DSETPATH: %s\n", new_path);
 
             if (new_path[1] == ':') memmove(new_path, new_path + 2, strlen(new_path) - 1);
@@ -503,13 +543,18 @@ void init_gemdrvemul(void)
         // ── Directory search ───────────────────────────────────────────────
         case GEMDRVEMUL_FSFIRST_CALL:
         {
+            LOG("[FSFIRST_RAW psize=%u]", payload_size_received);
+            for (int _i = 0; _i < 20 && _i < (int)(payload_size_received / 2); _i++)
+                LOG(" %04x", payloadPtr[_i]);
+            LOG("\n");
             uint32_t ndta    = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             payloadPtr += 2;
             uint32_t attribs = payloadPtr[0];
             payloadPtr += 2;
             payloadPtr += 2;  // fspec Atari address — skip
             char raw_fspec[MAX_FOLDER_LENGTH] = {0};
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, raw_fspec, MAX_FOLDER_LENGTH);
+            copy_atari_str(payloadPtr, str_max_words(payload_size_received),
+                           raw_fspec, sizeof(raw_fspec));
             DPRINTF("FSFIRST ndta=%08x attribs=%04x fspec=%s\n", ndta, attribs, raw_fspec);
 
             char fspec[MAX_FOLDER_LENGTH];
@@ -588,7 +633,8 @@ void init_gemdrvemul(void)
             uint16_t mode = payloadPtr[0];
             payloadPtr += 6;  // skip mode + 5 address/padding words
             char filename[MAX_FOLDER_LENGTH] = {0};
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, filename, MAX_FOLDER_LENGTH);
+            copy_atari_str(payloadPtr, str_max_words(payload_size_received),
+                           filename, sizeof(filename));
             DPRINTF("FOPEN mode=%d file=%s\n", mode, filename);
 
             // Strip drive letter and leading path separator
@@ -696,7 +742,8 @@ void init_gemdrvemul(void)
             uint16_t flag = payloadPtr[0];
             payloadPtr += 6;
             char filename[MAX_FOLDER_LENGTH] = {0};
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, filename, MAX_FOLDER_LENGTH);
+            copy_atari_str(payloadPtr, str_max_words(payload_size_received),
+                           filename, sizeof(filename));
             char *fptr = filename;
             if (fptr[1] == ':') fptr += 2;
             if (*fptr == '\\' || *fptr == '/') fptr++;
@@ -719,7 +766,8 @@ void init_gemdrvemul(void)
             uint16_t flag = payloadPtr[0];
             payloadPtr += 6;
             char filename[MAX_FOLDER_LENGTH] = {0};
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, filename, MAX_FOLDER_LENGTH);
+            copy_atari_str(payloadPtr, str_max_words(payload_size_received),
+                           filename, sizeof(filename));
             char *fptr = filename;
             if (fptr[1] == ':') fptr += 2;
             if (*fptr == '\\' || *fptr == '/') fptr++;

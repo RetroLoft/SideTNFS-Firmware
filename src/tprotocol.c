@@ -78,7 +78,7 @@ void terminate_protocol_parser()
     }
 }
 
-inline void __not_in_flash_func(process_command)(ProtocolCallback callback)
+static void __not_in_flash_func(process_command)(ProtocolCallback callback)
 {
 #if defined(_DEBUG) && (_DEBUG != 0) && defined(SHOW_COMMANDS) && (SHOW_COMMANDS != 0)
     DPRINTF("COMMAND: %d / PAYLOAD SIZE: %d / PAYLOAD: ", transmission.command_id, transmission.payload_size);
