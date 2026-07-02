@@ -40,13 +40,21 @@ bool fs_list_dir(const char *dir, const char *pat, int index, FsEntry *out);
 // Returns true and fills *out on success.
 bool fs_stat(const char *path, FsEntry *out);
 
-// Open path (no drive letter, no leading backslash) for reading.
+// Open an existing file. mode: 0=read-only, 1=write-only, 2=read-write.
 // On failure sets *gemdos_err to a GEMDOS error code and returns NULL.
-FsHandle *fs_open(const char *path, int16_t *gemdos_err);
+FsHandle *fs_open(const char *path, uint16_t mode, int16_t *gemdos_err);
+
+// Create a new file (or truncate an existing one) and open it for writing.
+// On failure sets *gemdos_err and returns NULL.
+FsHandle *fs_create(const char *path, int16_t *gemdos_err);
 
 // Read up to len bytes into buf from the current file position.
 // Returns the number of bytes actually read (0 = EOF).
 uint32_t fs_read(FsHandle *h, void *buf, uint32_t len);
+
+// Write up to len bytes from buf at the current file position.
+// Returns the number of bytes actually written.
+uint32_t fs_write(FsHandle *h, const void *buf, uint32_t len);
 
 // Seek within an open file.  whence: 0 = SET, 1 = CUR, 2 = END.
 // Returns the new byte offset on success, or a negative GEMDOS error code.
@@ -54,5 +62,20 @@ int32_t fs_seek(FsHandle *h, int32_t offset, int whence);
 
 // Close handle and release any resources held by the backend.
 void fs_close(FsHandle *h);
+
+// Delete a file. Returns GEMDOS_EOK or a GEMDOS error code.
+int16_t fs_unlink(const char *path);
+
+// Create a directory. Returns GEMDOS_EOK or a GEMDOS error code.
+int16_t fs_mkdir(const char *path);
+
+// Remove an empty directory. Returns GEMDOS_EOK or a GEMDOS error code.
+int16_t fs_rmdir(const char *path);
+
+// Rename or move a file or directory. Returns GEMDOS_EOK or a GEMDOS error code.
+int16_t fs_rename(const char *old_path, const char *new_path);
+
+// Returns true when the handle was opened for writing (needed by FCLOSE cache logic).
+bool fs_handle_writable(const FsHandle *h);
 
 #endif // FS_BACKEND_H_

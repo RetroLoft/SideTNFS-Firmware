@@ -33,6 +33,7 @@ add_executable(sidetnfs
     src/tprotocol.c
     src/romemul.c
     src/gemdrvemul.c
+    src/log_event.c
     src/net_wifi.c
     src/net_test.c
     src/net_udp_test.c

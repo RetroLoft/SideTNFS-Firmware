@@ -1,8 +1,6 @@
 #ifndef TNFS_CLIENT_H_
 #define TNFS_CLIENT_H_
 
-#ifdef SIDETNFS_DEBUG
-
 #include <stdint.h>
 #include <stdbool.h>
 #include "lwip/ip_addr.h"
@@ -25,10 +23,24 @@
 #define TNFS_CMD_CLOSEDIR      0x12u
 #define TNFS_CMD_OPENDIRX      0x17u   // extended opendir: returns count + handle
 #define TNFS_CMD_READDIRX      0x18u   // extended readdir: returns flags + size + name per entry
-#define TNFS_CMD_STAT          0x24u
-#define TNFS_CMD_OPEN          0x29u
 #define TNFS_CMD_READ          0x21u
+#define TNFS_CMD_WRITE         0x22u
 #define TNFS_CMD_CLOSE         0x23u
+#define TNFS_CMD_STAT          0x24u
+#define TNFS_CMD_LSEEK         0x25u
+#define TNFS_CMD_UNLINK        0x26u
+#define TNFS_CMD_RMDIR         0x27u
+#define TNFS_CMD_MKDIR         0x28u
+#define TNFS_CMD_OPEN          0x29u
+#define TNFS_CMD_RENAME        0x2Au
+
+// TNFS open flags (used in OPEN request bytes [4-5])
+#define TNFS_O_RDONLY          0x0001u  // open for reading only
+#define TNFS_O_WRONLY          0x0002u  // open for writing only
+#define TNFS_O_RDWR            0x0003u  // open for reading and writing
+#define TNFS_O_CREAT           0x0100u  // create file if it does not exist
+#define TNFS_O_TRUNC           0x0200u  // truncate to zero length on open
+#define TNFS_MODE_0644         0x01A4u  // rw-r--r-- (UNIX mode for new files)
 
 // Result codes
 #define TNFS_OK                0x00u
@@ -59,5 +71,4 @@ bool     tnfs_client_send(const uint8_t *buf, uint16_t len);
 // Clears the pending flag — a second call returns 0 until a new packet arrives.
 uint16_t tnfs_client_recv(uint8_t *dst, uint16_t max_len);
 
-#endif // SIDETNFS_DEBUG
 #endif // TNFS_CLIENT_H_

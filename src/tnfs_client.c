@@ -1,7 +1,5 @@
 #include "include/tnfs_client.h"
 
-#ifdef SIDETNFS_DEBUG
-
 #include <string.h>
 #include "pico/cyw43_arch.h"
 #include "lwip/udp.h"
@@ -17,8 +15,10 @@ static void recv_cb(void *arg, struct udp_pcb *pcb,
 {
     (void)arg; (void)pcb; (void)addr; (void)port;
     if (!p) return;
-    uint16_t n = p->len < TNFS_MTU ? p->len : TNFS_MTU;
-    memcpy(s_rx_buf, p->payload, n);
+    // Use tot_len (full chain) and pbuf_copy_partial so fragmented pbufs are
+    // handled correctly; p->len is only the first segment.
+    uint16_t n = p->tot_len < TNFS_MTU ? (uint16_t)p->tot_len : (uint16_t)TNFS_MTU;
+    pbuf_copy_partial(p, s_rx_buf, n, 0);
     s_rx_len = n;
     s_rx_rdy = true;
     pbuf_free(p);
@@ -63,4 +63,3 @@ uint16_t tnfs_client_recv(uint8_t *dst, uint16_t max_len)
     return n;
 }
 
-#endif // SIDETNFS_DEBUG
