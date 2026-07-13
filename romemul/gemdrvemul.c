@@ -578,6 +578,14 @@ static void __not_in_flash_func(get_local_full_pathname)(char *tmp_filepath)
     DPRINTF("tmp_filepath: %s\n", tmp_filepath);
 }
 
+// Thin naming wrapper around get_local_full_pathname(). Kept local to this file
+// because the wrapped function reads its input implicitly from the file-scope
+// globals payloadPtr/dpath_string/hd_folder, not from a parameter.
+static void __not_in_flash_func(scfs_get_local_full_pathname)(char *tmp_filepath)
+{
+    get_local_full_pathname(tmp_filepath);
+}
+
 // Delete all the file descriptors in the list using delete all files by fdesc
 static void __not_in_flash_func(delete_all_files)(FileDescriptors **head)
 {
@@ -1391,7 +1399,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
-            get_local_full_pathname(tmp_pathname);
+            scfs_get_local_full_pathname(tmp_pathname);
             DPRINTF("Folder to create: %s\n", tmp_pathname);
 
             // Check if the folder exists. If not, return an error
@@ -1425,7 +1433,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
-            get_local_full_pathname(tmp_pathname);
+            scfs_get_local_full_pathname(tmp_pathname);
             DPRINTF("Folder to delete: %s\n", tmp_pathname);
 
             // Check if the folder exists. If not, return an error
