@@ -186,3 +186,21 @@ Server tcpdump output:
   - difference expected because `DEBUG.TXT` exists only on SD.
 - Mega STE hardware test passed.
 - GEMDRIVE backend unchanged.
+
+## Fase 5K — TNFS READDIRX entry normalization
+
+- Added first TNFS READDIRX entry to Atari/GEMDOS entry translator.
+- Added strict 8.3-only name validator.
+- Long names are skipped for now.
+- Lowercase names are skipped for now.
+- Dotfiles, AppleDouble files and special entries are skipped.
+- TNFS directory flag maps to `FS_ST_FOLDER`.
+- TNFS hidden flag maps to `FS_ST_HIDDEN`.
+- Read-only/system/archive are not available from READDIRX and are left unset.
+- Directory sizes are forced to 0.
+- Date/time are currently placeholder 0/0.
+- Translator is exercised only by the existing OPENDIRX/READDIRX root probe.
+- `DEBUG.TXT` shows short translate status line.
+- Mega STE hardware test passed.
+- GEMDRIVE backend unchanged.
+- Fsfirst/Fsnext/DTA unchanged.

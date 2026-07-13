@@ -9,6 +9,7 @@
 #define SIDETNFS_PROBE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Fase 5B: create a UDP PCB and udp_connect() it to the TNFS server, then
 // immediately remove it again. Sends no payload at all -- udp_connect() is a
@@ -68,5 +69,36 @@ void sidetnfs_mark_network_skipped(void);
 // directory calls, so no new blocking-risk class is introduced. Never
 // retries, never logs, silently does nothing on any failure.
 void sidetnfs_scan_sd_root_if_needed(const char *hd_folder);
+
+// Fase 5K: a TNFS OPENDIRX/READDIRX entry normalized into Atari/GEMDOS form.
+// 8.3 names only for now -- see sidetnfs_is_supported_83_name(). No
+// long-name<->short-name mapping table exists yet, so anything that isn't
+// already a valid 8.3 name is skipped rather than shortened.
+typedef struct
+{
+    char name[14];  // 8.3 name + NUL (matches the DTA d_fname convention)
+    uint8_t attr;   // Atari/GEMDOS attribute bits (FS_ST_*)
+    uint32_t size;  // file size; directories forced to 0
+    uint16_t date;  // DOS/GEMDOS date -- fixed placeholder for now, see report
+    uint16_t time;  // DOS/GEMDOS time -- fixed placeholder for now, see report
+    bool valid;     // true if out was actually filled in
+    bool skipped;   // true if this entry was intentionally skipped
+} SidetnfsAtariDirEntry;
+
+// Fase 5K: strict, uppercase-only 8.3 name check. Rejects anything that
+// isn't already a valid "NAME" or "NAME.EXT" GEMDOS-compatible name
+// (lowercase, long names, multiple dots, spaces, path separators, FAT-
+// invalid characters, ".", "..", and leading-dot/AppleDouble names are all
+// rejected). No malloc, no I/O.
+bool sidetnfs_is_supported_83_name(const char *name);
+
+// Fase 5K: convert one TNFS OPENDIRX/READDIRX entry into Atari/GEMDOS form.
+// Returns true and fills *out (valid=true) on success; returns false and
+// sets out->skipped=true (rest zeroed) if the entry is intentionally not
+// representable yet (unsupported name, or the TNFS "special" flag). Pure
+// RAM-to-RAM conversion -- no I/O, no network, no blocking.
+bool sidetnfs_normalize_dir_entry(const char *tnfs_name, uint8_t tnfs_flags,
+                                   uint32_t tnfs_size, uint32_t tnfs_mtime,
+                                   SidetnfsAtariDirEntry *out);
 
 #endif // SIDETNFS_PROBE_H

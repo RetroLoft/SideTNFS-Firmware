@@ -14,6 +14,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/ip_addr.h"
 #include "f_util.h"
+#include "include/filesys.h" // FS_ST_* Atari attribute bits
 
 #define SIDETNFS_SERVER_IP "192.168.178.10"
 #define SIDETNFS_SERVER_PORT 16384
@@ -86,6 +87,12 @@ typedef struct
     uint16_t readdirx_count_files;
     uint16_t readdirx_count_total;
     uint16_t readdirx_rounds;
+
+    // Fase 5K: how many raw READDIRX entries were successfully normalized
+    // into Atari/GEMDOS 8.3 form vs. intentionally skipped (unsupported
+    // name, or TNFS "special" flag).
+    uint16_t translate_ok_count;
+    uint16_t translate_skipped_count;
 
     bool sd_scan_done;
     uint16_t sd_scan_count_dirs;
@@ -167,6 +174,111 @@ void sidetnfs_send_udp_probe(void)
     cyw43_arch_lwip_end();
 }
 
+// Fase 5K: strict, uppercase-only 8.3 name check -- see sidetnfs_probe.h.
+bool sidetnfs_is_supported_83_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0')
+    {
+        return false;
+    }
+    if (name[0] == '.')
+    {
+        // Rejects ".", "..", AppleDouble "._*" and Linux/macOS dotfiles
+        // (e.g. ".DS_Store") in one go.
+        return false;
+    }
+
+    size_t len = strlen(name);
+    size_t dot_count = 0;
+    size_t dot_pos = 0;
+    for (size_t i = 0; i < len; i++)
+    {
+        char c = name[i];
+        if (c == '.')
+        {
+            dot_count++;
+            dot_pos = i;
+            continue;
+        }
+        if ((unsigned char)c < 32)
+        {
+            return false;
+        }
+        if (c == ' ' || c == '/' || c == '\\' ||
+            c == '<' || c == '>' || c == ':' || c == '"' || c == '|' || c == '?' || c == '*')
+        {
+            return false; // FAT/GEMDOS-invalid characters
+        }
+        if (c >= 'a' && c <= 'z')
+        {
+            return false; // lowercase unsupported for now -- see report
+        }
+    }
+    if (dot_count > 1)
+    {
+        return false; // only one "NAME.EXT"-style dot allowed
+    }
+
+    size_t base_len = (dot_count == 1) ? dot_pos : len;
+    size_t ext_len = (dot_count == 1) ? (len - dot_pos - 1) : 0;
+
+    if (base_len == 0 || base_len > 8)
+    {
+        return false;
+    }
+    if (dot_count == 1 && (ext_len == 0 || ext_len > 3))
+    {
+        return false; // reject trailing-dot ("NAME.") and overlong extensions
+    }
+
+    return true;
+}
+
+// Fase 5K: convert one TNFS entry to Atari/GEMDOS form -- see sidetnfs_probe.h.
+bool sidetnfs_normalize_dir_entry(const char *tnfs_name, uint8_t tnfs_flags,
+                                   uint32_t tnfs_size, uint32_t tnfs_mtime,
+                                   SidetnfsAtariDirEntry *out)
+{
+    (void)tnfs_mtime; // Fase 5K: real epoch->DOS conversion deferred, see report
+    memset(out, 0, sizeof(*out));
+
+    if (tnfs_flags & TNFS_DIRENTRY_SPECIAL)
+    {
+        out->skipped = true;
+        return false;
+    }
+    if (!sidetnfs_is_supported_83_name(tnfs_name))
+    {
+        out->skipped = true;
+        return false;
+    }
+
+    strncpy(out->name, tnfs_name, sizeof(out->name) - 1);
+    out->name[sizeof(out->name) - 1] = '\0';
+
+    bool is_dir = (tnfs_flags & TNFS_DIRENTRY_DIR) != 0;
+    out->attr = 0;
+    if (is_dir)
+    {
+        out->attr |= FS_ST_FOLDER;
+    }
+    if (tnfs_flags & TNFS_DIRENTRY_HIDDEN)
+    {
+        out->attr |= FS_ST_HIDDEN;
+    }
+    // Read-only/system bits are not available from TNFS READDIRX -> left
+    // off. Archive bit also left off (documented choice, see report).
+
+    out->size = is_dir ? 0 : tnfs_size;
+
+    // Fixed placeholder date/time -- see report/SIDETNFS_PROGRESS.md.
+    out->date = 0;
+    out->time = 0;
+
+    out->valid = true;
+    return true;
+}
+
 // Parse one READDIRX response's entries (flags(1)+size(4)+mtime(4)+ctime(4)
 // +name(null-term) each), counting dirs vs files. Only touches RAM. Mirrors
 // the byte layout of a previously hardware-tested standalone implementation.
@@ -180,6 +292,8 @@ static void parse_readdirx_entries(const uint8_t *buf, uint16_t n, uint8_t batch
             break;
         }
         uint8_t flags = buf[needle];
+        uint32_t size = (uint32_t)buf[needle + 1] | ((uint32_t)buf[needle + 2] << 8) |
+                        ((uint32_t)buf[needle + 3] << 16) | ((uint32_t)buf[needle + 4] << 24);
         const char *name = (const char *)&buf[needle + 13];
         uint16_t avail = (uint16_t)(n - (needle + 13));
         size_t nlen = strnlen(name, avail);
@@ -188,6 +302,19 @@ static void parse_readdirx_entries(const uint8_t *buf, uint16_t n, uint8_t batch
             break; // name not null-terminated within what we captured
         }
         needle = (uint16_t)(needle + 14 + nlen);
+
+        // Fase 5K: translate every raw entry independently of the raw
+        // dir/file counters' own skip rules below, so the ok/skipped
+        // counts reflect sidetnfs_normalize_dir_entry()'s own policy.
+        SidetnfsAtariDirEntry atari_entry;
+        if (sidetnfs_normalize_dir_entry(name, flags, size, 0, &atari_entry))
+        {
+            s_state.translate_ok_count++;
+        }
+        else if (atari_entry.skipped)
+        {
+            s_state.translate_skipped_count++;
+        }
 
         if (flags & (TNFS_DIRENTRY_HIDDEN | TNFS_DIRENTRY_SPECIAL))
         {
@@ -540,6 +667,7 @@ static int build_status_text(char *text, size_t text_size)
     char line1[64];
     char line2[64] = "";
     char line3[64] = "";
+    char line3b[64] = "";
     char line4[64] = "";
     char line5[80] = "";
 
@@ -567,15 +695,15 @@ static int build_status_text(char *text, size_t text_size)
         {
             if (!s_state.opendir_response_received)
             {
-                snprintf(line2, sizeof(line2), "[WAIT] opendir / response pending\r\n");
+                snprintf(line2, sizeof(line2), "[WAIT] opendirx / response pending\r\n");
             }
             else if (s_state.opendir_rc != 0x00)
             {
-                snprintf(line2, sizeof(line2), "[ERR] opendir / failed - rc: %02X\r\n", s_state.opendir_rc);
+                snprintf(line2, sizeof(line2), "[ERR] opendirx / failed - rc: %02X\r\n", s_state.opendir_rc);
             }
             else
             {
-                snprintf(line2, sizeof(line2), "[OK] opendir / successful - handle: %u\r\n", s_state.opendir_handle);
+                snprintf(line2, sizeof(line2), "[OK] opendirx / successful - handle: %u\r\n", s_state.opendir_handle);
 
                 if (s_state.readdirx_started)
                 {
@@ -591,6 +719,8 @@ static int build_status_text(char *text, size_t text_size)
                     {
                         snprintf(line3, sizeof(line3), "[OK] readdirx / - %u dirs, %u files\r\n",
                                  (unsigned)s_state.readdirx_count_dirs, (unsigned)s_state.readdirx_count_files);
+                        snprintf(line3b, sizeof(line3b), "[OK] translate / - %u ok, %u skipped\r\n",
+                                 (unsigned)s_state.translate_ok_count, (unsigned)s_state.translate_skipped_count);
                     }
                 }
             }
@@ -609,7 +739,7 @@ static int build_status_text(char *text, size_t text_size)
         }
     }
 
-    int len = snprintf(text, text_size, "%s%s%s%s%s", line1, line2, line3, line4, line5);
+    int len = snprintf(text, text_size, "%s%s%s%s%s%s", line1, line2, line3, line3b, line4, line5);
 
 #if SIDETNFS_DEBUG_SHOW_RAW
     if (len > 0 && (size_t)len < text_size)
