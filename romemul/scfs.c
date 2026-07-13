@@ -28,3 +28,18 @@ bool scfs_get_disk_info(const char *path, ScFsDiskInfo *info)
     info->bytes_per_sector = NUM_BYTES_PER_SECTOR;
     return true;
 }
+
+bool scfs_stat(const char *path, ScFsStat *out)
+{
+    FILINFO fno;
+    FRESULT fr = f_stat(path, &fno);
+    if (fr != FR_OK)
+    {
+        return false;
+    }
+    out->attr = fno.fattrib;
+    out->size = fno.fsize;
+    out->date = fno.fdate;
+    out->time = fno.ftime;
+    return true;
+}

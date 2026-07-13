@@ -54,3 +54,17 @@
 - Normal GEMDRIVE usage still works.
 - Creating and deleting a directory still works.
 - Error-path testing for deleting a non-existing directory is deferred to a later small test program.
+
+## Fase 4E — minimal SCFS stat wrapper
+
+- Added `ScFsStat`.
+- Added `scfs_stat()`.
+- `scfs_stat()` currently forwards to FatFS `f_stat()`.
+- `Fattrib` inquiry path now uses `scfs_stat()` for reading attributes.
+- `Fattrib` set path still uses the original `f_chmod()` logic.
+- `directory_exists()` was intentionally not changed to avoid reversing the layering between `filesys.c` and `scfs.c`.
+- No TNFS added.
+- No backend selection added.
+- No Fsfirst/Fsnext/DTA changes.
+- No Fopen/Fread/Fwrite changes.
+- Mega STE hardware test passed.

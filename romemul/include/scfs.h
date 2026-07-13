@@ -24,4 +24,14 @@ bool scfs_get_disk_info(const char *path, ScFsDiskInfo *info);
 // be circular.
 int16_t scfs_fresult_to_gemdos_error(FRESULT fr);
 
+typedef struct
+{
+    uint8_t attr;
+    uint32_t size;
+    uint16_t date;
+    uint16_t time;
+} ScFsStat;
+
+bool scfs_stat(const char *path, ScFsStat *out);
+
 #endif // SCFS_H

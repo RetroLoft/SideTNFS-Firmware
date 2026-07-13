@@ -2082,16 +2082,16 @@ void init_gemdrvemul(bool safe_config_reboot)
             DPRINTF("Getting attributes of file: %s\n", tmp_filepath);
 
             // Get the attributes of the file
-            FILINFO fno;
-            fr = f_stat(tmp_filepath, &fno);
-            if (fr != FR_OK)
+            ScFsStat stat_info;
+            bool stat_ok = scfs_stat(tmp_filepath, &stat_info);
+            if (!stat_ok)
             {
-                DPRINTF("ERROR: Could not get file attributes (%d)\r\n", fr);
+                DPRINTF("ERROR: Could not get file attributes\r\n");
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
             }
             else
             {
-                uint32_t fattrib_st = attribs_fat2st(fno.fattrib);
+                uint32_t fattrib_st = attribs_fat2st(stat_info.attr);
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, fattrib_st);
                 char fattrib_st_str[7] = "";
                 get_attribs_st_str(fattrib_st_str, fattrib_st);
