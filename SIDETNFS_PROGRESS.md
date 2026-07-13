@@ -152,3 +152,37 @@ Server tcpdump output:
 - If WiFi/network is skipped or fails, TNFS probe service is disabled.
 - `DEBUG.TXT` shows `[SKIP] tnfs disabled`.
 - Mega STE ESC-skip test passed.
+
+## Fase 5I — TNFS OPENDIRX/READDIRX root test
+
+- Replaced the earlier basic OPENDIR probe with OPENDIRX because READDIRX requires an OPENDIRX handle.
+- OPENDIRX `/` succeeds and returns a directory handle.
+- READDIRX `/` runs non-blocking over multiple service iterations (one new request per service call, capped rounds).
+- Directory/file counting works.
+- Tested result: `12 dirs, 1 files`.
+- `DEBUG.TXT` shows short status lines only.
+- No GEMDRIVE backend changes.
+- No Fsfirst/Fsnext/DTA changes.
+- Mega STE hardware test passed.
+
+## Fase 5J — SD/FatFS vs TNFS directory-listing differences
+
+- Added `SIDETNFS_SD_TNFS_DIRLIST_DIFFS.md`.
+- Analysed expected differences between SD/FatFS and TNFS directory listing.
+- Key differences:
+  - path mapping;
+  - wildcard semantics;
+  - 8.3 name normalization;
+  - attribute mapping;
+  - directory size handling;
+  - date/time conversion;
+  - EOF handling;
+  - TNFS rc to GEMDOS error mapping;
+  - async-aware DTA state.
+- Added short SD-root vs TNFS-root count comparison in `DEBUG.TXT`.
+- Tested result:
+  - TNFS root: `12 dirs, 1 files`
+  - SD root: `12 dirs, 2 files`
+  - difference expected because `DEBUG.TXT` exists only on SD.
+- Mega STE hardware test passed.
+- GEMDRIVE backend unchanged.

@@ -59,4 +59,14 @@ void sidetnfs_debug_file_service(const char *hd_folder);
 // Never blocks, never logs, no UART.
 void sidetnfs_mark_network_skipped(void);
 
+// Fase 5J: one-shot SD/FatFS root directory scan (via f_opendir/f_readdir),
+// purely to compare entry counts against the TNFS READDIRX root scan in
+// DEBUG.TXT. Independent of network state -- uses hd_folder directly, no
+// TNFS/SCFS involved. Runs at most once per boot (guarded internally).
+// Synchronous but bounded by the size of hd_folder's root (a handful of
+// entries) -- same order of magnitude as GEMDRIVE's own existing FatFS
+// directory calls, so no new blocking-risk class is introduced. Never
+// retries, never logs, silently does nothing on any failure.
+void sidetnfs_scan_sd_root_if_needed(const char *hd_folder);
+
 #endif // SIDETNFS_PROBE_H

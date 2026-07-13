@@ -2614,6 +2614,10 @@ void init_gemdrvemul(bool safe_config_reboot)
 #endif
             sidetnfs_probe_service();
         }
+        // Fase 5J: one-shot SD-root scan for the DEBUG.TXT SD-vs-TNFS
+        // comparison. Pure FatFS, independent of network state, guarded
+        // internally to run at most once per boot.
+        sidetnfs_scan_sd_root_if_needed(hd_folder);
         sidetnfs_debug_file_service(hd_folder);
     }
 }
