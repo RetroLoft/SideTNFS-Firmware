@@ -68,3 +68,15 @@
 - No Fsfirst/Fsnext/DTA changes.
 - No Fopen/Fread/Fwrite changes.
 - Mega STE hardware test passed.
+
+## Fase 4F — Fdatime inquiry via SCFS stat
+
+- `GEMDRVEMUL_FDATETIME_CALL` inquiry path now uses `scfs_stat()`.
+- `ScFsStat.date` and `ScFsStat.time` replace direct use of `FILINFO.fdate` and `FILINFO.ftime` in the inquiry path.
+- The Fdatime set path still uses the original `f_utime()` logic.
+- No `scfs_utime()` added.
+- No TNFS added.
+- No backend selection added.
+- No Fsfirst/Fsnext/DTA changes.
+- No Fopen/Fread/Fwrite changes.
+- Mega STE hardware test passed.

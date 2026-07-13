@@ -2218,32 +2218,31 @@ void init_gemdrvemul(bool safe_config_reboot)
                 if (fdatetime_flag == FDATETIME_INQUIRE)
                 {
                     DPRINTF("Inquire file date and time: %s fd: %d\n", fd->fpath, fdatetime_fd);
-                    FILINFO fno;
-                    FRESULT fr;
-                    fr = f_stat(fd->fpath, &fno);
-                    if (fr == FR_OK)
+                    ScFsStat stat_info;
+                    bool stat_ok = scfs_stat(fd->fpath, &stat_info);
+                    if (stat_ok)
                     {
-                        // File information is now in fno
+                        // File information is now in stat_info
 #if defined(_DEBUG) && (_DEBUG != 0)
                         // Save some memory and cycles if not in debug mode
                         // Convert the date and time
-                        unsigned int year = (fno.fdate >> 9);
-                        unsigned int month = (fno.fdate >> 5) & 0x0F;
-                        unsigned int day = fno.fdate & 0x1F;
+                        unsigned int year = (stat_info.date >> 9);
+                        unsigned int month = (stat_info.date >> 5) & 0x0F;
+                        unsigned int day = stat_info.date & 0x1F;
 
-                        unsigned int hour = fno.ftime >> 11;
-                        unsigned int minute = (fno.ftime >> 5) & 0x3F;
-                        unsigned int second = (fno.ftime & 0x1F);
+                        unsigned int hour = stat_info.time >> 11;
+                        unsigned int minute = (stat_info.time >> 5) & 0x3F;
+                        unsigned int second = (stat_info.time & 0x1F);
 
                         DPRINTF("Get file date and time: %02d:%02d:%02d %02d/%02d/%02d\n", hour, minute, second * 2, day, month, year + 1980);
 #endif
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EOK);
-                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, fno.fdate);
-                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, fno.ftime);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, stat_info.date);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, stat_info.time);
                     }
                     else
                     {
-                        DPRINTF("ERROR: Could not get file date and time from file %s (%d)\r\n", fd->fpath, fr);
+                        DPRINTF("ERROR: Could not get file date and time from file %s\r\n", fd->fpath);
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EFILNF);
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
