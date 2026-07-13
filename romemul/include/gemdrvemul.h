@@ -37,6 +37,7 @@
 #include "config.h"
 #include "memfunc.h"
 #include "filesys.h"
+#include "scfs.h"
 #include "rtcemul.h"
 
 #define DEFAULT_FOPEN_READ_BUFFER_SIZE 16384

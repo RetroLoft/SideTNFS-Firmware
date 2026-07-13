@@ -1368,7 +1368,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             remove_dup_slashes(tmp_path);
             remove_dup_slashes(dpath_tmp);
 
-            if (directory_exists(tmp_path))
+            if (scfs_directory_exists(tmp_path))
             {
                 DPRINTF("Directory exists: %s\n", tmp_path);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EOK;
@@ -1395,7 +1395,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             DPRINTF("Folder to create: %s\n", tmp_pathname);
 
             // Check if the folder exists. If not, return an error
-            if (directory_exists(tmp_pathname) != FR_OK)
+            if (scfs_directory_exists(tmp_pathname) != FR_OK)
             {
                 DPRINTF("ERROR: Folder does not exist\n");
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EPTHNF;
@@ -1429,7 +1429,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             DPRINTF("Folder to delete: %s\n", tmp_pathname);
 
             // Check if the folder exists. If not, return an error
-            if (directory_exists(tmp_pathname) == 0)
+            if (scfs_directory_exists(tmp_pathname) == 0)
             {
                 DPRINTF("ERROR: Folder does not exist\n");
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EPTHNF;
