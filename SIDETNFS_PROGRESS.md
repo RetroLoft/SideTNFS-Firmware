@@ -112,3 +112,23 @@ Server tcpdump output:
 - Mega STE hardware test passed.
 - No tcpdump output expected or observed, because `udp_connect()` does not send packets.
 - GEMDRIVE backend unchanged.
+
+## Fase 5F — DEBUG.TXT dirty updates and TNFS MOUNT response
+
+- Added persistent SIDETNFS debug-state in RAM.
+- `DEBUG.TXT` is rewritten with `FA_CREATE_ALWAYS` whenever the debug-state is dirty.
+- UDP callback stores only minimal response-state in RAM.
+- UDP callback does not write to FatFS.
+- Added non-blocking `cyw43_arch_poll()` in the existing GEMDRIVE main loop because this project uses `PICO_CYW43_ARCH_POLL`.
+- No blocking wait, retry loop, sleep or UART logging added.
+- TNFS MOUNT response is now received and written to `DEBUG.TXT`.
+- Tested response raw bytes: `4D 5C 00 00 00 02 01 E8 03`.
+- Parsed result:
+  - SID `0x5C4D`
+  - SEQ `0x00`
+  - CMD `0x00`
+  - RC `0x00`
+  - server version `2.1`
+  - retry time `1000 ms`
+- Mega STE hardware test passed.
+- GEMDRIVE still works.

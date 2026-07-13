@@ -1099,6 +1099,13 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // If set then set the RTC and network status to 1, otherwise set it to 0
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RTC_STATUS)) = 0xFFFFFFFF;
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0xFFFFFFFF;
+
+                // Fase 5C: lazy, non-blocking TNFS MOUNT probe. This is the
+                // last point in network setup where WiFi is still known to
+                // be up (every other path below this falls back to
+                // cyw43_arch_deinit()), and it runs before the main command
+                // loop below ever sees a real Atari/GEMDRIVE handshake.
+                sidetnfs_send_mount_probe();
             }
             else
             {
@@ -1245,6 +1252,12 @@ void init_gemdrvemul(bool safe_config_reboot)
                         dpath_string[0] = '\\'; // Set the root folder as default
                         dpath_string[1] = '\0';
                         hd_folder_ready = true;
+
+                        // Fase 5F: write/update DEBUG.TXT now that SD/FatFS
+                        // is confirmed mounted and hd_folder is known.
+                        // No-op if nothing is dirty yet.
+                        sidetnfs_debug_file_service(hd_folder);
+
                         *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
                     }
                 }
@@ -2573,5 +2586,15 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Write config only once to avoid hitting the flash too much
             write_config_only_once = false;
         }
+
+        // Fase 5F: let the network stack process any pending packets (the
+        // TNFS MOUNT reply is otherwise never delivered to its callback in
+        // this poll-mode build), then write DEBUG.TXT if anything became
+        // dirty as a result. Both calls are cheap no-ops when there is
+        // nothing pending/dirty -- this is not a wait/retry loop.
+#if PICO_CYW43_ARCH_POLL
+        cyw43_arch_poll();
+#endif
+        sidetnfs_debug_file_service(hd_folder);
     }
 }

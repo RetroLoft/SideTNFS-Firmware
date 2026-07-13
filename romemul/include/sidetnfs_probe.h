@@ -24,4 +24,21 @@ bool sidetnfs_udp_connect_test(void);
 // reply, never logs. Silently does nothing on any failure.
 void sidetnfs_send_udp_probe(void);
 
+// Fase 5C/5F: send a single TNFS MOUNT request and register a receive
+// callback for the (optional, asynchronous) reply. Fire-and-forget -- never
+// waits, never retries, never logs. Must only be called after WiFi is
+// confirmed connected. Marks the debug state dirty so
+// sidetnfs_debug_file_service() will pick this up on its next call.
+void sidetnfs_send_mount_probe(void);
+
+// Fase 5F: if the debug state is dirty (mount probe just sent, or a
+// response just arrived) and hd_folder is known, (re)write
+// <hd_folder>/DEBUG.TXT with FA_CREATE_ALWAYS, then clear the dirty flag.
+// No-op (and stays dirty for a later call) if hd_folder is NULL, nothing is
+// dirty, or the last write was too recent (simple throttling). Never
+// blocks, never retries, silently does nothing on any failure. Safe to
+// call from multiple places, including once per GEMDRIVE main-loop
+// iteration -- the dirty-check keeps it a cheap no-op otherwise.
+void sidetnfs_debug_file_service(const char *hd_folder);
+
 #endif // SIDETNFS_PROBE_H
