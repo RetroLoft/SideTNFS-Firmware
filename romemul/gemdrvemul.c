@@ -1286,24 +1286,19 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             // Check the free space
-            DWORD fre_clust;
-            FATFS *fs;
-            FRESULT fr;
-            // Get free space
-            fr = f_getfree(hd_folder, &fre_clust, &fs);
-            if (fr != FR_OK)
+            ScFsDiskInfo disk_info;
+            bool disk_info_ok = scfs_get_disk_info(hd_folder, &disk_info);
+            if (!disk_info_ok)
             {
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_DFREE_STATUS)) = GEMDOS_ERROR;
             }
             else
             {
-                // Calculate the total number of free bytes
-                uint64_t freeBytes = fre_clust * fs->csize * NUM_BYTES_PER_SECTOR;
-                DPRINTF("Total clusters: %d, free clusters: %d, bytes per sector: %d, sectors per cluster: %d\n", fs->n_fatent - 2, fre_clust, NUM_BYTES_PER_SECTOR, fs->csize);
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT, fre_clust);
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 4, fs->n_fatent - 2);
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 8, NUM_BYTES_PER_SECTOR);
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 12, fs->csize);
+                DPRINTF("Total clusters: %d, free clusters: %d, bytes per sector: %d, sectors per cluster: %d\n", disk_info.total_clusters, disk_info.free_clusters, disk_info.bytes_per_sector, disk_info.sectors_per_cluster);
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT, disk_info.free_clusters);
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 4, disk_info.total_clusters);
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 8, disk_info.bytes_per_sector);
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 12, disk_info.sectors_per_cluster);
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_DFREE_STATUS)) = GEMDOS_EOK;
             }
             write_random_token(memory_shared_address);

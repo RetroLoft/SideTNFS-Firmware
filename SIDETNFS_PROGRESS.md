@@ -25,3 +25,19 @@
 - No TNFS added.
 - No backend selection added.
 - Mega STE hardware test passed.
+
+## Fase 4C — Dfree / disk-info wrapper
+
+- Added `ScFsDiskInfo`.
+- Added `scfs_get_disk_info()`.
+- Moved direct `f_getfree()` usage out of `gemdrvemul.c` into `scfs.c`.
+- `GEMDRVEMUL_DFREE_CALL` now uses `scfs_get_disk_info()`.
+- Values written to the Atari-side Dfree structure remain unchanged:
+  - free clusters
+  - total clusters
+  - bytes per sector
+  - sectors per cluster
+- No TNFS added.
+- No backend selection added.
+- Mega STE hardware test passed.
+- Baseline comparison confirmed that "Show Information" on GEMDRIVE drive/folders was already not working in original v1.0.1, so this is not a Fase 4C regression.
