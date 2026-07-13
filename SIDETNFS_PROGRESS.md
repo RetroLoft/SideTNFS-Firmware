@@ -100,3 +100,15 @@ Server tcpdump output:
 15:26:46.361174 enp2s0 In  IP 192.168.178.206.50752 > 192.168.178.10.16384: UDP, length 14
 15:26:46.361433 enp2s0 Out IP 192.168.178.10.16384 > 192.168.178.206.50752: UDP, length 5
 ```
+
+## Fase 5B — UDP connect-only test
+
+- Added `sidetnfs_udp_connect_test()`.
+- Function creates a UDP PCB, connects it to `192.168.178.10:16384`, then removes the PCB.
+- No payload is sent.
+- No TNFS command is sent.
+- No UART/debug/ringbuffer used.
+- Normal releasebuild used.
+- Mega STE hardware test passed.
+- No tcpdump output expected or observed, because `udp_connect()` does not send packets.
+- GEMDRIVE backend unchanged.

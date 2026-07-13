@@ -16,6 +16,31 @@
 
 static const char SIDETNFS_PROBE_PAYLOAD[] = "SIDETNFS_PROBE";
 
+bool sidetnfs_udp_connect_test(void)
+{
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    {
+        return false;
+    }
+
+    cyw43_arch_lwip_begin();
+
+    struct udp_pcb *pcb = udp_new();
+    if (!pcb)
+    {
+        cyw43_arch_lwip_end();
+        return false;
+    }
+
+    bool connected = (udp_connect(pcb, &server_ip, SIDETNFS_SERVER_PORT) == ERR_OK);
+
+    udp_remove(pcb);
+    cyw43_arch_lwip_end();
+
+    return connected;
+}
+
 void sidetnfs_send_udp_probe(void)
 {
     ip_addr_t server_ip;

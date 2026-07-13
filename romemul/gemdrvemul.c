@@ -1002,9 +1002,10 @@ void init_gemdrvemul(bool safe_config_reboot)
         else
         {
             // We have network connection!
-            // One-shot, non-blocking UDP reachability probe toward the TNFS
-            // server. Not a TNFS operation -- no mount, no reply handling.
-            sidetnfs_send_udp_probe();
+            // Fase 5B: local-only UDP PCB + udp_connect() toward the TNFS
+            // server. Sends no payload, no TNFS command -- udp_connect() is
+            // a local lwIP operation, nothing goes on the wire.
+            sidetnfs_udp_connect_test();
 
             // Start the internal RTC
             rtc_init();
