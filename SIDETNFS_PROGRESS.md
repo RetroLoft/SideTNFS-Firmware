@@ -204,3 +204,24 @@ Server tcpdump output:
 - Mega STE hardware test passed.
 - GEMDRIVE backend unchanged.
 - Fsfirst/Fsnext/DTA unchanged.
+
+## Fase 5L — GEMDOS wildcard matching for TNFS entries
+
+- Added local GEMDOS-style wildcard matcher for normalized TNFS 8.3 entries.
+- Matcher works on already-normalized Atari-visible names only.
+- Replicates existing GEMDRIVE/FatFS preprocessing:
+  - `*.*` becomes `*`
+  - `CONFIG.*` becomes `CONFIG`
+  - `FOLDER.*` becomes `FOLDER`
+- Supports `*` and `?`.
+- Matching is effectively case-insensitive.
+- Pattern counts are reported via short `DEBUG.TXT` lines.
+- Tested patterns:
+  - `*.*`
+  - `*`
+  - `*.PRG`
+  - `*.ACC`
+  - `CONFIG.*`
+- Mega STE hardware test passed.
+- GEMDRIVE backend unchanged.
+- Fsfirst/Fsnext/DTA unchanged.

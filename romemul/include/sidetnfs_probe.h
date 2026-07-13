@@ -101,4 +101,17 @@ bool sidetnfs_normalize_dir_entry(const char *tnfs_name, uint8_t tnfs_flags,
                                    uint32_t tnfs_size, uint32_t tnfs_mtime,
                                    SidetnfsAtariDirEntry *out);
 
+// Fase 5L: local GEMDOS-style wildcard match against an already-normalized
+// 8.3 Atari name (see sidetnfs_normalize_dir_entry()). Mirrors the existing
+// SD/FatFS GEMDRIVE pattern semantics from seach_path_2_st() in
+// gemdrvemul.c: a pattern ending in ".*" has that suffix stripped before
+// matching (so "*.*" behaves like "*", and "FOLDER.*" behaves like
+// "FOLDER" -- matching extension-less names too). This is a deliberate
+// GEMDOS/TOS quirk already relied on by the SD backend, not standard FatFS
+// wildcard behavior. After that adjustment, '*' matches zero or more
+// characters and '?' matches exactly one, compared case-insensitively (both
+// sides are expected to already be uppercase 8.3 per Fase 5K). No malloc,
+// no I/O.
+bool sidetnfs_gemdos_pattern_match(const char *name83, const char *pattern);
+
 #endif // SIDETNFS_PROBE_H

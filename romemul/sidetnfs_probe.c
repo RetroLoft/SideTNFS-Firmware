@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <ctype.h>
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 #include "lwip/udp.h"
@@ -54,6 +55,13 @@
 #define SIDETNFS_READDIRX_BATCH_SIZE 4u
 #define SIDETNFS_READDIRX_MAX_ROUNDS 32u
 
+// Fase 5L: small, fixed test set of GEMDOS-style patterns counted against
+// each successfully normalized READDIRX entry during the existing root
+// scan. Kept intentionally short (<=5) per the debug-line budget.
+#define SIDETNFS_MATCH_PATTERN_COUNT 5
+static const char *const SIDETNFS_MATCH_PATTERNS[SIDETNFS_MATCH_PATTERN_COUNT] = {
+    "*.*", "*", "*.PRG", "*.ACC", "CONFIG.*"};
+
 static const char SIDETNFS_PROBE_PAYLOAD[] = "SIDETNFS_PROBE";
 
 // Fase 5F/5G/5I: small, fixed-size debug state. Filled in by the UDP
@@ -93,6 +101,10 @@ typedef struct
     // name, or TNFS "special" flag).
     uint16_t translate_ok_count;
     uint16_t translate_skipped_count;
+
+    // Fase 5L: how many normalized entries matched each pattern in
+    // SIDETNFS_MATCH_PATTERNS (same index).
+    uint16_t match_counts[SIDETNFS_MATCH_PATTERN_COUNT];
 
     bool sd_scan_done;
     uint16_t sd_scan_count_dirs;
@@ -279,6 +291,75 @@ bool sidetnfs_normalize_dir_entry(const char *tnfs_name, uint8_t tnfs_flags,
     return true;
 }
 
+// Fase 5L: strip a trailing ".*" from a pattern, mirroring the existing
+// GEMDOS-adjustment already done for the SD/FatFS backend in
+// seach_path_2_st() (gemdrvemul.c) -- see the comment there: "Patterns do
+// not work with FatFs as Atari ST expects, so we need to adjust them."
+// Bounded to a small local buffer since patterns here are always short
+// 8.3-style strings; no malloc.
+static void normalize_gemdos_pattern(const char *pattern, char *out, size_t out_size)
+{
+    size_t len = strnlen(pattern, out_size - 1);
+    memcpy(out, pattern, len);
+    out[len] = '\0';
+    if (len >= 2 && out[len - 1] == '*' && out[len - 2] == '.')
+    {
+        out[len - 2] = '\0';
+    }
+}
+
+// Classic greedy '*'/'?' glob match, case-insensitive. Iterative (no
+// recursion, unlike FatFS's own static pattern_match()) since these
+// patterns are always short and single-term.
+static bool wildcard_match_upper(const char *pat, const char *str)
+{
+    const char *s = str;
+    const char *p = pat;
+    const char *star_p = NULL;
+    const char *star_s = NULL;
+
+    while (*s != '\0')
+    {
+        if (*p == '?' || toupper((unsigned char)*p) == toupper((unsigned char)*s))
+        {
+            p++;
+            s++;
+        }
+        else if (*p == '*')
+        {
+            star_p = p++;
+            star_s = s;
+        }
+        else if (star_p != NULL)
+        {
+            p = star_p + 1;
+            s = ++star_s;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    while (*p == '*')
+    {
+        p++;
+    }
+    return *p == '\0';
+}
+
+// Fase 5L: GEMDOS-style pattern match against a normalized 8.3 name -- see
+// sidetnfs_probe.h.
+bool sidetnfs_gemdos_pattern_match(const char *name83, const char *pattern)
+{
+    if (name83 == NULL || pattern == NULL)
+    {
+        return false;
+    }
+    char norm_pattern[13];
+    normalize_gemdos_pattern(pattern, norm_pattern, sizeof(norm_pattern));
+    return wildcard_match_upper(norm_pattern, name83);
+}
+
 // Parse one READDIRX response's entries (flags(1)+size(4)+mtime(4)+ctime(4)
 // +name(null-term) each), counting dirs vs files. Only touches RAM. Mirrors
 // the byte layout of a previously hardware-tested standalone implementation.
@@ -310,6 +391,13 @@ static void parse_readdirx_entries(const uint8_t *buf, uint16_t n, uint8_t batch
         if (sidetnfs_normalize_dir_entry(name, flags, size, 0, &atari_entry))
         {
             s_state.translate_ok_count++;
+            for (uint8_t p = 0; p < SIDETNFS_MATCH_PATTERN_COUNT; p++)
+            {
+                if (sidetnfs_gemdos_pattern_match(atari_entry.name, SIDETNFS_MATCH_PATTERNS[p]))
+                {
+                    s_state.match_counts[p]++;
+                }
+            }
         }
         else if (atari_entry.skipped)
         {
@@ -668,6 +756,7 @@ static int build_status_text(char *text, size_t text_size)
     char line2[64] = "";
     char line3[64] = "";
     char line3b[64] = "";
+    char match_lines[SIDETNFS_MATCH_PATTERN_COUNT * 40] = "";
     char line4[64] = "";
     char line5[80] = "";
 
@@ -721,6 +810,19 @@ static int build_status_text(char *text, size_t text_size)
                                  (unsigned)s_state.readdirx_count_dirs, (unsigned)s_state.readdirx_count_files);
                         snprintf(line3b, sizeof(line3b), "[OK] translate / - %u ok, %u skipped\r\n",
                                  (unsigned)s_state.translate_ok_count, (unsigned)s_state.translate_skipped_count);
+
+                        size_t match_len = 0;
+                        for (uint8_t p = 0; p < SIDETNFS_MATCH_PATTERN_COUNT && match_len < sizeof(match_lines); p++)
+                        {
+                            int r = snprintf(&match_lines[match_len], sizeof(match_lines) - match_len,
+                                              "[OK] match %s - %u entries\r\n",
+                                              SIDETNFS_MATCH_PATTERNS[p], (unsigned)s_state.match_counts[p]);
+                            if (r <= 0)
+                            {
+                                break;
+                            }
+                            match_len += (size_t)r;
+                        }
                     }
                 }
             }
@@ -739,7 +841,7 @@ static int build_status_text(char *text, size_t text_size)
         }
     }
 
-    int len = snprintf(text, text_size, "%s%s%s%s%s%s", line1, line2, line3, line3b, line4, line5);
+    int len = snprintf(text, text_size, "%s%s%s%s%s%s%s", line1, line2, line3, line3b, match_lines, line4, line5);
 
 #if SIDETNFS_DEBUG_SHOW_RAW
     if (len > 0 && (size_t)len < text_size)
@@ -795,7 +897,7 @@ void sidetnfs_debug_file_service(const char *hd_folder)
         return;
     }
 
-    char text[384];
+    char text[640];
     int len = build_status_text(text, sizeof(text));
     if (len <= 0)
     {
