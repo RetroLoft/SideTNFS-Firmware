@@ -20,43 +20,56 @@
 #define SIDETNFS_MOUNT_NAME "Atari.ST"
 
 #define TNFS_CMD_MOUNT 0x00u
+#define TNFS_CMD_OPENDIR 0x10u
 #define TNFS_PROTO_VER_MINOR 0x02
 #define TNFS_PROTO_VER_MAJOR 0x01
+
+// Set to 1 to append a raw hex dump of the last response to DEBUG.TXT.
+// Off by default -- Fase 5G wants short, human-readable status lines only.
+#ifndef SIDETNFS_DEBUG_SHOW_RAW
+#define SIDETNFS_DEBUG_SHOW_RAW 0
+#endif
 
 #define SIDETNFS_DEBUG_RAW_SIZE 16
 #define SIDETNFS_DEBUG_WRITE_MIN_INTERVAL_MS 250
 
 static const char SIDETNFS_PROBE_PAYLOAD[] = "SIDETNFS_PROBE";
 
-// Fase 5F: small, fixed-size debug state. Filled in by the UDP callback
+// Fase 5F/5G: small, fixed-size debug state. Filled in by the UDP callback
 // (RAM only, never touches FatFS) and consumed by
 // sidetnfs_debug_file_service(), which is the only place that ever writes
 // to SD. No malloc, no dynamic strings.
 typedef struct
 {
-    bool mount_probe_sent;
-    bool mount_response_received;
     bool debug_dirty;
-
-    uint32_t mount_probe_send_count;
     uint32_t debug_write_count;
 
-    uint16_t response_len;
-    uint16_t sid;
-    uint8_t seq;
-    uint8_t cmd;
-    uint8_t rc;
+    bool network_skipped;
 
-    uint8_t raw[SIDETNFS_DEBUG_RAW_SIZE];
+    bool mount_probe_sent;
+    bool mount_response_received;
+    uint16_t sid;
+    uint8_t mount_rc;
+
+    bool opendir_sent;
+    bool opendir_response_received;
+    uint8_t opendir_handle;
+    uint8_t opendir_rc;
+
+#if SIDETNFS_DEBUG_SHOW_RAW
+    uint16_t last_response_len;
+    uint8_t last_raw[SIDETNFS_DEBUG_RAW_SIZE];
+#endif
 } SidetnfsDebugState;
 
-static SidetnfsDebugState s_debug_state = {0};
+static SidetnfsDebugState s_state = {0};
 
 // The MOUNT PCB is intentionally never removed once created: the udp_recv()
 // callback must still be able to fire whenever the server's reply happens
-// to arrive, and this probe is a one-shot, once-per-boot action, so leaking
-// a single PCB for the remaining lifetime of the firmware is the smallest
-// safe choice (no risk of removing it out from under an in-flight callback).
+// to arrive (for both MOUNT and the later OPENDIR sent over the same PCB),
+// and this probe is a one-shot, once-per-boot action, so leaking a single
+// PCB for the remaining lifetime of the firmware is the smallest safe
+// choice (no risk of removing it out from under an in-flight callback).
 static struct udp_pcb *s_mount_pcb = NULL;
 
 bool sidetnfs_udp_connect_test(void)
@@ -118,10 +131,12 @@ void sidetnfs_send_udp_probe(void)
     cyw43_arch_lwip_end();
 }
 
-// lwIP receive callback for the MOUNT probe. Only touches RAM state -- no
-// FatFS, no printf, no heavy parsing, no blocking. Always frees the pbuf.
-static void mount_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
-                                 const ip_addr_t *addr, u16_t port)
+// lwIP receive callback, shared by MOUNT and OPENDIR responses (both use the
+// same PCB). Only touches RAM state -- no FatFS, no printf, no heavy
+// parsing, no blocking. Always frees the pbuf. Routes on the echoed command
+// byte (offset 3) since both request types share this one callback.
+static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                                const ip_addr_t *addr, u16_t port)
 {
     (void)arg;
     (void)pcb;
@@ -136,21 +151,37 @@ static void mount_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     uint16_t n = p->tot_len < sizeof(buf) ? (uint16_t)p->tot_len : (uint16_t)sizeof(buf);
     pbuf_copy_partial(p, buf, n, 0);
 
-    s_debug_state.response_len = p->tot_len;
-    memcpy(s_debug_state.raw, buf, n);
-    if (n < sizeof(s_debug_state.raw))
+#if SIDETNFS_DEBUG_SHOW_RAW
+    s_state.last_response_len = p->tot_len;
+    memcpy(s_state.last_raw, buf, n);
+    if (n < sizeof(s_state.last_raw))
     {
-        memset(&s_debug_state.raw[n], 0, sizeof(s_debug_state.raw) - n);
+        memset(&s_state.last_raw[n], 0, sizeof(s_state.last_raw) - n);
     }
-    if (n >= 4)
+#endif
+
+    if (n < 4)
     {
-        s_debug_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-        s_debug_state.seq = buf[2];
-        s_debug_state.cmd = buf[3];
+        pbuf_free(p);
+        return;
     }
-    s_debug_state.rc = n > 4 ? buf[4] : 0;
-    s_debug_state.mount_response_received = true;
-    s_debug_state.debug_dirty = true;
+
+    uint8_t cmd = buf[3];
+    if (cmd == TNFS_CMD_MOUNT)
+    {
+        s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+        s_state.mount_rc = n > 4 ? buf[4] : 0;
+        s_state.mount_response_received = true;
+        s_state.debug_dirty = true;
+    }
+    else if (cmd == TNFS_CMD_OPENDIR)
+    {
+        s_state.opendir_rc = n > 4 ? buf[4] : 0;
+        s_state.opendir_handle = n > 5 ? buf[5] : 0;
+        s_state.opendir_response_received = true;
+        s_state.debug_dirty = true;
+    }
+    // Unknown/unexpected command: ignore silently.
 
     pbuf_free(p);
 }
@@ -164,9 +195,8 @@ void sidetnfs_send_mount_probe(void)
 {
     // Mark as attempted regardless of what happens below -- this is a
     // fire-and-forget probe, "sent" means "we tried this boot".
-    s_debug_state.mount_probe_sent = true;
-    s_debug_state.mount_probe_send_count++;
-    s_debug_state.debug_dirty = true;
+    s_state.mount_probe_sent = true;
+    s_state.debug_dirty = true;
 
     ip_addr_t server_ip;
     if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
@@ -185,7 +215,7 @@ void sidetnfs_send_mount_probe(void)
 
     // Register the reply callback before sending, so a fast reply can never
     // race ahead of us registering it.
-    udp_recv(pcb, mount_recv_callback, NULL);
+    udp_recv(pcb, tnfs_recv_callback, NULL);
 
     // Header: session=0x0000 (new session), seq=0x00, cmd=TNFS_CMD_MOUNT.
     // Payload: proto version (minor, major) + null-terminated mount path
@@ -193,7 +223,7 @@ void sidetnfs_send_mount_probe(void)
     uint8_t buf[6 + 1 + sizeof(SIDETNFS_MOUNT_NAME) + 2];
     buf[0] = 0x00;
     buf[1] = 0x00;
-    buf[2] = 0x00;
+    buf[2] = 0x00; // seq 0 for MOUNT
     buf[3] = TNFS_CMD_MOUNT;
     buf[4] = TNFS_PROTO_VER_MINOR;
     buf[5] = TNFS_PROTO_VER_MAJOR;
@@ -222,26 +252,155 @@ void sidetnfs_send_mount_probe(void)
     cyw43_arch_lwip_end();
 }
 
-static const char *result_text(void)
+// Fase 5G: send a single OPENDIR "/" request over the existing MOUNT PCB,
+// using the session id learned from the MOUNT response. Fire-and-forget,
+// same non-blocking guarantees as sidetnfs_send_mount_probe().
+static void send_opendir_probe(void)
 {
-    if (!s_debug_state.mount_response_received)
+    s_state.opendir_sent = true;
+    s_state.debug_dirty = true;
+
+    if (!s_mount_pcb)
     {
-        return "NO_RESPONSE_YET";
+        return;
     }
-    if (s_debug_state.response_len < 5)
+
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
     {
-        return "UNKNOWN";
+        return;
     }
-    return s_debug_state.rc == 0x00 ? "OK" : "ERROR";
+
+    cyw43_arch_lwip_begin();
+
+    // Header: session=<from MOUNT response>, seq=0x01, cmd=TNFS_CMD_OPENDIR.
+    // Payload: null-terminated path "/" -- MOUNT already scoped the session
+    // to "/Atari.ST", so subsequent paths are relative to that root.
+    uint8_t buf[6];
+    buf[0] = (uint8_t)(s_state.sid & 0xFF);
+    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[2] = 0x01; // seq 1 for OPENDIR
+    buf[3] = TNFS_CMD_OPENDIR;
+    buf[4] = '/';
+    buf[5] = '\0';
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(buf), PBUF_RAM);
+    if (!p)
+    {
+        cyw43_arch_lwip_end();
+        return;
+    }
+
+    memcpy(p->payload, buf, sizeof(buf));
+    udp_sendto(s_mount_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    pbuf_free(p);
+
+    cyw43_arch_lwip_end();
 }
 
-// Fase 5F: (re)write DEBUG.TXT only when dirty, only when hd_folder is
+void sidetnfs_probe_service(void)
+{
+    if (s_state.mount_response_received && s_state.mount_rc == 0x00 && !s_state.opendir_sent)
+    {
+        send_opendir_probe();
+    }
+}
+
+// Fase 5H: record that networking/TNFS was skipped this boot (no WiFi
+// configured, connect/NTP timeout, or ESC/CANCEL during either wait). Only
+// touches RAM state -- safe to call regardless of WiFi/cyw43 state.
+void sidetnfs_mark_network_skipped(void)
+{
+    if (s_state.network_skipped)
+    {
+        return; // already recorded, avoid needless dirty-thrashing
+    }
+    s_state.network_skipped = true;
+    s_state.debug_dirty = true;
+}
+
+// Fase 5G/5H: build the short status text. No raw dumps by default (see
+// SIDETNFS_DEBUG_SHOW_RAW). Each line is independent so partial progress
+// (e.g. mount done, opendir still pending) is always representable.
+static int build_status_text(char *text, size_t text_size)
+{
+    char line1[64];
+    char line2[64] = "";
+
+    if (s_state.network_skipped)
+    {
+        return snprintf(text, text_size, "[SKIP] tnfs disabled\r\n");
+    }
+    if (!s_state.mount_probe_sent)
+    {
+        return 0; // nothing to report yet
+    }
+    else if (!s_state.mount_response_received)
+    {
+        snprintf(line1, sizeof(line1), "[WAIT] mount response pending\r\n");
+    }
+    else if (s_state.mount_rc != 0x00)
+    {
+        snprintf(line1, sizeof(line1), "[ERR] mount failed - rc: %02X\r\n", s_state.mount_rc);
+    }
+    else
+    {
+        snprintf(line1, sizeof(line1), "[OK] mounted successful - session id: %04X\r\n", s_state.sid);
+
+        if (s_state.opendir_sent)
+        {
+            if (!s_state.opendir_response_received)
+            {
+                snprintf(line2, sizeof(line2), "[WAIT] opendir / response pending\r\n");
+            }
+            else if (s_state.opendir_rc != 0x00)
+            {
+                snprintf(line2, sizeof(line2), "[ERR] opendir / failed - rc: %02X\r\n", s_state.opendir_rc);
+            }
+            else
+            {
+                snprintf(line2, sizeof(line2), "[OK] opendir / successful - handle: %u\r\n", s_state.opendir_handle);
+            }
+        }
+    }
+
+    int len = snprintf(text, text_size, "%s%s", line1, line2);
+
+#if SIDETNFS_DEBUG_SHOW_RAW
+    if (len > 0 && (size_t)len < text_size)
+    {
+        char raw_hex[SIDETNFS_DEBUG_RAW_SIZE * 3 + 1] = {0};
+        size_t raw_hex_len = 0;
+        uint16_t raw_count = s_state.last_response_len < SIDETNFS_DEBUG_RAW_SIZE
+                                 ? s_state.last_response_len
+                                 : SIDETNFS_DEBUG_RAW_SIZE;
+        for (uint16_t i = 0; i < raw_count && raw_hex_len < sizeof(raw_hex); i++)
+        {
+            int r = snprintf(&raw_hex[raw_hex_len], sizeof(raw_hex) - raw_hex_len, "%02X ", s_state.last_raw[i]);
+            if (r <= 0)
+            {
+                break;
+            }
+            raw_hex_len += (size_t)r;
+        }
+        int extra = snprintf(text + len, text_size - (size_t)len, "raw: %s\r\n", raw_hex);
+        if (extra > 0)
+        {
+            len += extra;
+        }
+    }
+#endif
+
+    return len;
+}
+
+// Fase 5F/5G: (re)write DEBUG.TXT only when dirty, only when hd_folder is
 // known, with simple throttling. Never blocks, never retries, silently
 // does nothing on any failure -- the dirty flag is left set on failure or
 // when throttled, so a later call will retry.
 void sidetnfs_debug_file_service(const char *hd_folder)
 {
-    if (!s_debug_state.debug_dirty || hd_folder == NULL)
+    if (!s_state.debug_dirty || hd_folder == NULL)
     {
         return;
     }
@@ -261,53 +420,8 @@ void sidetnfs_debug_file_service(const char *hd_folder)
         return;
     }
 
-    char raw_hex[SIDETNFS_DEBUG_RAW_SIZE * 3 + 1] = {0};
-    size_t raw_hex_len = 0;
-    uint16_t raw_count = s_debug_state.response_len < SIDETNFS_DEBUG_RAW_SIZE
-                             ? s_debug_state.response_len
-                             : SIDETNFS_DEBUG_RAW_SIZE;
-    for (uint16_t i = 0; i < raw_count && raw_hex_len < sizeof(raw_hex); i++)
-    {
-        int r = snprintf(&raw_hex[raw_hex_len], sizeof(raw_hex) - raw_hex_len, "%02X ", s_debug_state.raw[i]);
-        if (r <= 0)
-        {
-            break;
-        }
-        raw_hex_len += (size_t)r;
-    }
-
-    char text[512];
-    int len = snprintf(text, sizeof(text),
-                        "SIDETNFS DEBUG\r\n"
-                        "Server: " SIDETNFS_SERVER_IP ":16384\r\n"
-                        "Mount/root: /" SIDETNFS_MOUNT_NAME "\r\n"
-                        "\r\n"
-                        "Mount probe sent: %s\r\n"
-                        "Mount probe send count: %u\r\n"
-                        "\r\n"
-                        "Response received: %s\r\n"
-                        "Response length: %u\r\n"
-                        "SID: %u\r\n"
-                        "SEQ: %u\r\n"
-                        "CMD: %u\r\n"
-                        "RC: %u\r\n"
-                        "Result: %s\r\n"
-                        "\r\n"
-                        "Raw response:\r\n"
-                        "%s\r\n"
-                        "\r\n"
-                        "Debug writes: %u\r\n",
-                        s_debug_state.mount_probe_sent ? "yes" : "no",
-                        (unsigned)s_debug_state.mount_probe_send_count,
-                        s_debug_state.mount_response_received ? "yes" : "no",
-                        (unsigned)s_debug_state.response_len,
-                        (unsigned)s_debug_state.sid,
-                        (unsigned)s_debug_state.seq,
-                        (unsigned)s_debug_state.cmd,
-                        (unsigned)s_debug_state.rc,
-                        result_text(),
-                        raw_hex,
-                        (unsigned)s_debug_state.debug_write_count);
+    char text[192];
+    int len = build_status_text(text, sizeof(text));
     if (len <= 0)
     {
         return;
@@ -332,6 +446,6 @@ void sidetnfs_debug_file_service(const char *hd_folder)
     f_write(&file, text, (UINT)len, &written);
     f_close(&file);
 
-    s_debug_state.debug_dirty = false;
-    s_debug_state.debug_write_count++;
+    s_state.debug_dirty = false;
+    s_state.debug_write_count++;
 }

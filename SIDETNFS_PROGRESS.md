@@ -132,3 +132,23 @@ Server tcpdump output:
   - retry time `1000 ms`
 - Mega STE hardware test passed.
 - GEMDRIVE still works.
+
+## Fase 5G — TNFS OPENDIR test
+
+- After successful TNFS MOUNT, firmware sends one OPENDIR request for `/`.
+- OPENDIR uses the session id from the MOUNT response.
+- OPENDIR response is received non-blocking.
+- `DEBUG.TXT` uses short status lines.
+- Tested result: `[OK] opendir / successful - handle: 0`.
+- No GEMDRIVE backend changes.
+- Mega STE hardware test passed.
+
+## Fase 5H — guard network polling after ESC/network skip
+
+- Fixed ESC/network-skip crash.
+- Root cause: `cyw43_arch_poll()` and SIDETNFS probe service were called after network teardown.
+- Added `sidetnfs_network_ok` guard in GEMDRIVE main loop.
+- Added `sidetnfs_mark_network_skipped()`.
+- If WiFi/network is skipped or fails, TNFS probe service is disabled.
+- `DEBUG.TXT` shows `[SKIP] tnfs disabled`.
+- Mega STE ESC-skip test passed.

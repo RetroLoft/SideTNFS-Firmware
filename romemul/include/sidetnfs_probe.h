@@ -31,6 +31,15 @@ void sidetnfs_send_udp_probe(void);
 // sidetnfs_debug_file_service() will pick this up on its next call.
 void sidetnfs_send_mount_probe(void);
 
+// Fase 5G: check whether the MOUNT response is in and successful, and if so
+// (and OPENDIR "/" was not already sent this boot) send a single OPENDIR
+// request over the existing MOUNT PCB. Fire-and-forget, non-blocking, safe
+// to call every GEMDRIVE main-loop iteration -- the internal guards make it
+// a cheap no-op otherwise. Must only be called after
+// sidetnfs_send_mount_probe() was called (and ideally after a
+// cyw43_arch_poll() so the MOUNT response has had a chance to arrive).
+void sidetnfs_probe_service(void);
+
 // Fase 5F: if the debug state is dirty (mount probe just sent, or a
 // response just arrived) and hd_folder is known, (re)write
 // <hd_folder>/DEBUG.TXT with FA_CREATE_ALWAYS, then clear the dirty flag.
@@ -40,5 +49,14 @@ void sidetnfs_send_mount_probe(void);
 // call from multiple places, including once per GEMDRIVE main-loop
 // iteration -- the dirty-check keeps it a cheap no-op otherwise.
 void sidetnfs_debug_file_service(const char *hd_folder);
+
+// Fase 5H: mark that networking/TNFS was skipped this boot (no WiFi
+// configured, WiFi connect failed/timed out, or the user pressed ESC/
+// CANCEL during the WiFi or NTP wait). Only touches RAM state -- safe to
+// call even though WiFi/cyw43 may already have been torn down by the
+// caller. Marks the debug state dirty so sidetnfs_debug_file_service()
+// will write a short "[SKIP] tnfs disabled" line once hd_folder is known.
+// Never blocks, never logs, no UART.
+void sidetnfs_mark_network_skipped(void);
 
 #endif // SIDETNFS_PROBE_H

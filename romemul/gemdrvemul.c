@@ -890,6 +890,13 @@ void init_gemdrvemul(bool safe_config_reboot)
         DPRINTF("Shared variable %d: %04x%04x\n", i, value & 0xFFFF, value >> 16);
     }
 
+    // Fase 5H: only true once WiFi is confirmed still up (set right before
+    // sidetnfs_send_mount_probe() below). Guards every later call that
+    // touches cyw43/lwIP in the main loop, since every other path below
+    // this point falls back to cyw43_arch_deinit()/network_terminate() --
+    // polling a torn-down network stack there previously caused a hang.
+    bool sidetnfs_network_ok = false;
+
     // Only try to get the datetime from the network if the wifi is configured
     if (gemdrive_rtc_enabled && strlen(find_entry(PARAM_WIFI_SSID)->value) > 0)
     {
@@ -998,6 +1005,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Just be sure to deinit the network stack
             network_terminate();
             DPRINTF("No wifi configured. Skipping network initialization.\n");
+            sidetnfs_mark_network_skipped();
         }
         else
         {
@@ -1105,13 +1113,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // be up (every other path below this falls back to
                 // cyw43_arch_deinit()), and it runs before the main command
                 // loop below ever sees a real Atari/GEMDRIVE handshake.
+                sidetnfs_network_ok = true;
                 sidetnfs_send_mount_probe();
             }
             else
             {
                 DPRINTF("Timeout reached. RTC not set.\n");
-                cyw43_arch_deinit(); 
+                cyw43_arch_deinit();
                 DPRINTF("No wifi configured. Skipping network initialization.\n");
+                sidetnfs_mark_network_skipped();
             }
         }
     }
@@ -1120,6 +1130,7 @@ void init_gemdrvemul(bool safe_config_reboot)
         // Just be sure to deinit the network stack
         cyw43_arch_deinit();
         DPRINTF("No wifi configured. Skipping network initialization.\n");
+        sidetnfs_mark_network_skipped();
     }
 
     DPRINTF("Waiting for commands...\n");
@@ -2587,14 +2598,22 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_config_only_once = false;
         }
 
-        // Fase 5F: let the network stack process any pending packets (the
-        // TNFS MOUNT reply is otherwise never delivered to its callback in
-        // this poll-mode build), then write DEBUG.TXT if anything became
-        // dirty as a result. Both calls are cheap no-ops when there is
-        // nothing pending/dirty -- this is not a wait/retry loop.
+        // Fase 5F/5G/5H: let the network stack process any pending packets
+        // (the TNFS replies are otherwise never delivered to their callback
+        // in this poll-mode build), then send the next probe step if the
+        // previous one succeeded. Both touch cyw43/lwIP, so they are only
+        // safe when sidetnfs_network_ok is true (WiFi/NTP actually
+        // succeeded this boot) -- every other path already tore cyw43 down
+        // via cyw43_arch_deinit()/network_terminate(), and polling it
+        // afterwards is what previously caused a hang after ESC/no-WiFi.
+        // DEBUG.TXT itself is pure FatFS and always safe to service.
+        if (sidetnfs_network_ok)
+        {
 #if PICO_CYW43_ARCH_POLL
-        cyw43_arch_poll();
+            cyw43_arch_poll();
 #endif
+            sidetnfs_probe_service();
+        }
         sidetnfs_debug_file_service(hd_folder);
     }
 }
