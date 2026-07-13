@@ -7,6 +7,7 @@
  */
 
 #include "include/gemdrvemul.h"
+#include "include/sidetnfs_probe.h"
 
 // Let's substitute the flags
 static uint16_t active_command_id = 0xFFFF;
@@ -1001,6 +1002,10 @@ void init_gemdrvemul(bool safe_config_reboot)
         else
         {
             // We have network connection!
+            // One-shot, non-blocking UDP reachability probe toward the TNFS
+            // server. Not a TNFS operation -- no mount, no reply handling.
+            sidetnfs_send_udp_probe();
+
             // Start the internal RTC
             rtc_init();
 

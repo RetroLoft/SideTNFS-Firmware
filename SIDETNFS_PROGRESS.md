@@ -80,3 +80,23 @@
 - No Fsfirst/Fsnext/DTA changes.
 - No Fopen/Fread/Fwrite changes.
 - Mega STE hardware test passed.
+
+## Fase 5A — UDP probe to TNFS server
+
+- Added a minimal UDP probe to `192.168.178.10:16384`.
+- Probe payload is `SIDETNFS_PROBE`.
+- Probe is sent only after WiFi is successfully available in the existing GEMDRIVE/WiFi path.
+- No TNFS client added.
+- No MOUNT/OPENDIR/READDIR/OPEN/READ added.
+- No UART/debug/ringbuffer added.
+- Normal releasebuild used.
+- Server confirmed receipt with tcpdump.
+- Server also sent a UDP response.
+- GEMDRIVE backend was not changed.
+
+Server tcpdump output:
+
+```text
+15:26:46.361174 enp2s0 In  IP 192.168.178.206.50752 > 192.168.178.10.16384: UDP, length 14
+15:26:46.361433 enp2s0 Out IP 192.168.178.10.16384 > 192.168.178.206.50752: UDP, length 5
+```
