@@ -41,3 +41,16 @@
 - No backend selection added.
 - Mega STE hardware test passed.
 - Baseline comparison confirmed that "Show Information" on GEMDRIVE drive/folders was already not working in original v1.0.1, so this is not a Fase 4C regression.
+
+## Fase 4D — FatFS to GEMDOS error mapping helper
+
+- Added central helper for mapping FatFS `FRESULT` values to GEMDOS error codes.
+- Helper is used only in the first low-risk handler(s) selected during this phase.
+- No TNFS added.
+- No backend selection added.
+- No Fsfirst/Fsnext/DTA changes.
+- No Fopen/Fread/Fwrite changes.
+- Mega STE hardware test passed.
+- Normal GEMDRIVE usage still works.
+- Creating and deleting a directory still works.
+- Error-path testing for deleting a non-existing directory is deferred to a later small test program.

@@ -586,6 +586,26 @@ static void __not_in_flash_func(scfs_get_local_full_pathname)(char *tmp_filepath
     get_local_full_pathname(tmp_filepath);
 }
 
+// Declared in scfs.h; implemented here because the GEMDOS_* constants below
+// are defined later in this file's own header (gemdrvemul.h), not in scfs.h.
+// Mapping matches the values currently used by GEMDRVEMUL_DDELETE_CALL only:
+// other handlers (Fdelete, Frename, Fclose) map some FRESULT values
+// differently and are intentionally not covered here yet.
+int16_t __not_in_flash_func(scfs_fresult_to_gemdos_error)(FRESULT fr)
+{
+    switch (fr)
+    {
+    case FR_OK:
+        return GEMDOS_EOK;
+    case FR_DENIED:
+        return GEMDOS_EACCDN;
+    case FR_NO_PATH:
+        return GEMDOS_EPTHNF;
+    default:
+        return GEMDOS_EINTRN;
+    }
+}
+
 // Delete all the file descriptors in the list using delete all files by fdesc
 static void __not_in_flash_func(delete_all_files)(FileDescriptors **head)
 {
@@ -1447,24 +1467,21 @@ void init_gemdrvemul(bool safe_config_reboot)
                     if (fr == FR_DENIED)
                     {
                         DPRINTF("ERROR: Folder is not empty\n");
-                        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
                     }
                     else if (fr == FR_NO_PATH)
                     {
                         DPRINTF("ERROR: Folder does not exist\n");
-                        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EPTHNF;
                     }
                     else
                     {
                         DPRINTF("ERROR: Internal error: %d\n", fr);
-                        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EINTRN;
                     }
                 }
                 else
                 {
                     DPRINTF("Folder deleted\n");
-                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EOK;
                 }
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = scfs_fresult_to_gemdos_error(fr);
             }
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
