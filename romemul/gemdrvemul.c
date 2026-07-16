@@ -373,6 +373,53 @@ static void __not_in_flash_func(populate_dta)(uint32_t memory_address_dta, uint3
     }
 }
 
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+// Fase 5N (experimental): fill the Atari-side DTA transfer area directly
+// from a normalized TNFS entry, mirroring populate_dta()'s exact byte
+// layout (including its pre-write endianness-swap of the still-zeroed
+// filename area, harmless since nullify_dta() already zeroed it -- kept
+// only to stay byte-for-byte consistent with the proven function above).
+// Unlike populate_dta(), this never touches the FatFS DTA hash table/DIR/
+// FILINFO at all -- this search's bookkeeping lives entirely in
+// sidetnfs_probe.c's own single-slot experimental state.
+static void __not_in_flash_func(populate_dta_from_sidetnfs_entry)(uint32_t memory_address_dta,
+                                                                    const SidetnfsAtariDirEntry *entry)
+{
+    nullify_dta(memory_address_dta);
+    *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_F_FOUND)) = 0;
+
+    char d_name[12] = {0};
+    char d_fname[14] = {0};
+    strncpy(d_name, entry->name, sizeof(d_name) - 1);
+    strncpy(d_fname, entry->name, sizeof(d_fname) - 1);
+
+    for (uint8_t i = 0; i < 12; i++)
+    {
+        *((volatile uint8_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + i)) = (uint8_t)d_name[i];
+    }
+    CHANGE_ENDIANESS_BLOCK16(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 30, 14);
+    *((volatile uint32_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 12)) = 0; // d_offset_drive
+    *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 16)) = 0; // d_curbyt
+    *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 18)) = 0; // d_curcl
+    *((volatile uint8_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 20)) = entry->attr;
+    *((volatile uint8_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 21)) = entry->attr;
+    CHANGE_ENDIANESS_BLOCK16(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 20, 2);
+    *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 22)) = entry->time;
+    *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 24)) = entry->date;
+
+    uint32_t value = ((entry->size << 16) & 0xFFFF0000) | ((entry->size >> 16) & 0xFFFF);
+    uint16_t *address = (uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 26);
+    address[1] = (value >> 16) & 0xFFFF;
+    address[0] = value & 0xFFFF;
+
+    for (uint8_t i = 0; i < 14; i++)
+    {
+        *((volatile uint8_t *)(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 30 + i)) = (uint8_t)d_fname[i];
+    }
+    CHANGE_ENDIANESS_BLOCK16(memory_address_dta + GEMDRVEMUL_DTA_TRANSFER + 30, 14);
+}
+#endif // SIDETNFS_EXPERIMENTAL_FS_LISTING
+
 static void __not_in_flash_func(add_file)(FileDescriptors **head, FileDescriptors *newFDescriptor, const char *fpath, FIL fobject, uint16_t new_fd)
 {
     strncpy(newFDescriptor->fpath, fpath, 127);
@@ -1144,6 +1191,22 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if defined(_DEBUG) && (_DEBUG != 0)
         uint16_t old_command = active_command_id != 0xFFFF ? active_command_id : 0xFFFF;
 #endif
+#if SIDETNFS_FS_DIAG_ENABLED
+        // Fase 5V/5X: log every genuinely-dispatched command_id (never on
+        // idle 0xFFFF iterations) so a short, focused test (root listing +
+        // ESC/refresh a few times + SELECT) can show whether an
+        // unrecognized/unexpected command_id ever arrives instead of a
+        // real GEMDRVEMUL_FSNEXT_CALL -- see report. Independent of
+        // SIDETNFS_EXPERIMENTAL_FS_LISTING so the same measurement can be
+        // taken on the SD/FatFS baseline build (Fase 5X). Keep test
+        // sessions short: this logs EVERY command, so a long session will
+        // fill the 256-slot budget with unrelated Fopen/Fread/etc. noise
+        // before the interesting part is even reached.
+        if (active_command_id != 0xFFFF)
+        {
+            sidetnfs_diag_log(SIDETNFS_DIAG_COMMAND_ENTER, active_command_id, NULL, NULL, NULL, 0, 0, 0, 0);
+        }
+#endif
         switch (active_command_id)
         {
         case GEMDRVEMUL_DEBUG:
@@ -1266,8 +1329,13 @@ void init_gemdrvemul(bool safe_config_reboot)
 
                         // Fase 5F: write/update DEBUG.TXT now that SD/FatFS
                         // is confirmed mounted and hd_folder is known.
-                        // No-op if nothing is dirty yet.
+                        // No-op if nothing is dirty yet. Fase 5S: skipped
+                        // entirely in diagnostic mode -- DEBUG.TXT is only
+                        // ever written by the SELECT-button dump then (see
+                        // report).
+#if !SIDETNFS_FS_DIAG_ENABLED
                         sidetnfs_debug_file_service(hd_folder);
+#endif
 
                         *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
                     }
@@ -1539,9 +1607,51 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_DTA_EXIST_CALL:
         {
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
-            bool ndta_exists = lookupDTA(ndta);
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
+            bool ndta_exists;
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+            // Fase 5Z: DTA_EXIST must recognize TNFS (and fake no-network)
+            // search state too -- the 68k side queries this between
+            // Fsfirst and Fsnext to decide whether to issue a real Fsnext
+            // at all (see report: the SD-baseline log showed COMMAND_ENTER
+            // DTA_EXIST immediately before FSNEXT_ENTER). Never touches the
+            // FatFS DTA table while this switch is on -- Fsfirst never
+            // populates it in this mode.
+            bool fake_active = sidetnfs_cache_search_is_active(ndta);
+#if !SIDETNFS_DIR_CACHE_ENABLED
+            bool tnfs_active = sidetnfs_tnfs_dta_is_active(ndta);
+#else
+            bool tnfs_active = false;
+#endif
+            ndta_exists = tnfs_active || fake_active;
+#if SIDETNFS_FS_DIAG_ENABLED
+            if (tnfs_active)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_TNFS_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+            else if (fake_active)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAKE_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+            else
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+#endif
+#else
+            ndta_exists = lookupDTA(ndta) ? true : false;
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_EXIST_FATFS_OK : SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta,
+                               NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
+#endif
             DPRINTF("DTA %x exists: %s\n", ndta, (ndta_exists) ? "TRUE" : "FALSE");
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DTA_EXIST, (ndta_exists ? ndta : 0));
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_RETURN, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)ndta_exists, 0);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -1550,15 +1660,58 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             DPRINTF("Releasing DTA: %x\n", ndta);
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
+            uint32_t release_count;
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+            // Fase 5Z: release whichever backend actually holds ndta's
+            // search state -- TNFS DTA registry and/or the fake no-network
+            // search table (never the FatFS DTA table, which Fsfirst never
+            // populated in this mode). Each release is a no-op if ndta
+            // isn't active in that particular table.
+#if !SIDETNFS_DIR_CACHE_ENABLED
+            bool was_tnfs_active = sidetnfs_tnfs_dta_is_active(ndta);
+            sidetnfs_tnfs_dta_release(ndta);
+#else
+            bool was_tnfs_active = false;
+#endif
+            bool was_fake_active = sidetnfs_cache_search_is_active(ndta);
+            sidetnfs_cache_search_close(ndta);
+#if SIDETNFS_FS_DIAG_ENABLED
+            if (was_tnfs_active)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_TNFS, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+            if (was_fake_active)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_FAKE, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+#endif
+#if !SIDETNFS_DIR_CACHE_ENABLED
+            release_count = sidetnfs_tnfs_dta_count_active() + sidetnfs_cache_search_count_active();
+#else
+            release_count = sidetnfs_cache_search_count_active();
+#endif
+            nullify_dta(memory_shared_address);
+#else
             DTANode *dtaNode = lookupDTA(ndta);
             if (dtaNode != NULL)
             {
                 releaseDTA(ndta);
                 DPRINTF("Existing DTA at %x released. DTA table elements: %d\n", ndta, countDTA());
+#if SIDETNFS_FS_DIAG_ENABLED
+                sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_FATFS, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
             }
             nullify_dta(memory_shared_address);
-
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DTA_RELEASE, countDTA());
+            release_count = countDTA();
+#endif
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DTA_RELEASE, release_count);
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_RETURN, ndta, NULL, NULL, NULL, 0, 0, 0,
+                               (uint8_t)release_count);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -1619,12 +1772,112 @@ void init_gemdrvemul(bool safe_config_reboot)
             DPRINTF("Fsfirst ndta: %x, attribs: %s, fspec: %x, fspec string: %s\n", ndta, attribs_str, fspec, fspec_string);
             DPRINTF("Fsfirst Full internal path: %s, filename pattern: %s[%d]\n", internal_path, pattern, strlen(pattern));
 
-            bool ndta_exists = lookupDTA(ndta) ? true : false;
+#if SIDETNFS_FS_DIAG_ENABLED
+            // Fase 5X: unconditional on SIDETNFS_EXPERIMENTAL_FS_LISTING so
+            // this fires identically on the SD baseline build too.
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_ENTER, ndta, path_forwardslash, pattern, NULL, 0, 0, 0,
+                               (uint8_t)attribs);
+#endif
 
             if (!(attribs & FS_ST_LABEL))
             {
                 attribs |= FS_ST_ARCH;
             }
+
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_ATTR_PREP, ndta, NULL, NULL, NULL, 0, 0, 0, (uint8_t)attribs);
+#endif
+
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+            // Fase 5Q: directory listing is now UNCONDITIONALLY served from
+            // memory (TNFS cache, or the fake no-network listing below) --
+            // never from FatFS/SD, and never falling through to the code
+            // below this block. No f_findfirst(), no lookupDTA()/insertDTA()
+            // for this ndta at all (see report: those are what the FatFS
+            // path below uses, and it is now completely unreachable while
+            // this switch is on). path_forwardslash/pattern/attribs were
+            // already computed above (mount-root-relative, no hd_folder,
+            // trailing ".*" already stripped by seach_path_2_st()).
+            {
+                char tnfs_path[MAX_FOLDER_LENGTH];
+                snprintf(tnfs_path, sizeof(tnfs_path), "%s", path_forwardslash);
+                size_t tnfs_path_len = strlen(tnfs_path);
+                if (tnfs_path_len > 1 && tnfs_path[tnfs_path_len - 1] == '/')
+                {
+                    tnfs_path[tnfs_path_len - 1] = '\0';
+                }
+
+                SidetnfsAtariDirEntry sidetnfs_entry;
+                SidetnfsDirSearchResult sidetnfs_result;
+                if (sidetnfs_network_ok && sidetnfs_tnfs_listing_ready())
+                {
+#if SIDETNFS_DIR_CACHE_ENABLED
+                    sidetnfs_result =
+                        sidetnfs_cache_search_start(ndta, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+#else
+                    // Fase 5Y: cache layer disabled -- TNFS DTA-registry
+                    // search instead (OPENDIRX + one-entry-at-a-time
+                    // READDIRX, registered under ndta the same way SD's
+                    // insertDTA()/lookupDTA() works). Never SD.
+                    sidetnfs_result =
+                        sidetnfs_tnfs_dta_start(ndta, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+#endif
+                }
+                else
+                {
+                    // Fase 5Q: TNFS never became available this boot (no
+                    // WiFi, ESC-skip, or MOUNT never succeeded). Serve a
+                    // fake, memory-only listing instead of any SD fallback
+                    // -- this NEVER touches cyw43/lwIP (which may already be
+                    // torn down in this case, see Fase 5H).
+                    sidetnfs_result =
+                        sidetnfs_fake_search_start(ndta, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+                }
+
+                if (sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND)
+                {
+                    populate_dta_from_sidetnfs_entry(memory_shared_address, &sidetnfs_entry);
+                    sidetnfs_note_tnfs_fs_hit();
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_FOUND, ndta, tnfs_path, pattern, sidetnfs_entry.name, 0, 0,
+                                       0, sidetnfs_entry.attr);
+                }
+                else // NOT_FOUND (empty/exhausted listing) or ERROR
+                     // (cache-miss refresh timed out/failed) -- either way, a
+                     // clean GEMDOS answer, never SD fallback.
+                {
+                    nullify_dta(memory_shared_address);
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
+                    if (sidetnfs_result == SIDETNFS_DIR_SEARCH_ERROR)
+                    {
+                        sidetnfs_note_tnfs_fs_error();
+                    }
+                    else
+                    {
+                        sidetnfs_note_tnfs_fs_hit();
+                    }
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_NOT_FOUND, ndta, tnfs_path, pattern, NULL, 0, 0,
+                                       (uint8_t)sidetnfs_result, 0);
+                }
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_RETURN, ndta, NULL, NULL, NULL, 0, 0,
+                                   (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_EFILNF), 0);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break; // ALWAYS -- the FatFS code below is unreachable
+            }
+#endif // SIDETNFS_EXPERIMENTAL_FS_LISTING
+
+            bool ndta_exists = lookupDTA(ndta) ? true : false;
+
+#if SIDETNFS_FS_DIAG_ENABLED
+            // Fase 5X: SD-baseline measurement -- logging only, no behavior
+            // change (see report).
+            sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_LOOKUP_OK : SIDETNFS_DIAG_DTA_LOOKUP_FAIL, ndta, NULL,
+                               NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_SD_DTA_LOOKUP_OK : SIDETNFS_DIAG_SD_DTA_LOOKUP_FAIL, ndta,
+                               NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_SD_FIND_FIRST, ndta, internal_path, pattern, NULL, 0, 0, 0,
+                               (uint8_t)attribs);
+#endif
 
             FRESULT fr;   /* Return value */
             DIR *dj;      /* Directory object */
@@ -1690,6 +1943,12 @@ void init_gemdrvemul(bool safe_config_reboot)
                     }
                     DTA data = {"filename.typ", 0, 0, 0, 0, 0, 0, 0, 0, "filename.typ"};
                     insertDTA(ndta, data, dj, fno, attribs);
+#if SIDETNFS_FS_DIAG_ENABLED
+                    sidetnfs_diag_log(SIDETNFS_DIAG_DTA_INSERT, ndta, NULL, NULL, fno->fname, 0, 0, 0, 0);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_SD_DTA_INSERT, ndta, NULL, NULL, fno->fname, 0, 0, 0, 0);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_FOUND, ndta, NULL, NULL, fno->fname, 0, 0, 0,
+                                       attribs_conv_st);
+#endif
                     // Populate the DTA with the first file found
                     populate_dta(memory_shared_address, ndta, GEMDOS_EFILNF);
                     // Null dj and fno to avoid freeing them
@@ -1699,6 +1958,10 @@ void init_gemdrvemul(bool safe_config_reboot)
                 else
                 {
                     DPRINTF("Skipped: %s, attr: %s\n", fno->fname, attribs_str);
+#if SIDETNFS_FS_DIAG_ENABLED
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_NOT_FOUND, ndta, NULL, NULL, fno->fname, 0, 0,
+                                       (uint8_t)GEMDOS_EFILNF, 0);
+#endif
                     int16_t error_code = GEMDOS_EFILNF;
                     DPRINTF("DTA at %x showing error code: %x\n", ndta, error_code);
                     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = error_code;
@@ -1722,6 +1985,10 @@ void init_gemdrvemul(bool safe_config_reboot)
                 }
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = error_code;
                 nullify_dta(memory_shared_address);
+#if SIDETNFS_FS_DIAG_ENABLED
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_NOT_FOUND, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)error_code,
+                                   0);
+#endif
             }
             // Guarantee that the dynamic memory is released
             if (dj != NULL)
@@ -1732,6 +1999,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             {
                 free(fno);
             }
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_RETURN, ndta, NULL, NULL, NULL, 0, 0,
+                               (uint8_t)(*((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND))),
+                               0);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -1741,10 +2013,124 @@ void init_gemdrvemul(bool safe_config_reboot)
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0]; // d3 register
             DPRINTF("Fsnext ndta: %x\n", ndta);
 
+#if SIDETNFS_FS_DIAG_ENABLED && !SIDETNFS_EXPERIMENTAL_FS_LISTING
+            // Fase 5X: SD-baseline measurement -- the TNFS build already
+            // logs FSNEXT_ENTER/FSNEXT_CASE_REACHED below (inside the
+            // SIDETNFS_EXPERIMENTAL_FS_LISTING block); this is the same
+            // pair of events for the SD/FatFS baseline build, logged before
+            // any other logic so there is no ambiguity about whether
+            // GEMDRVEMUL_FSNEXT_CALL was ever dispatched to at all.
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_CASE_REACHED, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
+
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+            // Fase 5U: log both events at the absolute top of this case,
+            // before any other logic, so there is no ambiguity about
+            // whether GEMDRVEMUL_FSNEXT_CALL was ever dispatched to at all
+            // (see report -- hardware testing never showed either of
+            // these, which is the actual root cause under investigation).
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_CASE_REACHED, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            // Fase 5Q: directory listing is UNCONDITIONALLY served from
+            // memory (real TNFS cache search, or a fake no-network search --
+            // sidetnfs_cache_search_next() handles both identically, see
+            // report). Never falls through to the FatFS DTA hash table
+            // below -- lookupDTA()/f_findnext() are unreachable here while
+            // this switch is on, even if no search is (or is no longer)
+            // active for this ndta (a clean GEMDOS_ENMFIL, not a crash).
+            {
+                SidetnfsAtariDirEntry sidetnfs_entry;
+                SidetnfsDirSearchResult sidetnfs_result;
+                bool sidetnfs_search_was_active;
+#if SIDETNFS_DIR_CACHE_ENABLED
+                sidetnfs_search_was_active = sidetnfs_cache_search_is_active(ndta);
+                sidetnfs_result =
+                    sidetnfs_search_was_active ? sidetnfs_cache_search_next(ndta, &sidetnfs_entry) : SIDETNFS_DIR_SEARCH_ERROR;
+#else
+                // Fase 5Y: a search active for ndta is either the fake
+                // no-network listing (always via the shared
+                // cache-search-slot table, see sidetnfs_fake_search_start())
+                // or a real TNFS DTA-registry search -- check both.
+                if (sidetnfs_cache_search_is_active(ndta))
+                {
+                    sidetnfs_search_was_active = true;
+                    sidetnfs_result = sidetnfs_cache_search_next(ndta, &sidetnfs_entry);
+                }
+                else if (sidetnfs_tnfs_dta_is_active(ndta))
+                {
+                    sidetnfs_search_was_active = true;
+                    sidetnfs_result = sidetnfs_tnfs_dta_next(ndta, &sidetnfs_entry);
+                }
+                else
+                {
+                    sidetnfs_search_was_active = false;
+                    sidetnfs_result = SIDETNFS_DIR_SEARCH_ERROR;
+                }
+#endif
+                if (sidetnfs_search_was_active)
+                {
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_SEARCH_ACTIVE, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+                }
+                else
+                {
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_SEARCH_MISSING, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+                }
+                if (sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND)
+                {
+                    populate_dta_from_sidetnfs_entry(memory_shared_address, &sidetnfs_entry);
+                    sidetnfs_note_tnfs_fs_hit();
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_FOUND, ndta, NULL, NULL, sidetnfs_entry.name, 0, 0, 0,
+                                       sidetnfs_entry.attr);
+                }
+                else
+                {
+                    // NOT_FOUND (listing exhausted) or ERROR (no/invalidated
+                    // search state): end cleanly with GEMDOS_ENMFIL either
+                    // way -- no SD fallback.
+                    sidetnfs_cache_search_close(ndta);
+#if !SIDETNFS_DIR_CACHE_ENABLED
+                    sidetnfs_tnfs_dta_release(ndta); // no-op if this was the fake listing, not a real TNFS search
+#endif
+                    nullify_dta(memory_shared_address);
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_ENMFIL;
+                    if (sidetnfs_result == SIDETNFS_DIR_SEARCH_ERROR)
+                    {
+                        sidetnfs_note_tnfs_fs_error();
+                    }
+                    else
+                    {
+                        sidetnfs_note_tnfs_fs_hit();
+                    }
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_END, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)sidetnfs_result,
+                                       0);
+                }
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_RETURN, ndta, NULL, NULL, NULL, 0, 0,
+                                   (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_ENMFIL), 0);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break; // ALWAYS -- the FatFS code below is unreachable
+            }
+#endif // SIDETNFS_EXPERIMENTAL_FS_LISTING
+
             FRESULT fr; /* Return value */
             DTANode *dtaNode = lookupDTA(ndta);
 
             bool ndta_exists = dtaNode ? true : false;
+#if SIDETNFS_FS_DIAG_ENABLED
+            // Fase 5X: SD-baseline measurement -- logging only, no behavior
+            // change (see report). This is the lookupDTA() call whose
+            // success/failure directly answers "does Fsnext find the DTA
+            // Fsfirst inserted?".
+            sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_LOOKUP_OK : SIDETNFS_DIAG_DTA_LOOKUP_FAIL, ndta, NULL,
+                               NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_SD_DTA_LOOKUP_OK : SIDETNFS_DIAG_SD_DTA_LOOKUP_FAIL, ndta,
+                               NULL, NULL, NULL, 0, 0, 0, 0);
+            if (ndta_exists)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_SD_FIND_NEXT, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+            }
+#endif
             if (dtaNode != NULL && dtaNode->dj != NULL && dtaNode->fno != NULL && ndta_exists)
             {
                 uint32_t attribs = dtaNode->attribs;
@@ -1792,6 +2178,10 @@ void init_gemdrvemul(bool safe_config_reboot)
                     char attribs_str[7] = "";
                     get_attribs_st_str(attribs_str, attribs_conv_st);
                     DPRINTF("Found: %s, attr: %s\n", dtaNode->fno->fname, attribs_str);
+#if SIDETNFS_FS_DIAG_ENABLED
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_FOUND, ndta, NULL, NULL, dtaNode->fno->fname, 0, 0, 0,
+                                       attribs_conv_st);
+#endif
                     // Populate the DTA with the next file found
                     populate_dta(memory_shared_address, ndta, GEMDOS_ENMFIL);
                 }
@@ -1807,6 +2197,9 @@ void init_gemdrvemul(bool safe_config_reboot)
                         DPRINTF("Existing DTA at %x released. DTA table elements: %d\n", ndta, countDTA());
                     }
                     nullify_dta(memory_shared_address);
+#if SIDETNFS_FS_DIAG_ENABLED
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_END, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)error_code, 0);
+#endif
                 }
             }
             else
@@ -1821,7 +2214,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                     DPRINTF("Existing DTA at %x released. DTA table elements: %d\n", ndta, countDTA());
                 }
                 nullify_dta(memory_shared_address);
+#if SIDETNFS_FS_DIAG_ENABLED
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_END, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)error_code, 0);
+#endif
             }
+#if SIDETNFS_FS_DIAG_ENABLED
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_RETURN, ndta, NULL, NULL, NULL, 0, 0,
+                               (uint8_t)(*((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND))),
+                               0);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -2591,7 +2992,23 @@ void init_gemdrvemul(bool safe_config_reboot)
         // }
 #endif
         // If SELECT button is pressed, launch the configurator
-        if (gpio_get(SELECT_GPIO) != 0)
+        bool select_pressed_now = gpio_get(SELECT_GPIO) != 0;
+#if SIDETNFS_FS_DIAG_ENABLED && SIDETNFS_DEBUG_DUMP_ON_SELECT
+        // Fase 5S: edge-triggered (rising edge only) dump of the RAM
+        // diagnostic eventlog to DEBUG.TXT -- fires once per physical
+        // press, before select_button_action() below (which, in the
+        // non-safe-reboot case, reboots immediately and never returns).
+        // This is the ONLY place DEBUG.TXT is ever written in this build;
+        // no automatic main-loop/state-change/callback/Fsfirst-Fsnext write
+        // exists anymore (see report).
+        static bool s_diag_select_prev_pressed = false;
+        if (select_pressed_now && !s_diag_select_prev_pressed)
+        {
+            sidetnfs_diag_dump_on_select(hd_folder);
+        }
+        s_diag_select_prev_pressed = select_pressed_now;
+#endif
+        if (select_pressed_now)
         {
             select_button_action(safe_config_reboot, write_config_only_once);
             // Write config only once to avoid hitting the flash too much
@@ -2613,11 +3030,25 @@ void init_gemdrvemul(bool safe_config_reboot)
             cyw43_arch_poll();
 #endif
             sidetnfs_probe_service();
+#if SIDETNFS_EXPERIMENTAL_FS_LISTING && SIDETNFS_DIR_CACHE_ENABLED
+            // Fase 5O: early, non-blocking root-cache warmup + ongoing
+            // cache-build ticks. At most one network step per call -- see
+            // sidetnfs_dir_cache_service() in sidetnfs_probe.c. Only used
+            // when the cache layer is enabled (Fase 5R); the direct-scan
+            // diagnostic variant does all its network I/O synchronously
+            // inside Fsfirst/Fsnext instead.
+            sidetnfs_dir_cache_service();
+#endif
         }
         // Fase 5J: one-shot SD-root scan for the DEBUG.TXT SD-vs-TNFS
         // comparison. Pure FatFS, independent of network state, guarded
         // internally to run at most once per boot.
         sidetnfs_scan_sd_root_if_needed(hd_folder);
+        // Fase 5S: automatic per-tick DEBUG.TXT writes are disabled in
+        // diagnostic mode -- see the SELECT-button edge-handler above,
+        // which is now the only place DEBUG.TXT is ever written.
+#if !SIDETNFS_FS_DIAG_ENABLED
         sidetnfs_debug_file_service(hd_folder);
+#endif
     }
 }
