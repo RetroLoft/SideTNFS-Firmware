@@ -11,23 +11,45 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Fase 5N/5O: compile-time switch for the experimental TNFS-backed
-// Fsfirst/Fsnext directory listing. When 0, gemdrvemul.c compiles out every
-// TNFS-listing branch entirely, so GEMDRVEMUL_FSFIRST_CALL/
-// GEMDRVEMUL_FSNEXT_CALL behave exactly as the existing, proven SD/FatFS
-// backend (byte-for-byte unchanged). When 1 (Fase 5O meaning): directory
-// listing is served from the RAM directory-cache described in
-// sidetnfs_probe.h below -- never a live per-entry network wait inside
-// Fsfirst/Fsnext (that was Fase 5N's approach, removed after real-hardware
-// instability -- see report), and no SD fallback once TNFS listing is
-// actually active (network ok + MOUNT succeeded) since the end goal is
-// SD-less operation.
-#ifndef SIDETNFS_EXPERIMENTAL_FS_LISTING
-#define SIDETNFS_EXPERIMENTAL_FS_LISTING 1
+// Fase 6A/6E: central backend choice for GEMDRIVE directory listing.
+// Replaced the old on/off SIDETNFS_EXPERIMENTAL_FS_LISTING switch (removed
+// in Fase 6E) with an explicit backend identifier, so future backends (e.g.
+// a flash-image-backed one) have a real slot instead of yet another
+// boolean. Only directory listing (Fsfirst/Fsnext/DTA_EXIST/DTA_RELEASE)
+// is backend-routed as of this phase -- file I/O (Fopen/Fread/Fwrite/etc.)
+// remains SD/FatFS-backed regardless of SIDETNFS_BACKEND_TYPE.
+#define SIDETNFS_BACKEND_SD 0
+#define SIDETNFS_BACKEND_TNFS 1
+#define SIDETNFS_BACKEND_FLASH 2
+
+#ifndef SIDETNFS_BACKEND_TYPE
+#define SIDETNFS_BACKEND_TYPE SIDETNFS_BACKEND_TNFS
 #endif
 
+#if SIDETNFS_BACKEND_TYPE == SIDETNFS_BACKEND_FLASH
+#error "SIDETNFS_BACKEND_FLASH not implemented yet"
+#endif
+
+// Fase 6A: compatibility macros -- gemdrvemul.c/sidetnfs_probe.c's main
+// Fsfirst/Fsnext/DTA_EXIST/DTA_RELEASE routing checks
+// SIDETNFS_USE_TNFS_LISTING/SIDETNFS_USE_SD_LISTING instead of the raw
+// backend-type comparison, so a future third real backend doesn't require
+// touching every call site again.
+#define SIDETNFS_USE_TNFS_LISTING (SIDETNFS_BACKEND_TYPE == SIDETNFS_BACKEND_TNFS)
+#define SIDETNFS_USE_SD_LISTING (SIDETNFS_BACKEND_TYPE == SIDETNFS_BACKEND_SD)
+#define SIDETNFS_USE_FLASH_LISTING (SIDETNFS_BACKEND_TYPE == SIDETNFS_BACKEND_FLASH)
+
+// Fase 5N/5O/6E: SIDETNFS_EXPERIMENTAL_FS_LISTING (the original on/off
+// switch for the TNFS-backed Fsfirst/Fsnext directory listing) has been
+// removed entirely -- superseded by SIDETNFS_BACKEND_TYPE above.
+// SIDETNFS_USE_TNFS_LISTING/SIDETNFS_USE_SD_LISTING (both derived from
+// SIDETNFS_BACKEND_TYPE) are now the only routing checks in
+// gemdrvemul.c/sidetnfs_probe.c; the name "experimental" no longer applied
+// once TNFS listing became the proven, stable default (see
+// SIDETNFS_PHASE5_DIRECTORY_LISTING.md).
+
 // Fase 5N (stability investigation): compile-time switch for all DEBUG.TXT
-// writes. Independent of SIDETNFS_EXPERIMENTAL_FS_LISTING above -- this
+// writes. Independent of the backend/listing routing above -- this
 // lets Testbuild A disable the debug file while keeping the TNFS
 // Fsfirst/Fsnext path active (and a future Testbuild B do the reverse), to
 // isolate whether the SD/FatFS DEBUG.TXT write itself is a source of
@@ -38,45 +60,25 @@
 #define SIDETNFS_DEBUG_FILE_ENABLED 1
 #endif
 
-// Fase 5R/5W (diagnostic): compile-time switch for the TNFS directory-cache
-// layer, independent of SIDETNFS_EXPERIMENTAL_FS_LISTING above. Only
-// meaningful when SIDETNFS_EXPERIMENTAL_FS_LISTING == 1. When 1:
-// GEMDRVEMUL_FSFIRST_CALL/FSNEXT_CALL serve directory listing from the RAM
-// cache (sidetnfs_cache_search_start()/next(), Fase 5O/5Q) -- this whole
-// layer (root pre-cache, cache slots, batch fetching, repeat-Fsfirst
-// continuation) turned out to be much more machinery than the problem
-// needed, see report. When 0 (default, Fase 5Y): GEMDRVEMUL_FSFIRST_CALL/
-// FSNEXT_CALL use the TNFS DTA-registry model instead
-// (sidetnfs_tnfs_dta_start()/next(), Fase 5Y) -- one OPENDIRX + a READDIRX
-// loop reading SIDETNFS_READDIRX_MAX_ENTRIES entries at a time, with search
-// state registered under ndta exactly the way the SD/FatFS backend's
-// insertDTA()/lookupDTA() works (one GEMDOS call in, one directory entry
-// out, no RAM-resident directory cache at all -- see report: the SD
-// baseline proved this ndta-keyed registration is what makes real Fsnext
-// dispatch work). Neither setting ever falls back to SD/FatFS directory
-// listing, and the fake no-network listing (sidetnfs_fake_search_start())
-// is unaffected by this switch either way.
-#ifndef SIDETNFS_DIR_CACHE_ENABLED
-#define SIDETNFS_DIR_CACHE_ENABLED 0
-#endif
+// Fase 6B/6C: the RAM directory-cache layer (root pre-cache, cache slots,
+// batch fetching) that used to live behind SIDETNFS_DIR_CACHE_ENABLED, and
+// the SIDETNFS_DIRECT_SCAN_ENABLED marker that used to name the
+// alternative, have both been removed entirely -- the cache worked, but
+// didn't fit the GEMDOS/DTA/Fsnext flow cleanly (see report/
+// SIDETNFS_PHASE5_DIRECTORY_LISTING.md). The TNFS DTA-registry model
+// (sidetnfs_tnfs_dta_start()/next(), Fase 5Y) is now unconditionally the
+// only TNFS directory-listing path for SIDETNFS_BACKEND_TNFS: one OPENDIRX
+// + a READDIRX loop reading SIDETNFS_READDIRX_MAX_ENTRIES entries at a
+// time, with search state registered under ndta exactly the way the
+// SD/FatFS backend's insertDTA()/lookupDTA() works. Never falls back to
+// SD/FatFS directory listing; the fake no-network listing
+// (sidetnfs_fake_search_start()) is unaffected and unchanged.
 
-// Fase 5S/5Y: explicit alias for "use the TNFS DTA-registry path" --
-// complementary to SIDETNFS_DIR_CACHE_ENABLED by default, but named
-// separately for clarity in build configs that set both explicitly. Not the
-// old batch-of-8, single-global-slot diagnostic scan from Fase 5R (nor the
-// unregistered Fase 5W "live search") -- a TNFS search registered under
-// ndta (SIDETNFS_TNFS_DTA_SLOTS slots) reading SIDETNFS_READDIRX_MAX_ENTRIES
-// entries per READDIRX round (default 1).
-#ifndef SIDETNFS_DIRECT_SCAN_ENABLED
-#define SIDETNFS_DIRECT_SCAN_ENABLED (!SIDETNFS_DIR_CACHE_ENABLED)
-#endif
-
-// Fase 5W: how many entries GEMDRVEMUL_FSFIRST_CALL/FSNEXT_CALL's live
+// Fase 5W: how many entries GEMDRVEMUL_FSFIRST_CALL/FSNEXT_CALL's TNFS DTA
 // search requests per READDIRX round. Default 1 -- deliberately as close
 // as possible to f_findnext()'s own one-entry-at-a-time contract (see
 // report: fetching larger batches is what led to the whole cache/slot/
-// repeat-Fsfirst machinery in the first place). Only meaningful when
-// SIDETNFS_DIR_CACHE_ENABLED == 0.
+// repeat-Fsfirst machinery this phase removed).
 #ifndef SIDETNFS_READDIRX_MAX_ENTRIES
 #define SIDETNFS_READDIRX_MAX_ENTRIES 1
 #endif
@@ -103,53 +105,57 @@
 #define SIDETNFS_TNFS_DTA_MAX_ROUNDS 32
 #endif
 
-// Fase 5AA: send a real TNFS CLOSEDIR for every OPENDIRX handle once it's
-// no longer needed (EOF, Fsnext exhausted, DTA_RELEASE, a repeated Fsfirst
-// replacing an existing search, or an error mid-search) -- see report:
-// without this, directory handles leaked on the server/session across
-// repeated Fsfirst/refresh cycles, and after enough leaked handles the
-// server stopped returning listings at all ("everything empty after a few
-// refreshes"). When 0, falls back to the Fase 5W/5Y/5Z behavior of only
-// clearing local bookkeeping (kept for a quick A/B revert if CLOSEDIR ever
-// turns out to be the wrong opcode/format for this server -- see
-// TNFS_CMD_CLOSEDIR in sidetnfs_probe.c).
-#ifndef SIDETNFS_TNFS_CLOSEDIR_ENABLED
-#define SIDETNFS_TNFS_CLOSEDIR_ENABLED 1
-#endif
+// Fase 5AA/6D: a real TNFS CLOSEDIR is always sent for every OPENDIRX
+// handle once it's no longer needed (EOF, Fsnext exhausted, DTA_RELEASE, a
+// repeated Fsfirst replacing an existing search, or an error mid-search) --
+// see report: without this, directory handles leaked on the server/session
+// across repeated Fsfirst/refresh cycles, and after enough leaked handles
+// the server stopped returning listings at all ("everything empty after a
+// few refreshes"). This was previously gated behind
+// SIDETNFS_TNFS_CLOSEDIR_ENABLED (a quick A/B revert in case CLOSEDIR
+// turned out to be the wrong opcode/format for this server -- see
+// TNFS_CMD_CLOSEDIR in sidetnfs_probe.c); hardware testing confirmed it is
+// correct and required, so the switch was removed in Fase 6D.
 
-// Fase 5S: compile-time switch for the RAM-only Fsfirst/Fsnext/cache
-// diagnostic eventlog (see SidetnfsDiagEvent below). When 0, every
-// sidetnfs_diag_log() call site compiles to nothing (all arguments
-// unused/no-op) -- zero cost, zero behavior change. When 1, each call
-// records one fixed-size event into a bounded RAM array; never touches SD,
-// never touches UART, never blocks.
-#ifndef SIDETNFS_FS_DIAG_ENABLED
-#define SIDETNFS_FS_DIAG_ENABLED 1
-#endif
+// Fase 5S/6F: the RAM-only Fsfirst/Fsnext diagnostic eventlog
+// (sidetnfs_diag_log(), see SidetnfsDiagEvent below) is now always on --
+// the SIDETNFS_FS_DIAG_ENABLED on/off switch was removed in Fase 6F, since
+// the eventlog is what the SELECT-button DEBUG.TXT dump is built from, and
+// that dump stays useful for diagnosing the next phases (Fopen/Fread, file
+// handles, path mapping, TNFS errors). Each call records one fixed-size
+// event into a bounded RAM array; never touches SD, never touches UART,
+// never blocks.
 
-// Fase 5S: compile-time switch for dumping the diagnostic eventlog (plus a
-// short cache/search-slot summary) to <hd_folder>/DEBUG.TXT when the
-// SELECT button is pressed (edge-triggered, once per press -- see
-// gemdrvemul.c). Independent of SIDETNFS_DEBUG_FILE_ENABLED and
-// SIDETNFS_FS_DIAG_ENABLED: with the latter off there is simply nothing to
-// dump (an empty event count), but the dump-on-SELECT mechanism itself
-// still compiles in. Never triggers automatically -- no main-loop tick,
-// no Fsfirst/Fsnext call site, and no network callback ever writes
-// DEBUG.TXT; only the SELECT edge-handler does.
+// Fase 5S: compile-time switch for dumping the diagnostic eventlog to
+// <hd_folder>/DEBUG.TXT when the SELECT button is pressed (edge-triggered,
+// once per press -- see gemdrvemul.c). Independent of
+// SIDETNFS_DEBUG_FILE_ENABLED. Never triggers automatically -- no
+// main-loop tick, no Fsfirst/Fsnext call site, and no network callback
+// ever writes DEBUG.TXT; only the SELECT edge-handler does.
 #ifndef SIDETNFS_DEBUG_DUMP_ON_SELECT
 #define SIDETNFS_DEBUG_DUMP_ON_SELECT 1
 #endif
 
-// Fase 5U/5V: compile-time switch for treating a repeated Fsfirst (same
-// ndta/path/pattern, no Fsnext seen in between) as a continuation of the
-// existing search cursor rather than restarting at index 0. This is a
-// diagnostic/workaround measure, NOT a confirmed fix for why
-// GEMDRVEMUL_FSNEXT_CALL is never dispatched (see report) -- kept behind
-// its own switch so it can be disabled later without touching the rest of
-// the cache/search code.
-#ifndef SIDETNFS_FSFIRST_REPEAT_CONTINUE
-#define SIDETNFS_FSFIRST_REPEAT_CONTINUE 0
+// Fase 7D5: temporary file-I/O diagnosis focus mode -- NOT meant to stay on
+// permanently (see report). When 1: per-round TNFS READ detail
+// (SIDETNFS_DIAG_FREAD_TNFS_READ/READ_BUFF_TNFS_RC inside the internal
+// chunk-loop) is logged in full, and the per-entry directory-listing detail
+// events (TNFS_READDIRX_ONE/ENTRY/SKIP/MATCH) are additionally suppressed
+// to make room in the fixed SIDETNFS_DIAG_MAX_EVENTS budget. When 0
+// (default): file-I/O events are still logged, but only one summary per
+// GEMDRVEMUL_READ_BUFF_CALL (same shape as before this phase), and
+// directory-listing detail events log normally.
+#ifndef SIDETNFS_DEBUG_FOCUS_FILE_IO
+#define SIDETNFS_DEBUG_FOCUS_FILE_IO 0
 #endif
+
+// Fase 5U/5V (REMOVED in Fase 6B): repeated-Fsfirst-as-continuation was a
+// diagnostic workaround for GEMDRVEMUL_FSNEXT_CALL never being dispatched --
+// superseded by the real fix (Fase 5Z: DTA_EXIST/DTA_RELEASE recognizing
+// TNFS DTA-registry state), which made real Fsnext dispatch work and this
+// workaround unnecessary (see report). SIDETNFS_FSFIRST_REPEAT_CONTINUE and
+// its code are gone; a repeated Fsfirst for the same ndta now always starts
+// fresh, same as the SD/FatFS backend.
 
 // Fase 5B: create a UDP PCB and udp_connect() it to the TNFS server, then
 // immediately remove it again. Sends no payload at all -- udp_connect() is a
@@ -271,8 +277,8 @@ bool sidetnfs_gemdos_pattern_match(const char *name83, const char *pattern);
 // a later phase to wire up. No malloc, no I/O.
 bool sidetnfs_gemdos_attr_match(uint8_t entry_attr, uint8_t search_attr);
 
-// Fase 5O/5Q (experimental, SIDETNFS_EXPERIMENTAL_FS_LISTING only): result
-// of one cache-backed (or fake no-network) directory search step.
+// Fase 5O/5Q (only meaningful for SIDETNFS_USE_TNFS_LISTING): result of
+// one TNFS DTA-registry (or fake no-network) directory search step.
 typedef enum
 {
     SIDETNFS_DIR_SEARCH_FOUND = 0,   // *out_entry filled with a matching entry
@@ -289,83 +295,33 @@ typedef enum
 // service call.
 bool sidetnfs_tnfs_listing_ready(void);
 
-// Fase 5O/5Q: non-blocking directory-cache tick. Call every GEMDRIVE
-// main-loop iteration (gated behind sidetnfs_network_ok, right next to
-// sidetnfs_probe_service()). Auto-starts a cache build for "/" the first
-// time it runs after MOUNT succeeds (early root warmup). Otherwise advances
-// whichever cache slot is currently mid-network-build by at most one
-// network step (one send, or one already-arrived response consumed) --
-// never blocks, never sleeps, never more than one request in flight across
-// ALL slots (see report: two concurrent OPENDIRX/READDIRX conversations
-// sharing one TNFS session caused entry loss -- there is only ever one
-// slot "building" at a time, regardless of how many slots exist).
-void sidetnfs_dir_cache_service(void);
-
-// Fase 5Q: true if any cache slot is SIDETNFS_CACHE_READY for exactly this
-// path (see report for the fixed-size, SIDETNFS_DIR_CACHE_SLOTS-slot cache
-// design that replaced Fase 5O's single slot).
-bool sidetnfs_dir_cache_is_ready(const char *path);
-
-// Fase 5Q: (re)start a cache build for path. Reuses an existing slot
-// already holding this exact path if there is one; otherwise claims an
-// empty slot, or evicts the least-recently-used slot not currently
-// mid-network-build. If a DIFFERENT path is currently mid-network-build,
-// this call is a no-op (the channel handles one conversation at a time) --
-// the caller (sidetnfs_dir_cache_wait_ready()) retries until the channel is
-// free. Never blocks.
-void sidetnfs_dir_cache_request(const char *path);
-
-// Fase 5Q: used only by GEMDRVEMUL_FSFIRST_CALL on a cache miss. Repeatedly
-// requests path (see sidetnfs_dir_cache_request() -- a no-op while a
-// different path currently owns the network channel) and pumps
-// cyw43_arch_poll()+the same non-blocking step function used by
-// sidetnfs_dir_cache_service(), bounded by max_wait_ms wall-clock time
-// (never an unbounded loop). Returns true once a slot is READY for path,
-// false on SIDETNFS_CACHE_ERROR or on timeout. Never called from Fsnext --
-// Fsnext only ever reads an already-built slot.
-bool sidetnfs_dir_cache_wait_ready(const char *path, uint32_t max_wait_ms);
-
-// Fase 5Q: start a new cache-backed directory search for ndta, replacing
-// any previous search this ndta had (fixed-size search-slot table, see
-// report; up to SIDETNFS_SEARCH_SLOTS concurrent searches for DIFFERENT
-// ndta values are tracked independently -- this is what actually fixed the
-// "root always truncated" bug, not a network/protocol issue). path/
-// pattern/attribs follow the same conventions as the old Fase 5N
-// sidetnfs_dir_search_start() (mount-root-relative path, GEMDOS-style
-// pattern already preprocessed by seach_path_2_st(), attribs mask). If no
-// slot is already READY for path, this blocks (bounded, see
-// sidetnfs_dir_cache_wait_ready()) waiting for a build to finish -- this is
-// the ONLY place a bounded wait happens; sidetnfs_cache_search_next()
-// never waits. On FOUND, *out_entry is filled and the search stays active.
-// On NOT_FOUND, the search is closed (definitive, listing fully scanned).
-// On ERROR (build failed or timed out), the search is not left active --
-// caller must not fall back to SD (see report: SD fallback for directory
-// listing is removed entirely as of Fase 5Q).
-SidetnfsDirSearchResult sidetnfs_cache_search_start(uint32_t ndta, const char *path,
-                                                      const char *pattern, uint8_t attribs,
-                                                      SidetnfsAtariDirEntry *out_entry);
+// Fase 5O/5Q (REMOVED in Fase 6B): the RAM directory-cache
+// (sidetnfs_dir_cache_service()/is_ready()/request()/wait_ready() and
+// sidetnfs_cache_search_start()) is gone -- see the comment above and
+// SIDETNFS_PHASE5_DIRECTORY_LISTING.md. TNFS directory listing is served
+// exclusively by sidetnfs_tnfs_dta_start()/next() below.
 
 // Fase 5Q: start a fake, memory-only directory search for ndta -- used
-// instead of sidetnfs_cache_search_start() when TNFS was never available
-// this boot (no WiFi, ESC-skip, or MOUNT never succeeded). NEVER touches
-// cyw43/lwIP (which may already be torn down in this case, see Fase 5H).
-// path == "/" yields exactly one synthetic entry, "NO_NETW.TXT" (a plain
-// file, size 0, date/time 0/0 -- opening it is not expected to work yet,
-// see report); any other path yields an immediately-empty listing (no
-// entries, no error). Registers in the SAME search-slot table as
-// sidetnfs_cache_search_start(), so sidetnfs_cache_search_next()/
-// is_active()/close() work identically for fake and real searches --
-// GEMDRVEMUL_FSNEXT_CALL needs no awareness of which kind is active.
+// instead of a real TNFS search when TNFS was never available this boot
+// (no WiFi, ESC-skip, or MOUNT never succeeded). NEVER touches cyw43/lwIP
+// (which may already be torn down in this case, see Fase 5H). path == "/"
+// yields exactly one synthetic entry, "NO_NETW.TXT" (a plain file, size 0,
+// date/time 0/0 -- opening it is not expected to work yet, see report); any
+// other path yields an immediately-empty listing (no entries, no error).
+// Registers in its own fixed-size search-slot table (SIDETNFS_SEARCH_SLOTS
+// concurrent searches for DIFFERENT ndta values), so
+// sidetnfs_fake_search_next()/is_active()/close() work identically for
+// fake and real (TNFS DTA-registry) searches -- GEMDRVEMUL_FSNEXT_CALL
+// needs no awareness of which kind is active.
 SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *path,
                                                      const char *pattern, uint8_t attribs,
                                                      SidetnfsAtariDirEntry *out_entry);
 
-// Fase 5Y (only compiled when SIDETNFS_DIR_CACHE_ENABLED == 0): start a
-// TNFS directory search for ndta -- OPENDIRX for path, then a bounded
-// READDIRX loop (SIDETNFS_READDIRX_MAX_ENTRIES entries per round, up to
-// SIDETNFS_TNFS_DTA_MAX_ROUNDS rounds) until the first pattern+attribs
-// match, EOF, or the round cap. No entry cache of any kind -- this is
-// intentionally as close as possible to the SD/FatFS backend's
+// Fase 5Y: start a TNFS directory search for ndta -- OPENDIRX for path,
+// then a bounded READDIRX loop (SIDETNFS_READDIRX_MAX_ENTRIES entries per
+// round, up to SIDETNFS_TNFS_DTA_MAX_ROUNDS rounds) until the first
+// pattern+attribs match, EOF, or the round cap. No entry cache of any kind
+// -- this is intentionally as close as possible to the SD/FatFS backend's
 // f_findfirst()+insertDTA() contract (see report: the SD-baseline hardware
 // test proved real GEMDRVEMUL_FSNEXT_CALL dispatch works once the search
 // state is registered under ndta the same way SD's DTA hash table does it).
@@ -374,10 +330,11 @@ SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *pa
 // slots) -- never a FatFS DIR*/FILINFO*, but the same "insert on Fsfirst,
 // lookup on Fsnext" shape. Starting a new search for an ndta that already
 // had one replaces it (mirrors the SD/FatFS backend's own behavior on a
-// repeated Fsfirst -- see report; SIDETNFS_FSFIRST_REPEAT_CONTINUE is OFF by
-// default). DOES touch the network on every call (bounded, cmd+seq
-// validated) -- unlike the cache path, there is no RAM copy to serve a hit
-// from. On a terminal result (NOT_FOUND/ERROR) the ndta's registry entry is
+// repeated Fsfirst -- see report: a repeated Fsfirst always starts fresh,
+// the Fase 5U/5V repeat-continuation workaround was removed in Fase 6B).
+// DOES touch the network on every call (bounded, cmd+seq validated) --
+// unlike the removed cache path, there is no RAM copy to serve a hit from.
+// On a terminal result (NOT_FOUND/ERROR) the ndta's registry entry is
 // released before returning (see sidetnfs_tnfs_dta_release()).
 SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
                                                   const char *pattern, uint8_t attribs,
@@ -401,21 +358,55 @@ void sidetnfs_tnfs_dta_release(uint32_t ndta);
 // same way countDTA() does for the FatFS table (see gemdrvemul.c).
 uint16_t sidetnfs_tnfs_dta_count_active(void);
 
-// Fase 5O: continue the active search for ndta (real or fake -- see
-// sidetnfs_cache_search_is_active()). Pure RAM scan -- no network, no
-// wait, ever.
-SidetnfsDirSearchResult sidetnfs_cache_search_next(uint32_t ndta, SidetnfsAtariDirEntry *out_entry);
+// Fase 7D: TNFS file-op results. Mirrors the FOUND/NOT_FOUND/ERROR shape of
+// SidetnfsDirSearchResult above -- NOT_FOUND lets the caller map to
+// GEMDOS_EFILNF specifically (TNFS ENOENT), ERROR to a generic GEMDOS_EINTRN
+// (any other wire error, protocol timeout, or send failure).
+typedef enum
+{
+    SIDETNFS_FILE_OPEN_OK = 0,
+    SIDETNFS_FILE_OPEN_NOT_FOUND,
+    SIDETNFS_FILE_OPEN_ERROR
+} SidetnfsFileOpenResult;
 
-// Fase 5O: true if ndta has a currently active search (real or fake).
-bool sidetnfs_cache_search_is_active(uint32_t ndta);
+// Open tnfs_path read-only over TNFS (GEMDOS mode 0 only -- caller must deny
+// mode 1/2 before ever calling this). Bounded wait, same contract as
+// sidetnfs_tnfs_dta_start() -- never blocks indefinitely, never crashes on a
+// wrong/unsupported opcode guess. On SIDETNFS_FILE_OPEN_OK, *out_handle is
+// the TNFS-side file handle to use for subsequent read/close calls.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint8_t *out_handle);
 
-// Fase 5O: explicitly close the active search for ndta, if it is the one
-// currently active (no-op otherwise).
-void sidetnfs_cache_search_close(uint32_t ndta);
+// Read up to requested bytes (internally chunked and bounded -- see
+// SIDETNFS_TNFS_READ_CHUNK_MAX in sidetnfs_probe.c) from tnfs_handle
+// directly into out_buf (the caller's shared-memory read buffer -- no
+// intermediate stack copy). guest_fd is only used for diagnostic logging.
+// *out_actual receives the actual byte count (0 at EOF -- not an error).
+// Returns false only on a genuine protocol error/timeout/unexpected wire
+// error, never for EOF or a short read.
+bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *out_buf,
+                              uint16_t requested, uint16_t *out_actual);
 
-// Fase 5Z: number of currently-active cache/fake searches -- see
+// Send TNFS CLOSE for tnfs_handle and wait (bounded, same contract as
+// tnfs_dta_closedir()). Always logs the outcome but never reports failure
+// back to the caller -- per Fase 7D requirements, the local file descriptor
+// must always be released regardless of whether the network close
+// succeeded, so there is nothing meaningful for the caller to act on.
+void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle);
+
+// Fase 5O/6B: continue the active fake no-network search for ndta. Pure
+// RAM scan -- no network, no wait, ever.
+SidetnfsDirSearchResult sidetnfs_fake_search_next(uint32_t ndta, SidetnfsAtariDirEntry *out_entry);
+
+// Fase 5O: true if ndta has a currently active fake no-network search.
+bool sidetnfs_fake_search_is_active(uint32_t ndta);
+
+// Fase 5O: explicitly close the active fake no-network search for ndta, if
+// it is the one currently active (no-op otherwise).
+void sidetnfs_fake_search_close(uint32_t ndta);
+
+// Fase 5Z: number of currently-active fake no-network searches -- see
 // sidetnfs_tnfs_dta_count_active() above.
-uint16_t sidetnfs_cache_search_count_active(void);
+uint16_t sidetnfs_fake_search_count_active(void);
 
 // Fase 5N: record one successful/failed TNFS Fsfirst/Fsnext hit for the
 // short DEBUG.TXT summary line (throttled/dirty-flag driven, like every
@@ -423,17 +414,12 @@ uint16_t sidetnfs_cache_search_count_active(void);
 void sidetnfs_note_tnfs_fs_hit(void);
 void sidetnfs_note_tnfs_fs_error(void);
 
-// Fase 5S: RAM-only Fsfirst/Fsnext/cache diagnostic eventlog. See
-// SIDETNFS_FS_DIAG_ENABLED above and sidetnfs_diag_log()/
-// sidetnfs_diag_dump_on_select() below.
+// Fase 5S: RAM-only Fsfirst/Fsnext diagnostic eventlog. See
+// sidetnfs_diag_log()/sidetnfs_diag_dump_on_select() below.
 typedef enum
 {
     SIDETNFS_DIAG_FSFIRST_ENTER = 0,
     SIDETNFS_DIAG_FSFIRST_ATTR_PREP,
-    SIDETNFS_DIAG_FSFIRST_CACHE_HIT,
-    SIDETNFS_DIAG_FSFIRST_CACHE_MISS,
-    SIDETNFS_DIAG_FSFIRST_CACHE_READY,
-    SIDETNFS_DIAG_FSFIRST_CACHE_ERROR,
     SIDETNFS_DIAG_FSFIRST_FOUND,
     SIDETNFS_DIAG_FSFIRST_NOT_FOUND,
     SIDETNFS_DIAG_FSFIRST_RETURN,
@@ -443,22 +429,15 @@ typedef enum
     SIDETNFS_DIAG_FSNEXT_FOUND,
     SIDETNFS_DIAG_FSNEXT_END,
     SIDETNFS_DIAG_FSNEXT_RETURN,
+    // Fase 6B: SIDETNFS_DIAG_SEARCH_OVERWRITE still used (fake no-network
+    // search overwrite); the CACHE_* events above it (removed) were only
+    // for the deleted RAM directory-cache.
     SIDETNFS_DIAG_SEARCH_OVERWRITE,
-    SIDETNFS_DIAG_CACHE_REPLACE,
-    SIDETNFS_DIAG_CACHE_BUILD_START,
-    SIDETNFS_DIAG_CACHE_OPENDIRX_OK,
-    SIDETNFS_DIAG_CACHE_READDIRX_BATCH,
-    SIDETNFS_DIAG_CACHE_BUILD_READY,
-    SIDETNFS_DIAG_CACHE_BUILD_ERROR,
-    SIDETNFS_DIAG_CACHE_BUILD_TIMEOUT,
     SIDETNFS_DIAG_FAKE_SEARCH_START,
     SIDETNFS_DIAG_FAKE_FOUND,
     SIDETNFS_DIAG_FAKE_NOT_FOUND,
-    // Fase 5U: repeated-Fsfirst-as-continuation diagnostics (see report --
-    // hardware testing never showed a single FSNEXT_ENTER; GEM/TOS appears
-    // to re-issue Fsfirst for the same ndta/path/pattern instead).
-    SIDETNFS_DIAG_FSFIRST_REPEAT_CONTINUE,
-    SIDETNFS_DIAG_FSFIRST_REPEAT_RESTART,
+    // Fase 5U/6B: repeated-Fsfirst-as-continuation diagnostics REMOVED --
+    // superseded by the real Fase 5Z fix (see report).
     SIDETNFS_DIAG_FSNEXT_CASE_REACHED,
     // Fase 5V: every dispatched command_id (see report -- confirms whether
     // an unrecognized/unexpected command arrives during what looks like a
@@ -477,7 +456,7 @@ typedef enum
     SIDETNFS_DIAG_TNFS_READDIRX_EOF,
     // Fase 5X: SD-baseline measurement events. Logged from the SD/FatFS
     // Fsfirst/Fsnext code path itself (only reachable when
-    // SIDETNFS_EXPERIMENTAL_FS_LISTING == 0) purely as logging -- no
+    // SIDETNFS_USE_SD_LISTING) purely as logging -- no
     // f_findfirst()/f_findnext()/insertDTA()/lookupDTA()/populate_dta()
     // behavior is touched, see report. DTA_LOOKUP_OK/FAIL and DTA_INSERT are
     // the backend-agnostic names (mirrors what a future TNFS DTA-registry
@@ -519,8 +498,9 @@ typedef enum
     SIDETNFS_DIAG_DTA_RELEASE_TNFS,
     SIDETNFS_DIAG_DTA_RELEASE_FAKE,
     SIDETNFS_DIAG_DTA_RELEASE_RETURN,
-    // Fase 5AA: TNFS CLOSEDIR events (see SIDETNFS_TNFS_CLOSEDIR_ENABLED).
-    // No separate TNFS_HANDLE_ALREADY_CLOSED event -- handle_valid and
+    // Fase 5AA: TNFS CLOSEDIR events -- always sent (see tnfs_dta_closedir()
+    // in sidetnfs_probe.c). No separate TNFS_HANDLE_ALREADY_CLOSED event --
+    // handle_valid and
     // active are always set/cleared together in this codebase (see
     // insertTnfsDTA()/releaseTnfsDTA() in sidetnfs_probe.c), so a
     // double-close of an active slot cannot structurally occur; the
@@ -531,6 +511,73 @@ typedef enum
     SIDETNFS_DIAG_TNFS_CLOSEDIR_ERROR,
     SIDETNFS_DIAG_TNFS_CLOSEDIR_TIMEOUT,
     SIDETNFS_DIAG_TNFS_HANDLE_RELEASE,
+    // Fase 7C: a mutating GEMDOS trap was denied at SIDETNFS_BACKEND_TNFS
+    // (see report -- TNFS write/create/delete/rename isn't implemented
+    // yet, so these traps must never fall through to a real FatFS/SD
+    // mutation while the TNFS backend is active).
+    SIDETNFS_DIAG_FCREATE_DENIED_TNFS,
+    SIDETNFS_DIAG_FWRITE_DENIED_TNFS,
+    SIDETNFS_DIAG_FDELETE_DENIED_TNFS,
+    SIDETNFS_DIAG_FRENAME_DENIED_TNFS,
+    SIDETNFS_DIAG_DCREATE_DENIED_TNFS,
+    SIDETNFS_DIAG_DDELETE_DENIED_TNFS,
+    SIDETNFS_DIAG_FATTRIB_SET_DENIED_TNFS,
+    SIDETNFS_DIAG_FDATETIME_SET_DENIED_TNFS,
+    // Fase 7D: real TNFS-backed Fopen(mode 0 only)/Fread/Fclose. ENTER/
+    // DENY_MODE events are logged from gemdrvemul.c (routing/guest-side);
+    // the TNFS_* wire-level events are logged from the new
+    // sidetnfs_tnfs_file_open()/read()/close() functions in
+    // sidetnfs_probe.c (mirrors the FSFIRST_*/TNFS_OPENDIRX* split above).
+    SIDETNFS_DIAG_FOPEN_ENTER,
+    SIDETNFS_DIAG_FOPEN_TNFS_OPEN,
+    SIDETNFS_DIAG_FOPEN_TNFS_OK,
+    SIDETNFS_DIAG_FOPEN_TNFS_DENY_MODE,
+    SIDETNFS_DIAG_FOPEN_TNFS_ERROR,
+    SIDETNFS_DIAG_FREAD_ENTER,
+    SIDETNFS_DIAG_FREAD_TNFS_READ,
+    SIDETNFS_DIAG_FREAD_TNFS_OK,
+    SIDETNFS_DIAG_FREAD_TNFS_EOF,
+    SIDETNFS_DIAG_FREAD_TNFS_ERROR,
+    SIDETNFS_DIAG_FCLOSE_ENTER,
+    SIDETNFS_DIAG_FCLOSE_TNFS_CLOSE,
+    SIDETNFS_DIAG_FCLOSE_TNFS_OK,
+    SIDETNFS_DIAG_FCLOSE_TNFS_ERROR,
+    // Fase 7D-debug: exact-faaltrap diagnosis. GEMDRVEMUL_DSETPATH_CALL is
+    // still unconditionally hard-SD (scfs_directory_exists()) -- these
+    // events exist purely to observe whether/how it's involved, no
+    // behavior change. The FOPEN_*/READ_BUFF_*/FCLOSE_* additions below
+    // give a per-field trace (raw path -> internal path -> tnfs path ->
+    // wire rc -> handle -> final GEMDOS return value) alongside the
+    // higher-level Fase 7D events above -- purely additive, nothing above
+    // is removed or renamed.
+    SIDETNFS_DIAG_DSETPATH_ENTER,
+    SIDETNFS_DIAG_DSETPATH_PATH_RAW,
+    SIDETNFS_DIAG_DSETPATH_SD_CHECK,
+    SIDETNFS_DIAG_DSETPATH_RETURN,
+    SIDETNFS_DIAG_FOPEN_MODE,
+    SIDETNFS_DIAG_FOPEN_RAW_PATH,
+    SIDETNFS_DIAG_FOPEN_INTERNAL_PATH,
+    SIDETNFS_DIAG_FOPEN_TNFS_PATH,
+    SIDETNFS_DIAG_FOPEN_TNFS_RC,
+    SIDETNFS_DIAG_FOPEN_TNFS_HANDLE,
+    SIDETNFS_DIAG_FOPEN_RETURN,
+    SIDETNFS_DIAG_READ_BUFF_ENTER,
+    SIDETNFS_DIAG_READ_BUFF_HANDLE,
+    SIDETNFS_DIAG_READ_BUFF_REQUESTED,
+    SIDETNFS_DIAG_READ_BUFF_BACKEND,
+    SIDETNFS_DIAG_READ_BUFF_TNFS_RC,
+    SIDETNFS_DIAG_READ_BUFF_ACTUAL,
+    SIDETNFS_DIAG_READ_BUFF_RETURN,
+    SIDETNFS_DIAG_FCLOSE_HANDLE,
+    SIDETNFS_DIAG_FCLOSE_BACKEND,
+    SIDETNFS_DIAG_FCLOSE_TNFS_RC,
+    SIDETNFS_DIAG_FCLOSE_RETURN,
+    // Fase 7D5: local file->offset before/after a READ_BUFF_CALL, logged
+    // once per call (not per internal TNFS-read round) -- the offset value
+    // is formatted as text into the `path` field to avoid uint16_t
+    // truncation for files >64KB.
+    SIDETNFS_DIAG_READ_BUFF_OFFSET_BEFORE,
+    SIDETNFS_DIAG_READ_BUFF_OFFSET_AFTER,
 } SidetnfsDiagEventType;
 
 #define SIDETNFS_DIAG_MAX_EVENTS 256
@@ -549,7 +596,7 @@ typedef struct
     char name[14];
 } SidetnfsDiagEvent;
 
-// Fase 5S: record one diagnostic event (see SIDETNFS_FS_DIAG_ENABLED). Pass
+// Fase 5S: record one diagnostic event. Pass
 // NULL/0 for any field not relevant to a given event type. No malloc, no
 // I/O, no blocking -- pure RAM array write. Stops recording once
 // SIDETNFS_DIAG_MAX_EVENTS is reached (keeps the earliest events, which

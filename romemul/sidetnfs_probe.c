@@ -39,6 +39,37 @@
 #define TNFS_PROTO_VER_MINOR 0x02
 #define TNFS_PROTO_VER_MAJOR 0x01
 
+// Fase 7D3: TNFS file-op opcodes -- OPEN/READ/CLOSE (WRITE not sent this
+// phase). Corrected against the actual TNFS server command-dispatch table
+// (checked against server source this round, unlike the Fase 7D guess
+// below): file ops sit in the 0x20-0x29 block, not directly after
+// MOUNT/UMOUNT as originally (incorrectly) guessed.
+//   TNFS_CMD_OPEN_OLD 0x20 -- deprecated open, not used here
+//   TNFS_CMD_READ     0x21
+//   TNFS_CMD_WRITE     0x22 -- not sent this phase
+//   TNFS_CMD_CLOSE    0x23
+//   TNFS_CMD_OPEN     0x29 -- current/non-deprecated open, used here since
+//                             the existing OPEN request format (flags(2) +
+//                             mode(2) + path) matches this variant, not the
+//                             deprecated 0x20 one.
+// Fase 7D's original guess (OPEN=0x02/READ=0x03/CLOSE=0x05) was wrong --
+// the server was answering a different command (rc=22/EINVAL-shaped
+// response on every open), not timing out, which is why it wasn't caught
+// by the bounded-wait/timeout defense alone. Kept here for the record, not
+// used anymore.
+#define TNFS_CMD_OPEN_OLD 0x20u
+#define TNFS_CMD_READ 0x21u
+#define TNFS_CMD_WRITE 0x22u
+#define TNFS_CMD_CLOSE 0x23u
+#define TNFS_CMD_OPEN 0x29u
+
+// TNFS OPEN flags (protocol-defined, POSIX-open-like semantics). Only
+// read-only opens are ever sent this phase.
+#define TNFS_OPEN_RDONLY 0x0001u
+
+// TNFS wire error codes are POSIX errno values truncated to a byte.
+#define TNFS_ENOENT 2u
+
 #define TNFS_OK 0x00u
 #define TNFS_EOF 0x21u
 
@@ -67,6 +98,32 @@
 #define SIDETNFS_READDIRX_BATCH_SIZE 4u
 #define SIDETNFS_READDIRX_MAX_ROUNDS 32u
 
+// Fase 7D: max payload bytes requested per single TNFS READ wire
+// round-trip. Bounded well under SIDETNFS_RX_BUF_SIZE (256) so a full
+// response (header+rc+size+data) always fits s_fslisting_resp.buf with room
+// to spare, and well under a typical UDP MTU.
+//
+// Fase 7D5 correction: this used to also be the effective per-
+// GEMDRVEMUL_READ_BUFF_CALL limit (one TNFS READ per guest call) -- that
+// was wrong. The SD/FatFS route's f_read() fills the *entire* requested
+// buff_size (up to DEFAULT_FOPEN_READ_BUFFER_SIZE=16384) in one guest call,
+// short only at real EOF; a copy operation that requests a large buff_size
+// per call was silently getting back only SIDETNFS_TNFS_READ_CHUNK_MAX
+// bytes with the rest of the shared buffer left stale/zeroed, corrupting
+// the copy without ever raising a GEMDOS error (see report). This constant
+// still bounds each individual wire round-trip; sidetnfs_tnfs_file_read()
+// below now loops internally (bounded by SIDETNFS_TNFS_READ_MAX_ROUNDS) to
+// fill up to the full `requested` amount, matching f_read()'s contract.
+#define SIDETNFS_TNFS_READ_CHUNK_MAX 200u
+
+// Fase 7D5: hard cap on internal TNFS READ round-trips per single
+// sidetnfs_tnfs_file_read() call. ceil(DEFAULT_FOPEN_READ_BUFFER_SIZE /
+// SIDETNFS_TNFS_READ_CHUNK_MAX) = ceil(16384/200) = 82 covers the largest
+// legitimate single-call fill with comfortable margin; a pathological
+// server that never signals EOF still cannot turn this into an unbounded
+// loop.
+#define SIDETNFS_TNFS_READ_MAX_ROUNDS 128u
+
 // Fase 5L: small, fixed test set of GEMDOS-style patterns counted against
 // each successfully normalized READDIRX entry during the existing root
 // scan. Kept intentionally short (<=5) per the debug-line budget.
@@ -74,43 +131,20 @@
 static const char *const SIDETNFS_MATCH_PATTERNS[SIDETNFS_MATCH_PATTERN_COUNT] = {
     "*.*", "*", "*.PRG", "*.ACC", "CONFIG.*"};
 
-// Fase 5O: entries fetched per READDIRX round while (re)building a
-// directory-cache slot.
-#define SIDETNFS_FS_BATCH_SIZE 8u
-
-// Fase 5O: total entries one directory-cache slot can hold. Root only has
-// ~13 today; sized generously for a somewhat larger directory. Extra
-// entries beyond this are dropped (slot.truncated = true) rather than
-// overflowing -- no malloc, fixed storage only.
-#define SIDETNFS_DIR_CACHE_MAX_ENTRIES 64u
-
-// Fase 5Q: number of directories that can be cached (and searched)
-// simultaneously. Root-cause analysis of "root always truncated to 1
-// entry" (see report) found that GEM/TOS issues more than one concurrent
-// Fsfirst/Fsnext sequence around a single folder-window refresh (e.g. an
-// icon-layout .INF lookup interleaved with the real listing) -- a single
-// shared cache/search slot let one clobber the other. 4 slots comfortably
-// covers root + a couple of subdirectory/auxiliary lookups at once.
-#define SIDETNFS_DIR_CACHE_SLOTS 4u
+// Fase 5Q: number of concurrent fake no-network searches (one per active
+// ndta). Root-cause analysis of "root always truncated to 1 entry" (see
+// report) found that GEM/TOS issues more than one concurrent Fsfirst/Fsnext
+// sequence around a single folder-window refresh (e.g. an icon-layout .INF
+// lookup interleaved with the real listing) -- a single shared search slot
+// let one clobber the other. 4 slots comfortably covers root + a couple of
+// subdirectory/auxiliary lookups at once.
 #define SIDETNFS_SEARCH_SLOTS 4u
 
-// Fase 5R (diagnostic): bounded wait for a single OPENDIRX/READDIRX
-// round-trip in the direct (uncached) scan path. Worst case per round:
-// SIDETNFS_FS_WAIT_MAX_ITER * SIDETNFS_FS_WAIT_STEP_US = 200ms. Only used
-// when SIDETNFS_DIR_CACHE_ENABLED == 0.
+// Fase 5R: bounded wait for a single OPENDIRX/READDIRX/CLOSEDIR round-trip
+// in the TNFS DTA-registry path. Worst case per round:
+// SIDETNFS_FS_WAIT_MAX_ITER * SIDETNFS_FS_WAIT_STEP_US = 200ms.
 #define SIDETNFS_FS_WAIT_MAX_ITER 200
 #define SIDETNFS_FS_WAIT_STEP_US 1000
-
-// Fase 5O/5P: hard wall-clock budget for GEMDRVEMUL_FSFIRST_CALL to wait
-// for a cache-miss refresh to finish (see sidetnfs_dir_cache_wait_ready()).
-// This is the ONLY bounded wait left anywhere in the TNFS-listing path --
-// Fsnext never waits, and this budget covers the *whole* refresh (however
-// many READDIRX rounds that takes), not a single round-trip like Fase 5N.
-// Raised from 200ms to 500ms in Fase 5P: a directory needing several
-// READDIRX rounds (e.g. root's ~13 entries at 8/round) should comfortably
-// fit, but 200ms left little margin once real network jitter is added.
-#define SIDETNFS_DIR_CACHE_FSFIRST_WAIT_MS 500u
-#define SIDETNFS_DIR_CACHE_WAIT_STEP_US 1000
 
 static const char SIDETNFS_PROBE_PAYLOAD[] = "SIDETNFS_PROBE";
 
@@ -171,6 +205,15 @@ typedef struct
     uint16_t fs_listing_hits;
     uint16_t fs_listing_errors;
 
+    // Fase 7D4: compact file-I/O counters, incremented from
+    // sidetnfs_tnfs_file_open()/read()/close() -- cheap, RAM-only, no
+    // control-flow change, just visibility for the DEBUG.TXT header.
+    uint16_t tnfs_fopen_calls;
+    uint16_t tnfs_fopen_ok;
+    uint16_t tnfs_fread_calls;
+    uint32_t tnfs_fread_bytes;
+    uint16_t tnfs_fclose_calls;
+
 #if SIDETNFS_DEBUG_SHOW_RAW
     uint16_t last_response_len;
     uint8_t last_raw[SIDETNFS_DEBUG_RAW_SIZE];
@@ -180,75 +223,41 @@ typedef struct
 static SidetnfsDebugState s_state = {0};
 static uint8_t s_readdirx_seq = 2; // MOUNT uses 0, OPENDIRX uses 1
 
-// Fase 5O: single-slot RAM directory cache, entirely separate from the
-// FatFS DTA hash table in gemdrvemul.c -- that table is never touched by
-// the TNFS-listing path (see report for why: insertDTA()/lookupDTA()
-// dereference dj/fno unconditionally, and a TNFS-backed ndta never has
-// real FatFS DIR/FILINFO objects). SIDETNFS_DIR_CACHE_SLOTS directories can
-// be cached simultaneously (Fase 5Q, see report) -- requesting a path not
-// already held in a slot claims an empty slot, or evicts the
-// least-recently-used slot not currently mid-network-build.
-typedef enum
-{
-    SIDETNFS_CACHE_EMPTY = 0,
-    SIDETNFS_CACHE_LOADING,
-    SIDETNFS_CACHE_READY,
-    SIDETNFS_CACHE_ERROR,
-} SidetnfsCacheState;
+// Fase 7D4: suppress back-to-back TNFS_READDIRX_EOF events for the same
+// ndta -- repeated fresh directory scans (Desktop refresh, repeated
+// Fsfirst) each end in one EOF event, and these were crowding out the
+// fixed-size (SIDETNFS_DIAG_MAX_EVENTS) event log before the interesting
+// file-I/O events ever got recorded. Purely a logging suppression -- does
+// not touch search->eof or any other control flow. The first EOF for a
+// given ndta (or the first EOF after a *different* ndta's EOF) still logs.
+static uint32_t s_last_readdirx_eof_ndta = 0;
+static bool s_last_readdirx_eof_ndta_valid = false;
 
-typedef struct
-{
-    SidetnfsCacheState state;
-    char path[MAX_FOLDER_LENGTH];
-    SidetnfsAtariDirEntry entries[SIDETNFS_DIR_CACHE_MAX_ENTRIES];
-    uint16_t count;
-    uint16_t skipped;
-    uint16_t dirs;
-    uint16_t files;
-    uint8_t error_rc;
-    bool truncated;
-    uint32_t last_used_seq; // for least-recently-used eviction
-} SidetnfsDirCacheSlot;
+// Fase 5O/6B: the RAM directory cache that used to live here (per-path
+// cache slots, a network-build state machine, root pre-cache warmup) has
+// been removed entirely -- see SIDETNFS_PHASE5_DIRECTORY_LISTING.md and the
+// TNFS DTA-registry declarations further down (sidetnfs_tnfs_dta_start()/
+// next()), which are now the only TNFS directory-listing path.
 
-static SidetnfsDirCacheSlot s_dir_cache_slots[SIDETNFS_DIR_CACHE_SLOTS] = {0};
-static uint32_t s_dir_cache_use_counter = 0;
-
-// Fase 5Q: the network channel handles ONE OPENDIRX/READDIRX conversation
-// at a time, regardless of how many cache slots exist -- concurrent
-// conversations sharing one TNFS session is what caused entries to be
-// lost in earlier phases (see report). s_building_slot is the index into
-// s_dir_cache_slots[] currently being (re)built over the network, or -1
-// if the channel is idle. The build-in-progress fields below are only
-// meaningful while s_building_slot >= 0.
-static int s_building_slot = -1;
-static bool s_building_opendirx_sent = false;
-static bool s_building_opendirx_done = false;
-static uint8_t s_building_opendirx_seq = 0;
-static uint8_t s_building_dir_handle = 0;
-static bool s_building_readdirx_pending = false;
-static uint8_t s_building_readdirx_seq = 0;
-
-// Fase 5Q: fixed-size search-slot table, used by
-// GEMDRVEMUL_FSFIRST_CALL/FSNEXT_CALL, one slot per concurrently-active
-// ndta (see report -- this is what actually fixed "root always truncated
-// to 1 entry": GEM/TOS runs more than one Fsfirst/Fsnext sequence around a
-// single folder refresh). "fake" marks a memory-only no-network search
-// (see sidetnfs_fake_search_start()) that never touches a cache slot at
-// all -- cache_search_advance() special-cases it inline.
+// Fase 5Q/6B: fixed-size search-slot table for the fake, memory-only
+// no-network listing (see sidetnfs_fake_search_start()) -- one slot per
+// concurrently-active ndta (see report -- this is what actually fixed "root
+// always truncated to 1 entry": GEM/TOS runs more than one Fsfirst/Fsnext
+// sequence around a single folder refresh). Used only when TNFS was never
+// available this boot; real TNFS searches use the separate
+// SidetnfsTnfsDtaSearch registry below.
 typedef struct
 {
     bool active;
-    bool fake;
     uint32_t ndta;
     char path[MAX_FOLDER_LENGTH];
     char pattern[13];
     uint8_t attribs;
     uint16_t next_index;
-} SidetnfsCacheSearchSlot;
+} SidetnfsFakeSearchSlot;
 
-static SidetnfsCacheSearchSlot s_cache_searches[SIDETNFS_SEARCH_SLOTS] = {0};
+static SidetnfsFakeSearchSlot s_fake_searches[SIDETNFS_SEARCH_SLOTS] = {0};
 
-#if !SIDETNFS_DIR_CACHE_ENABLED
 // Fase 5Y: TNFS DTA-registry entry -- one open dir_handle plus
 // path/pattern/attribs/eof, NO entry cache of any kind. This is the direct
 // TNFS-side analogue of a FatFS DTANode (see insertDTA()/lookupDTA() in
@@ -275,7 +284,6 @@ typedef struct
 } SidetnfsTnfsDtaSearch;
 
 static SidetnfsTnfsDtaSearch s_tnfs_dta_searches[SIDETNFS_TNFS_DTA_SLOTS] = {0};
-#endif // !SIDETNFS_DIR_CACHE_ENABLED
 
 // Fase 5S: RAM-only diagnostic eventlog. Stops recording once full (see
 // sidetnfs_diag_log() doc comment) -- never a ring buffer, so the earliest
@@ -288,7 +296,6 @@ void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *p
                         const char *pattern, const char *name, uint16_t index,
                         uint16_t count, uint8_t result, uint8_t attr)
 {
-#if SIDETNFS_FS_DIAG_ENABLED
     if (s_diag_event_count >= SIDETNFS_DIAG_MAX_EVENTS)
     {
         return; // full -- stop recording, keep the earliest events
@@ -317,17 +324,6 @@ void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *p
         strncpy(e->name, name, sizeof(e->name) - 1);
     }
     s_diag_event_count++;
-#else
-    (void)event;
-    (void)ndta;
-    (void)path;
-    (void)pattern;
-    (void)name;
-    (void)index;
-    (void)count;
-    (void)result;
-    (void)attr;
-#endif
 }
 
 #if SIDETNFS_DEBUG_DUMP_ON_SELECT
@@ -339,14 +335,6 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "FSFIRST_ENTER";
     case SIDETNFS_DIAG_FSFIRST_ATTR_PREP:
         return "FSFIRST_ATTR_PREP";
-    case SIDETNFS_DIAG_FSFIRST_CACHE_HIT:
-        return "FSFIRST_CACHE_HIT";
-    case SIDETNFS_DIAG_FSFIRST_CACHE_MISS:
-        return "FSFIRST_CACHE_MISS";
-    case SIDETNFS_DIAG_FSFIRST_CACHE_READY:
-        return "FSFIRST_CACHE_READY";
-    case SIDETNFS_DIAG_FSFIRST_CACHE_ERROR:
-        return "FSFIRST_CACHE_ERROR";
     case SIDETNFS_DIAG_FSFIRST_FOUND:
         return "FSFIRST_FOUND";
     case SIDETNFS_DIAG_FSFIRST_NOT_FOUND:
@@ -367,30 +355,12 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "FSNEXT_RETURN";
     case SIDETNFS_DIAG_SEARCH_OVERWRITE:
         return "SEARCH_OVERWRITE";
-    case SIDETNFS_DIAG_CACHE_REPLACE:
-        return "CACHE_REPLACE";
-    case SIDETNFS_DIAG_CACHE_BUILD_START:
-        return "CACHE_BUILD_START";
-    case SIDETNFS_DIAG_CACHE_OPENDIRX_OK:
-        return "CACHE_OPENDIRX_OK";
-    case SIDETNFS_DIAG_CACHE_READDIRX_BATCH:
-        return "CACHE_READDIRX_BATCH";
-    case SIDETNFS_DIAG_CACHE_BUILD_READY:
-        return "CACHE_BUILD_READY";
-    case SIDETNFS_DIAG_CACHE_BUILD_ERROR:
-        return "CACHE_BUILD_ERROR";
-    case SIDETNFS_DIAG_CACHE_BUILD_TIMEOUT:
-        return "CACHE_BUILD_TIMEOUT";
     case SIDETNFS_DIAG_FAKE_SEARCH_START:
         return "FAKE_SEARCH_START";
     case SIDETNFS_DIAG_FAKE_FOUND:
         return "FAKE_FOUND";
     case SIDETNFS_DIAG_FAKE_NOT_FOUND:
         return "FAKE_NOT_FOUND";
-    case SIDETNFS_DIAG_FSFIRST_REPEAT_CONTINUE:
-        return "FSFIRST_REPEAT_CONTINUE";
-    case SIDETNFS_DIAG_FSFIRST_REPEAT_RESTART:
-        return "FSFIRST_REPEAT_RESTART";
     case SIDETNFS_DIAG_FSNEXT_CASE_REACHED:
         return "FSNEXT_CASE_REACHED";
     case SIDETNFS_DIAG_COMMAND_ENTER:
@@ -467,6 +437,98 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "TNFS_CLOSEDIR_TIMEOUT";
     case SIDETNFS_DIAG_TNFS_HANDLE_RELEASE:
         return "TNFS_HANDLE_RELEASE";
+    case SIDETNFS_DIAG_FCREATE_DENIED_TNFS:
+        return "FCREATE_DENIED_TNFS";
+    case SIDETNFS_DIAG_FWRITE_DENIED_TNFS:
+        return "FWRITE_DENIED_TNFS";
+    case SIDETNFS_DIAG_FDELETE_DENIED_TNFS:
+        return "FDELETE_DENIED_TNFS";
+    case SIDETNFS_DIAG_FRENAME_DENIED_TNFS:
+        return "FRENAME_DENIED_TNFS";
+    case SIDETNFS_DIAG_DCREATE_DENIED_TNFS:
+        return "DCREATE_DENIED_TNFS";
+    case SIDETNFS_DIAG_DDELETE_DENIED_TNFS:
+        return "DDELETE_DENIED_TNFS";
+    case SIDETNFS_DIAG_FATTRIB_SET_DENIED_TNFS:
+        return "FATTRIB_SET_DENIED_TNFS";
+    case SIDETNFS_DIAG_FDATETIME_SET_DENIED_TNFS:
+        return "FDATETIME_SET_DENIED_TNFS";
+    case SIDETNFS_DIAG_FOPEN_ENTER:
+        return "FOPEN_ENTER";
+    case SIDETNFS_DIAG_FOPEN_TNFS_OPEN:
+        return "FOPEN_TNFS_OPEN";
+    case SIDETNFS_DIAG_FOPEN_TNFS_OK:
+        return "FOPEN_TNFS_OK";
+    case SIDETNFS_DIAG_FOPEN_TNFS_DENY_MODE:
+        return "FOPEN_TNFS_DENY_MODE";
+    case SIDETNFS_DIAG_FOPEN_TNFS_ERROR:
+        return "FOPEN_TNFS_ERROR";
+    case SIDETNFS_DIAG_FREAD_ENTER:
+        return "FREAD_ENTER";
+    case SIDETNFS_DIAG_FREAD_TNFS_READ:
+        return "FREAD_TNFS_READ";
+    case SIDETNFS_DIAG_FREAD_TNFS_OK:
+        return "FREAD_TNFS_OK";
+    case SIDETNFS_DIAG_FREAD_TNFS_EOF:
+        return "FREAD_TNFS_EOF";
+    case SIDETNFS_DIAG_FREAD_TNFS_ERROR:
+        return "FREAD_TNFS_ERROR";
+    case SIDETNFS_DIAG_FCLOSE_ENTER:
+        return "FCLOSE_ENTER";
+    case SIDETNFS_DIAG_FCLOSE_TNFS_CLOSE:
+        return "FCLOSE_TNFS_CLOSE";
+    case SIDETNFS_DIAG_FCLOSE_TNFS_OK:
+        return "FCLOSE_TNFS_OK";
+    case SIDETNFS_DIAG_FCLOSE_TNFS_ERROR:
+        return "FCLOSE_TNFS_ERROR";
+    case SIDETNFS_DIAG_DSETPATH_ENTER:
+        return "DSETPATH_ENTER";
+    case SIDETNFS_DIAG_DSETPATH_PATH_RAW:
+        return "DSETPATH_PATH_RAW";
+    case SIDETNFS_DIAG_DSETPATH_SD_CHECK:
+        return "DSETPATH_SD_CHECK";
+    case SIDETNFS_DIAG_DSETPATH_RETURN:
+        return "DSETPATH_RETURN";
+    case SIDETNFS_DIAG_FOPEN_MODE:
+        return "FOPEN_MODE";
+    case SIDETNFS_DIAG_FOPEN_RAW_PATH:
+        return "FOPEN_RAW_PATH";
+    case SIDETNFS_DIAG_FOPEN_INTERNAL_PATH:
+        return "FOPEN_INTERNAL_PATH";
+    case SIDETNFS_DIAG_FOPEN_TNFS_PATH:
+        return "FOPEN_TNFS_PATH";
+    case SIDETNFS_DIAG_FOPEN_TNFS_RC:
+        return "FOPEN_TNFS_RC";
+    case SIDETNFS_DIAG_FOPEN_TNFS_HANDLE:
+        return "FOPEN_TNFS_HANDLE";
+    case SIDETNFS_DIAG_FOPEN_RETURN:
+        return "FOPEN_RETURN";
+    case SIDETNFS_DIAG_READ_BUFF_ENTER:
+        return "READ_BUFF_ENTER";
+    case SIDETNFS_DIAG_READ_BUFF_HANDLE:
+        return "READ_BUFF_HANDLE";
+    case SIDETNFS_DIAG_READ_BUFF_REQUESTED:
+        return "READ_BUFF_REQUESTED";
+    case SIDETNFS_DIAG_READ_BUFF_BACKEND:
+        return "READ_BUFF_BACKEND";
+    case SIDETNFS_DIAG_READ_BUFF_TNFS_RC:
+        return "READ_BUFF_TNFS_RC";
+    case SIDETNFS_DIAG_READ_BUFF_ACTUAL:
+        return "READ_BUFF_ACTUAL";
+    case SIDETNFS_DIAG_READ_BUFF_RETURN:
+        return "READ_BUFF_RETURN";
+    case SIDETNFS_DIAG_FCLOSE_HANDLE:
+        return "FCLOSE_HANDLE";
+    case SIDETNFS_DIAG_FCLOSE_BACKEND:
+        return "FCLOSE_BACKEND";
+    case SIDETNFS_DIAG_FCLOSE_TNFS_RC:
+        return "FCLOSE_TNFS_RC";
+    case SIDETNFS_DIAG_FCLOSE_RETURN:
+        return "FCLOSE_RETURN";
+    case SIDETNFS_DIAG_READ_BUFF_OFFSET_BEFORE:
+        return "READ_BUFF_OFFSET_BEFORE";
+    case SIDETNFS_DIAG_READ_BUFF_OFFSET_AFTER:
+        return "READ_BUFF_OFFSET_AFTER";
     default:
         return "UNKNOWN";
     }
@@ -555,15 +617,14 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
     UINT written;
     int len = snprintf(line, sizeof(line),
                         "SIDETNFS FS DIAG\r\n"
-                        "mode: %s\r\n"
-                        "experimental listing: %u\r\n"
+                        "backend: %s\r\n"
                         "events: %u\r\n",
-#if SIDETNFS_EXPERIMENTAL_FS_LISTING
-                        "TNFS_LIVE_DTA",
+#if SIDETNFS_USE_TNFS_LISTING
+                        "TNFS",
 #else
-                        "SD_BASELINE",
+                        "SD",
 #endif
-                        (unsigned)SIDETNFS_EXPERIMENTAL_FS_LISTING, (unsigned)s_diag_event_count);
+                        (unsigned)s_diag_event_count);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
@@ -582,90 +643,55 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
             break;
         }
     }
+    // Fase 5AA/6B: how many TNFS DTA-registry slots are active vs. how many
+    // still have an unclosed OPENDIRX handle -- if handles-open ever grows
+    // without bound across repeated Fsfirst/refresh cycles, that's a leak;
+    // it should track active closely (0 or 1 higher, briefly, between
+    // OPENDIRX success and the next release).
+    unsigned tnfs_active = 0;
+    unsigned tnfs_handles_open = 0;
+    for (unsigned i = 0; i < SIDETNFS_TNFS_DTA_SLOTS; i++)
+    {
+        if (s_tnfs_dta_searches[i].active)
+        {
+            tnfs_active++;
+        }
+        if (s_tnfs_dta_searches[i].handle_valid)
+        {
+            tnfs_handles_open++;
+        }
+    }
     len = snprintf(line, sizeof(line),
                     "fsnext case reached: %s\r\n"
                     "tnfs dta slots: %u\r\n"
-                    "cache enabled: %s\r\n"
+                    "tnfs dta active: %u\r\n"
+                    "tnfs handles open: %u\r\n"
                     "readdirx max entries: %u\r\n"
-                    "repeat fsfirst continue: %s\r\n\r\n",
-                    fsnext_ever_reached ? "YES" : "NO",
-#if SIDETNFS_DIR_CACHE_ENABLED
-                    0u,
-#else
-                    (unsigned)SIDETNFS_TNFS_DTA_SLOTS,
-#endif
-                    SIDETNFS_DIR_CACHE_ENABLED ? "YES" : "NO", (unsigned)SIDETNFS_READDIRX_MAX_ENTRIES,
-                    SIDETNFS_FSFIRST_REPEAT_CONTINUE ? "YES" : "NO");
+                    "closedir enabled: %s\r\n"
+                    "file io: TNFS enabled\r\n"
+                    "tnfs file cmds: open=0x%02x read=0x%02x close=0x%02x\r\n",
+                    fsnext_ever_reached ? "YES" : "NO", (unsigned)SIDETNFS_TNFS_DTA_SLOTS, tnfs_active,
+                    tnfs_handles_open, (unsigned)SIDETNFS_READDIRX_MAX_ENTRIES, "YES",
+                    (unsigned)TNFS_CMD_OPEN, (unsigned)TNFS_CMD_READ, (unsigned)TNFS_CMD_CLOSE);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    // Fase 7D4: compact file-I/O counters (see SidetnfsDebugState comment).
+    len = snprintf(line, sizeof(line),
+                    "fopen calls: %u\r\n"
+                    "fopen ok: %u\r\n"
+                    "fread calls: %u\r\n"
+                    "fread bytes: %lu\r\n"
+                    "fclose calls: %u\r\n\r\n",
+                    (unsigned)s_state.tnfs_fopen_calls, (unsigned)s_state.tnfs_fopen_ok,
+                    (unsigned)s_state.tnfs_fread_calls, (unsigned long)s_state.tnfs_fread_bytes,
+                    (unsigned)s_state.tnfs_fclose_calls);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
     }
 
-    // Fase 5AA: how many TNFS DTA-registry slots are active vs. how many
-    // still have an unclosed OPENDIRX handle -- if handles-open ever grows
-    // without bound across repeated Fsfirst/refresh cycles, that's a
-    // leak; it should track active closely (0 or 1 higher, briefly,
-    // between OPENDIRX success and the next release).
-#if !SIDETNFS_DIR_CACHE_ENABLED
-    {
-        unsigned tnfs_active = 0;
-        unsigned tnfs_handles_open = 0;
-        for (unsigned i = 0; i < SIDETNFS_TNFS_DTA_SLOTS; i++)
-        {
-            if (s_tnfs_dta_searches[i].active)
-            {
-                tnfs_active++;
-            }
-            if (s_tnfs_dta_searches[i].handle_valid)
-            {
-                tnfs_handles_open++;
-            }
-        }
-        len = snprintf(line, sizeof(line),
-                        "tnfs dta active: %u\r\n"
-                        "tnfs handles open: %u\r\n"
-                        "closedir enabled: %s\r\n\r\n",
-                        tnfs_active, tnfs_handles_open, SIDETNFS_TNFS_CLOSEDIR_ENABLED ? "YES" : "NO");
-        if (len > 0)
-        {
-            f_write(&file, line, (UINT)len, &written);
-        }
-    }
-#endif
-
-#if SIDETNFS_DIR_CACHE_ENABLED
-    for (unsigned i = 0; i < SIDETNFS_DIR_CACHE_SLOTS; i++)
-    {
-        if (s_dir_cache_slots[i].state == SIDETNFS_CACHE_EMPTY)
-        {
-            continue;
-        }
-        const char *state_str = s_dir_cache_slots[i].state == SIDETNFS_CACHE_READY     ? "READY"
-                                 : s_dir_cache_slots[i].state == SIDETNFS_CACHE_LOADING ? "LOADING"
-                                                                                        : "ERROR";
-        len = snprintf(line, sizeof(line), "cache[%u] path=%s state=%s count=%u dirs=%u files=%u skipped=%u\r\n",
-                       i, s_dir_cache_slots[i].path, state_str, (unsigned)s_dir_cache_slots[i].count,
-                       (unsigned)s_dir_cache_slots[i].dirs, (unsigned)s_dir_cache_slots[i].files,
-                       (unsigned)s_dir_cache_slots[i].skipped);
-        if (len > 0)
-        {
-            f_write(&file, line, (UINT)len, &written);
-        }
-    }
-    unsigned active_searches = 0;
-    for (unsigned i = 0; i < SIDETNFS_SEARCH_SLOTS; i++)
-    {
-        if (s_cache_searches[i].active)
-        {
-            active_searches++;
-        }
-    }
-    len = snprintf(line, sizeof(line), "active cache searches: %u\r\n\r\n", active_searches);
-    if (len > 0)
-    {
-        f_write(&file, line, (UINT)len, &written);
-    }
-#else
     for (unsigned i = 0; i < SIDETNFS_TNFS_DTA_SLOTS; i++)
     {
         if (!s_tnfs_dta_searches[i].active)
@@ -694,7 +720,6 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
     {
         f_write(&file, line, (UINT)len, &written);
     }
-#endif
 
     for (uint16_t i = 0; i < s_diag_event_count; i++)
     {
@@ -1364,21 +1389,20 @@ static void send_readdirx_probe(void)
 // until EOF/error/round-cap. Safe to call every GEMDRIVE main-loop
 // iteration -- all guards make it a cheap no-op otherwise.
 //
-// Fase 5P: while the cache-based TNFS listing is active
-// (SIDETNFS_EXPERIMENTAL_FS_LISTING), this legacy root OPENDIRX/READDIRX
-// probe is skipped entirely. Root-cause analysis of "root truncated to 1
-// entry" (see report) found that this probe and the new
-// sidetnfs_dir_cache_service() were both opening "/" under the SAME TNFS
-// session id at/around boot time -- two concurrent, uncoordinated
-// OPENDIRX/READDIRX conversations sharing one session is the most likely
-// explanation for the truncation (either a shared server-side read cursor,
-// or sequence-number collision between the two independent counters that
-// existed before this fix). MOUNT alone (still done above this function)
-// is sufficient for sidetnfs_tnfs_listing_ready() once the cache system
-// owns all TNFS directory traffic.
+// Fase 5P: while the TNFS listing backend is active (SIDETNFS_USE_TNFS_LISTING),
+// this legacy root OPENDIRX/READDIRX probe is skipped entirely. Root-cause
+// analysis of "root truncated to 1 entry" (see report) found that this
+// probe and the (since-removed, Fase 6B) directory cache were both opening
+// "/" under the SAME TNFS session id at/around boot time -- two
+// concurrent, uncoordinated OPENDIRX/READDIRX conversations sharing one
+// session is the most likely explanation for the truncation (either a
+// shared server-side read cursor, or sequence-number collision between the
+// two independent counters that existed before this fix). MOUNT alone
+// (still done above this function) is sufficient for
+// sidetnfs_tnfs_listing_ready().
 void sidetnfs_probe_service(void)
 {
-#if SIDETNFS_EXPERIMENTAL_FS_LISTING
+#if SIDETNFS_USE_TNFS_LISTING
     return;
 #else
     if (s_state.mount_response_received && s_state.mount_rc == 0x00 && !s_state.opendir_sent)
@@ -1452,11 +1476,10 @@ void sidetnfs_scan_sd_root_if_needed(const char *hd_folder)
 
 // Fase 5P: true once MOUNT has succeeded. Previously (Fase 5N) this also
 // required the legacy root OPENDIRX/READDIRX probe (Fase 5I/5J) to have
-// completed -- but that probe no longer runs while
-// SIDETNFS_EXPERIMENTAL_FS_LISTING is active (see sidetnfs_probe_service()
-// and the report), so MOUNT success is now sufficient: the cache system
-// itself is the thing that proves whether TNFS directory listing works.
-// Does NOT check WiFi/network-teardown state -- see sidetnfs_probe.h.
+// completed -- but that probe no longer runs while SIDETNFS_USE_TNFS_LISTING
+// (see sidetnfs_probe_service() and the report), so MOUNT success is now
+// sufficient. Does NOT check WiFi/network-teardown state -- see
+// sidetnfs_probe.h.
 bool sidetnfs_tnfs_listing_ready(void)
 {
     return s_state.mount_response_received && s_state.mount_rc == TNFS_OK &&
@@ -1520,8 +1543,8 @@ static bool fslisting_ensure_pcb(void)
 
 // Fire-and-forget OPENDIRX send over s_fslisting_pcb -- returns immediately,
 // never waits. The response (if any) is picked up later by
-// tnfs_fslisting_recv_callback() and consumed by dir_cache_advance_one_step()
-// or the direct-scan path (Fase 5R). Wire pattern is always "*" (local
+// tnfs_fslisting_recv_callback() and consumed by the TNFS DTA-registry path
+// (sidetnfs_tnfs_dta_start(), Fase 5Y). Wire pattern is always "*" (local
 // filtering only -- see sidetnfs_probe.h). Session id reused from the root
 // probe's MOUNT response (s_state.sid); TNFS sessions are keyed by session
 // id, not UDP source port, so sharing it across this separate PCB is safe.
@@ -1652,6 +1675,135 @@ static bool fslisting_send_closedir(uint8_t dir_handle, uint8_t *out_seq)
     return true;
 }
 
+// Fase 7D: fire-and-forget OPEN send over s_fslisting_pcb. flags is one of
+// the TNFS_OPEN_* values above (only TNFS_OPEN_RDONLY is ever sent this
+// phase -- mode 1/2 opens are denied before reaching this function, see
+// gemdrive_backend_fopen() in gemdrvemul.c). mode (creation mode) is always
+// sent as 0 -- only meaningful with O_CREAT, which this phase never sets.
+static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint8_t *out_seq)
+{
+    if (!fslisting_ensure_pcb())
+    {
+        return false;
+    }
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    {
+        return false;
+    }
+
+    uint8_t seq = s_readdirx_seq++;
+    size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
+    uint8_t buf[4 + 4 + MAX_FOLDER_LENGTH];
+    size_t offset = 0;
+    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
+    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = seq;
+    buf[offset++] = TNFS_CMD_OPEN;
+    buf[offset++] = (uint8_t)(flags & 0xFFu);
+    buf[offset++] = (uint8_t)(flags >> 8);
+    buf[offset++] = 0x00; // mode lo -- unused (O_CREAT never requested)
+    buf[offset++] = 0x00; // mode hi
+    memcpy(&buf[offset], tnfs_path, path_len);
+    offset += path_len;
+    buf[offset++] = '\0';
+
+    s_fslisting_resp.response_ready = false;
+    cyw43_arch_lwip_begin();
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)offset, PBUF_RAM);
+    if (!p)
+    {
+        cyw43_arch_lwip_end();
+        return false;
+    }
+    memcpy(p->payload, buf, offset);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    pbuf_free(p);
+    cyw43_arch_lwip_end();
+    *out_seq = seq;
+    return true;
+}
+
+// Fase 7D: fire-and-forget READ send for up to size bytes on an
+// already-open TNFS file handle. Same non-blocking contract as the other
+// fslisting_send_* helpers.
+static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out_seq)
+{
+    if (!fslisting_ensure_pcb())
+    {
+        return false;
+    }
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    {
+        return false;
+    }
+
+    uint8_t seq = s_readdirx_seq++;
+    uint8_t buf[7];
+    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
+    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[2] = seq;
+    buf[3] = TNFS_CMD_READ;
+    buf[4] = tnfs_handle;
+    buf[5] = (uint8_t)(size & 0xFFu);
+    buf[6] = (uint8_t)(size >> 8);
+
+    s_fslisting_resp.response_ready = false;
+    cyw43_arch_lwip_begin();
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(buf), PBUF_RAM);
+    if (!p)
+    {
+        cyw43_arch_lwip_end();
+        return false;
+    }
+    memcpy(p->payload, buf, sizeof(buf));
+    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    pbuf_free(p);
+    cyw43_arch_lwip_end();
+    *out_seq = seq;
+    return true;
+}
+
+// Fase 7D: fire-and-forget CLOSE send for a TNFS file handle obtained from
+// OPEN. Same wire shape as fslisting_send_closedir() (header + single
+// handle byte), different opcode/namespace (file handle, not dir handle).
+static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
+{
+    if (!fslisting_ensure_pcb())
+    {
+        return false;
+    }
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    {
+        return false;
+    }
+
+    uint8_t seq = s_readdirx_seq++;
+    uint8_t buf[5];
+    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
+    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[2] = seq;
+    buf[3] = TNFS_CMD_CLOSE;
+    buf[4] = tnfs_handle;
+
+    s_fslisting_resp.response_ready = false;
+    cyw43_arch_lwip_begin();
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(buf), PBUF_RAM);
+    if (!p)
+    {
+        cyw43_arch_lwip_end();
+        return false;
+    }
+    memcpy(p->payload, buf, sizeof(buf));
+    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    pbuf_free(p);
+    cyw43_arch_lwip_end();
+    *out_seq = seq;
+    return true;
+}
+
 // Parse up to max_entries raw READDIRX entries from s_fslisting_resp into
 // out_entries, normalizing each via sidetnfs_normalize_dir_entry() (Fase
 // 5K). Mirrors parse_readdirx_entries()'s byte layout exactly. Entries that
@@ -1705,7 +1857,6 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
     return count;
 }
 
-#if !SIDETNFS_DIR_CACHE_ENABLED
 // Fase 5Y: TNFS DTA registry -- lookupTnfsDTA()/insertTnfsDTA()/
 // releaseTnfsDTA() mirror the shape (not the storage) of the FatFS
 // lookupDTA()/insertDTA()/releaseDTA() hash table in gemdrvemul.c: keyed by
@@ -1754,9 +1905,10 @@ static SidetnfsTnfsDtaSearch *alloc_tnfs_dta_slot(void)
 // Register/replace ndta's TNFS DTA-registry entry -- a repeated Fsfirst for
 // the same ndta reuses (and overwrites) its existing slot, exactly like the
 // SD/FatFS backend's insertDTA() replacing an existing DTANode (see
-// gemdrvemul.c, and report: SIDETNFS_FSFIRST_REPEAT_CONTINUE is OFF by
-// default in this model -- a repeated Fsfirst always starts fresh). Only
-// called after OPENDIRX has already succeeded for dir_handle. Fase 5AA: if
+// gemdrvemul.c, and report: a repeated Fsfirst always starts fresh in this
+// model -- the Fase 5U/5V repeat-continuation workaround was removed in
+// Fase 6B). Only called after OPENDIRX has already succeeded for
+// dir_handle. Fase 5AA: if
 // the reused slot still has an open handle from the search it's replacing
 // (no EOF/release happened in between), that handle is CLOSEDIR'd first --
 // otherwise a repeated Fsfirst/refresh cycle leaks one handle per repeat.
@@ -1790,9 +1942,8 @@ static SidetnfsTnfsDtaSearch *insertTnfsDTA(uint32_t ndta, const char *path, con
 }
 
 // Release ndta's TNFS DTA-registry entry, if any (no-op otherwise). Fase
-// 5AA: now also sends a real TNFS CLOSEDIR for the entry's dir_handle
-// first, if it's still open (handle_valid) -- see
-// SIDETNFS_TNFS_CLOSEDIR_ENABLED. handle_valid is cleared regardless of
+// 5AA: also sends a real TNFS CLOSEDIR for the entry's dir_handle first,
+// if it's still open (handle_valid). handle_valid is cleared regardless of
 // whether CLOSEDIR actually succeeded (see tnfs_dta_closedir() -- a
 // failed/timed-out CLOSEDIR still must not block local cleanup or be
 // retried), so a slot's handle is never CLOSEDIR'd twice.
@@ -1833,19 +1984,19 @@ static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
     return false; // bounded-wait timeout
 }
 
-// Fase 5AA: send CLOSEDIR for dir_handle and wait (bounded -- same
+// Fase 5AA/6D: send CLOSEDIR for dir_handle and wait (bounded -- same
 // SIDETNFS_FS_WAIT_MAX_ITER/STEP_US timeout and cmd+seq validation as
 // OPENDIRX/READDIRX, via fslisting_wait_for()) for the response. Never
 // blocks indefinitely and never retries -- a failed/timed-out CLOSEDIR is
 // logged and otherwise ignored; the caller (insertTnfsDTA()/
 // releaseTnfsDTA()) always proceeds with local cleanup regardless of the
 // outcome (see report: cleanup must never hang or crash, even if this
-// server doesn't support/recognize CLOSEDIR). When
-// SIDETNFS_TNFS_CLOSEDIR_ENABLED is 0, does nothing (Fase 5W/5Y/5Z
-// behavior -- local-only release).
+// server doesn't support/recognize CLOSEDIR). Always sent -- hardware
+// testing confirmed leaked, un-CLOSEDIR'd directory handles caused
+// listings to go empty after repeated refreshes (see report), so there is
+// no longer a "local-only release" fallback mode.
 static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle)
 {
-#if SIDETNFS_TNFS_CLOSEDIR_ENABLED
     uint8_t seq = 0;
     if (!fslisting_send_closedir(dir_handle, &seq))
     {
@@ -1868,10 +2019,6 @@ static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_CLOSEDIR_ERROR, ndta, NULL, NULL, NULL, 0, dir_handle, rc, 0);
     }
-#else
-    (void)ndta;
-    (void)dir_handle;
-#endif
 }
 
 // Fase 5Y: read SIDETNFS_READDIRX_MAX_ENTRIES (default 1) entries at a
@@ -1895,8 +2042,10 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
         {
             return SIDETNFS_DIR_SEARCH_ERROR;
         }
+#if !SIDETNFS_DEBUG_FOCUS_FILE_IO
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_ONE, search->ndta, search->path, NULL, NULL, (uint16_t)round, 0,
                            0, 0);
+#endif
         if (!fslisting_wait_for(TNFS_CMD_READDIRX, seq))
         {
             return SIDETNFS_DIR_SEARCH_ERROR;
@@ -1917,7 +2066,13 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
         }
         if (batch == 0 || resp_len <= 8)
         {
-            sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_EOF, search->ndta, search->path, NULL, NULL, 0, 0, 0, 0);
+            // Fase 7D4: rate-limited -- see s_last_readdirx_eof_ndta comment.
+            if (!s_last_readdirx_eof_ndta_valid || s_last_readdirx_eof_ndta != search->ndta)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_EOF, search->ndta, search->path, NULL, NULL, 0, 0, 0, 0);
+                s_last_readdirx_eof_ndta = search->ndta;
+                s_last_readdirx_eof_ndta_valid = true;
+            }
             continue; // next loop iteration sees search->eof and returns NOT_FOUND
         }
 
@@ -1926,17 +2081,23 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
         uint8_t got = fslisting_parse_batch(batch, &entry, 1, &skipped);
         if (got == 0)
         {
+#if !SIDETNFS_DEBUG_FOCUS_FILE_IO
             sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_SKIP, search->ndta, search->path, NULL, NULL, 0, 0, 0, 0);
+#endif
             continue;
         }
+#if !SIDETNFS_DEBUG_FOCUS_FILE_IO
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_ENTRY, search->ndta, search->path, NULL, entry.name, 0, 0, 0,
                            entry.attr);
+#endif
         if (sidetnfs_gemdos_pattern_match(entry.name, search->pattern) &&
             sidetnfs_gemdos_attr_match(entry.attr, search->attribs))
         {
             *out_entry = entry;
+#if !SIDETNFS_DEBUG_FOCUS_FILE_IO
             sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_MATCH, search->ndta, search->path, NULL, entry.name, 0, 0,
                                0, entry.attr);
+#endif
             return SIDETNFS_DIR_SEARCH_FOUND;
         }
         // no match -- loop and read the next entry
@@ -1953,8 +2114,8 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
     // (insertTnfsDTA()) once we actually have a dir_handle, exactly like
     // the SD/FatFS backend only calls insertDTA() after f_findfirst()
     // already produced a match (see gemdrvemul.c). A repeated Fsfirst for
-    // the same ndta always starts fresh (SIDETNFS_FSFIRST_REPEAT_CONTINUE
-    // is OFF by default in this model, deliberately -- see report).
+    // the same ndta always starts fresh, deliberately (the Fase 5U/5V
+    // repeat-continuation workaround was removed in Fase 6B -- see report).
     uint8_t seq = 0;
     if (!fslisting_send_opendirx(path, &seq))
     {
@@ -2028,350 +2189,238 @@ uint16_t sidetnfs_tnfs_dta_count_active(void)
     }
     return count;
 }
-#endif // !SIDETNFS_DIR_CACHE_ENABLED
 
-// Find a slot already holding path (any state), or -1.
-static int find_cache_slot(const char *path)
+// Fase 7D: TNFS OPEN. See TNFS_CMD_OPEN comment above for the opcode
+// disclosure/risk note. ndta is not used for file ops (0) -- path is the
+// identifying field in the log until a guest handle exists.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint8_t *out_handle)
 {
-    for (int i = 0; i < (int)SIDETNFS_DIR_CACHE_SLOTS; i++)
+    s_state.tnfs_fopen_calls++;
+    s_state.debug_dirty = true;
+    uint8_t seq = 0;
+    if (!fslisting_send_open(tnfs_path, TNFS_OPEN_RDONLY, &seq))
     {
-        if (s_dir_cache_slots[i].state != SIDETNFS_CACHE_EMPTY &&
-            strncmp(s_dir_cache_slots[i].path, path, sizeof(s_dir_cache_slots[i].path)) == 0)
-        {
-            return i;
-        }
+        sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
+        return SIDETNFS_FILE_OPEN_ERROR;
     }
-    return -1;
+    sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_OPEN, 0, tnfs_path, NULL, NULL, 0, 0, 0, 0);
+    if (!fslisting_wait_for(TNFS_CMD_OPEN, seq))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
+        return SIDETNFS_FILE_OPEN_ERROR;
+    }
+    uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+    uint8_t handle = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+    s_fslisting_resp.response_ready = false;
+    // Fase 7D-debug: unconditional -- the exact wire rc byte for this OPEN,
+    // whatever it turns out to be, regardless of success/failure.
+    sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, rc, 0);
+    if (rc == TNFS_OK)
+    {
+        *out_handle = handle;
+        s_state.tnfs_fopen_ok++;
+        sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_OK, handle, tnfs_path, NULL, NULL, 0, 0, 0, 0);
+        sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_HANDLE, handle, tnfs_path, NULL, NULL, handle, 0, 0, 0);
+        return SIDETNFS_FILE_OPEN_OK;
+    }
+    sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, rc, 0);
+    return (rc == TNFS_ENOENT) ? SIDETNFS_FILE_OPEN_NOT_FOUND : SIDETNFS_FILE_OPEN_ERROR;
 }
 
-// Pick a slot to (re)use for a new path: an EMPTY slot if any, else the
-// least-recently-used slot that is not currently the one mid-network-build
-// (s_building_slot is never evicted out from under itself).
-static int alloc_cache_slot(void)
+// Fase 7D5: TNFS READ. Writes directly into the caller's buffer (the guest
+// shared-memory read area, see gemdrive_backend_fread() in gemdrvemul.c) --
+// no intermediate large stack buffer, only the existing fixed
+// s_fslisting_resp.buf[SIDETNFS_RX_BUF_SIZE] response scratch area.
+//
+// Loops internally over SIDETNFS_TNFS_READ_CHUNK_MAX-sized wire round-trips
+// (bounded by SIDETNFS_TNFS_READ_MAX_ROUNDS) until `requested` bytes have
+// been collected or the source signals no more data (actual==0 or
+// rc==TNFS_EOF on some round) -- matching the SD/FatFS route's f_read()
+// contract exactly: fill the whole requested amount, short only at real
+// EOF. Any wire error mid-loop discards this call's progress entirely and
+// returns false, same as f_read() reporting FR_* failure regardless of
+// bytes already read internally by FatFS.
+bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *out_buf,
+                              uint16_t requested, uint16_t *out_actual)
 {
-    for (int i = 0; i < (int)SIDETNFS_DIR_CACHE_SLOTS; i++)
-    {
-        if (s_dir_cache_slots[i].state == SIDETNFS_CACHE_EMPTY)
-        {
-            return i;
-        }
-    }
-    int victim = -1;
-    for (int i = 0; i < (int)SIDETNFS_DIR_CACHE_SLOTS; i++)
-    {
-        if (i == s_building_slot)
-        {
-            continue;
-        }
-        if (victim < 0 || s_dir_cache_slots[i].last_used_seq < s_dir_cache_slots[victim].last_used_seq)
-        {
-            victim = i;
-        }
-    }
-    return victim >= 0 ? victim : 0;
-}
+    s_state.tnfs_fread_calls++;
+    s_state.debug_dirty = true;
 
-// Fase 5Q: advance whichever slot is currently mid-network-build
-// (s_building_slot) by exactly one non-blocking step -- one send, or one
-// already-arrived response consumed. Never blocks, never sleeps, never
-// sends more than one request before a response (or timeout, handled by
-// the caller) is seen. Used both by sidetnfs_dir_cache_service() (once per
-// main-loop tick, for the early async root warmup) and by
-// sidetnfs_dir_cache_wait_ready() (pumped in a tight bounded loop for an
-// Fsfirst cache-miss) -- same state machine either way, just driven at
-// different cadences. No-op if the channel is idle (s_building_slot < 0).
-static void dir_cache_advance_one_step(void)
-{
-    if (s_building_slot < 0)
+    uint16_t total = 0;
+    uint8_t last_rc = TNFS_OK;
+    for (uint32_t round = 0; round < SIDETNFS_TNFS_READ_MAX_ROUNDS; round++)
     {
-        return;
-    }
-    SidetnfsDirCacheSlot *slot = &s_dir_cache_slots[s_building_slot];
-    if (slot->state != SIDETNFS_CACHE_LOADING)
-    {
-        s_building_slot = -1; // defensive -- should not happen
-        return;
-    }
-
-    if (!s_building_opendirx_sent)
-    {
-        s_building_opendirx_sent = fslisting_send_opendirx(slot->path, &s_building_opendirx_seq);
-        if (!s_building_opendirx_sent)
+        uint16_t remaining = (uint16_t)(requested - total);
+        if (remaining == 0)
         {
-            slot->state = SIDETNFS_CACHE_ERROR;
-            s_building_slot = -1;
+            break;
         }
-        return;
-    }
-
-    if (!s_building_opendirx_done)
-    {
-        if (!s_fslisting_resp.response_ready)
+        uint16_t chunk = remaining > SIDETNFS_TNFS_READ_CHUNK_MAX ? (uint16_t)SIDETNFS_TNFS_READ_CHUNK_MAX : remaining;
+        uint8_t seq = 0;
+        if (!fslisting_send_read(tnfs_handle, chunk, &seq))
         {
-            return; // still waiting for the OPENDIRX response
+            sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
+            return false;
         }
-        if (!(s_fslisting_resp.cmd == TNFS_CMD_OPENDIRX && s_fslisting_resp.seq == s_building_opendirx_seq))
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
+        sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_READ, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0,
+                           (uint8_t)round);
+#endif
+        if (!fslisting_wait_for(TNFS_CMD_READ, seq))
         {
-            s_fslisting_resp.response_ready = false; // stray/late response -- discard
-            return;
+            sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
+            return false;
         }
         uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
-        uint8_t handle = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+        last_rc = rc;
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
+        sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, rc,
+                           (uint8_t)round);
+#endif
+        uint16_t actual = 0;
+        if (s_fslisting_resp.len > 6)
+        {
+            actual = (uint16_t)s_fslisting_resp.buf[5] | ((uint16_t)s_fslisting_resp.buf[6] << 8);
+        }
+        // Never trust the wire-reported size beyond what the response
+        // frame actually carries or what was requested this round --
+        // clamp defensively before touching out_buf.
+        uint16_t avail = s_fslisting_resp.len > 7 ? (uint16_t)(s_fslisting_resp.len - 7) : 0;
+        if (actual > avail)
+        {
+            actual = avail;
+        }
+        if (actual > chunk)
+        {
+            actual = chunk;
+        }
+        if (rc != TNFS_OK && rc != TNFS_EOF)
+        {
+            s_fslisting_resp.response_ready = false;
+            sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, rc, 0);
+            return false;
+        }
+        if (actual > 0)
+        {
+            memcpy(out_buf + total, &s_fslisting_resp.buf[7], actual);
+        }
         s_fslisting_resp.response_ready = false;
-        if (rc != TNFS_OK)
+        total += actual;
+        s_state.tnfs_fread_bytes += actual;
+        if (actual == 0 || rc == TNFS_EOF)
         {
-            slot->state = SIDETNFS_CACHE_ERROR;
-            slot->error_rc = rc;
-            sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_BUILD_ERROR, 0, slot->path, NULL, NULL, 0, 0, rc, 0);
-            s_building_slot = -1;
-            return;
+            break; // no more data available from this handle right now
         }
-        s_building_dir_handle = handle;
-        s_building_opendirx_done = true;
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_OPENDIRX_OK, 0, slot->path, NULL, NULL, 0, handle, 0, 0);
+    }
+    *out_actual = total;
+    // Fase 7D5: one call-level summary regardless of how many internal
+    // rounds it took, so the default (non-focus) event budget stays at
+    // "one entry per guest READ_BUFF_CALL" (unchanged from before this
+    // phase) -- the per-round detail above only fires under
+    // SIDETNFS_DEBUG_FOCUS_FILE_IO.
+    sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, total, last_rc, 0);
+    if (total == 0)
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_EOF, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0, 0);
+    }
+    else
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_OK, guest_fd, NULL, NULL, NULL, tnfs_handle, total, 0, 0);
+    }
+    return true;
+}
+
+// Fase 7D: TNFS CLOSE. Always logs the outcome; never reports failure to
+// the caller (see header comment) -- the local file descriptor must always
+// be released regardless, same "cleanup can't hang or be retried" contract
+// as tnfs_dta_closedir() for directory handles.
+void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle)
+{
+    s_state.tnfs_fclose_calls++;
+    s_state.debug_dirty = true;
+    uint8_t seq = 0;
+    if (!fslisting_send_close(tnfs_handle, &seq))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
         return;
     }
-
-    if (!s_building_readdirx_pending)
+    sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_CLOSE, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0, 0);
+    if (!fslisting_wait_for(TNFS_CMD_CLOSE, seq))
     {
-        s_building_readdirx_pending =
-            fslisting_send_readdirx(s_building_dir_handle, (uint8_t)SIDETNFS_FS_BATCH_SIZE, &s_building_readdirx_seq);
-        if (!s_building_readdirx_pending)
-        {
-            slot->state = SIDETNFS_CACHE_ERROR;
-            s_building_slot = -1;
-        }
-        return;
-    }
-
-    if (!s_fslisting_resp.response_ready)
-    {
-        return; // still waiting for this READDIRX response
-    }
-    if (!(s_fslisting_resp.cmd == TNFS_CMD_READDIRX && s_fslisting_resp.seq == s_building_readdirx_seq))
-    {
-        s_fslisting_resp.response_ready = false; // stray/late response -- discard
+        sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
         return;
     }
     uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
-    uint8_t batch = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
-    uint16_t resp_len = s_fslisting_resp.len;
     s_fslisting_resp.response_ready = false;
-    s_building_readdirx_pending = false;
-
-    if (rc != TNFS_OK && rc != TNFS_EOF)
+    // Fase 7D-debug: unconditional -- the exact wire rc byte for this CLOSE.
+    sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, rc, 0);
+    if (rc == TNFS_OK)
     {
-        slot->state = SIDETNFS_CACHE_ERROR;
-        slot->error_rc = rc;
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_BUILD_ERROR, 0, slot->path, NULL, NULL, 0, slot->count, rc, 0);
-        s_building_slot = -1;
-        return;
+        sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_OK, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, rc, 0);
     }
-
-    if (batch > 0 && resp_len > 8)
+    else
     {
-        SidetnfsAtariDirEntry batch_entries[SIDETNFS_FS_BATCH_SIZE];
-        uint8_t got = fslisting_parse_batch(batch, batch_entries, SIDETNFS_FS_BATCH_SIZE, &slot->skipped);
-        for (uint8_t i = 0; i < got; i++)
-        {
-            if (slot->count >= SIDETNFS_DIR_CACHE_MAX_ENTRIES)
-            {
-                slot->truncated = true;
-                break;
-            }
-            slot->entries[slot->count++] = batch_entries[i];
-            if (batch_entries[i].attr & FS_ST_FOLDER)
-            {
-                slot->dirs++;
-            }
-            else
-            {
-                slot->files++;
-            }
-        }
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_READDIRX_BATCH, 0, slot->path, NULL, NULL, batch, slot->count, rc, 0);
+        sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, rc, 0);
     }
-
-    if (rc == TNFS_EOF || batch == 0)
-    {
-        // The ONLY place a slot is ever marked READY -- always after a
-        // full EOF, never a partially-filled intermediate state. Frees the
-        // network channel for the next request.
-        slot->state = SIDETNFS_CACHE_READY;
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_BUILD_READY, 0, slot->path, NULL, NULL, slot->dirs, slot->count, 0, 0);
-        s_building_slot = -1;
-    }
-    // else: stay LOADING; the next step will send another READDIRX round.
 }
 
-void sidetnfs_dir_cache_service(void)
-{
-    if (find_cache_slot("/") < 0 &&
-        s_state.mount_response_received && s_state.mount_rc == TNFS_OK)
-    {
-        sidetnfs_dir_cache_request("/"); // early root warmup, once, right after MOUNT
-    }
-    dir_cache_advance_one_step();
-}
+// Fase 5O/5Q/6B: find_cache_slot()/alloc_cache_slot()/
+// dir_cache_advance_one_step()/sidetnfs_dir_cache_service()/
+// sidetnfs_dir_cache_is_ready()/sidetnfs_dir_cache_request()/
+// sidetnfs_dir_cache_wait_ready() -- the RAM directory-cache build state
+// machine -- have been removed. See
+// SIDETNFS_PHASE5_DIRECTORY_LISTING.md/report.
 
-bool sidetnfs_dir_cache_is_ready(const char *path)
-{
-    int slot = find_cache_slot(path);
-    return slot >= 0 && s_dir_cache_slots[slot].state == SIDETNFS_CACHE_READY;
-}
-
-void sidetnfs_dir_cache_request(const char *path)
-{
-    int slot = find_cache_slot(path);
-    if (slot >= 0 && s_dir_cache_slots[slot].state == SIDETNFS_CACHE_LOADING)
-    {
-        return; // already building exactly this path
-    }
-    if (s_building_slot >= 0)
-    {
-        return; // channel busy with a different path -- caller retries later
-    }
-    if (slot < 0)
-    {
-        slot = alloc_cache_slot();
-    }
-    if (s_dir_cache_slots[slot].state != SIDETNFS_CACHE_EMPTY &&
-        strncmp(s_dir_cache_slots[slot].path, path, sizeof(s_dir_cache_slots[slot].path)) != 0)
-    {
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_REPLACE, 0, s_dir_cache_slots[slot].path, path, NULL, (uint16_t)slot, 0,
-                           0, 0);
-    }
-    memset(&s_dir_cache_slots[slot], 0, sizeof(s_dir_cache_slots[slot]));
-    strncpy(s_dir_cache_slots[slot].path, path, sizeof(s_dir_cache_slots[slot].path) - 1);
-    s_dir_cache_slots[slot].state = SIDETNFS_CACHE_LOADING;
-    s_dir_cache_slots[slot].last_used_seq = ++s_dir_cache_use_counter;
-    sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_BUILD_START, 0, path, NULL, NULL, (uint16_t)slot, 0, 0, 0);
-
-    s_building_slot = slot;
-    s_building_opendirx_sent = false;
-    s_building_opendirx_done = false;
-    s_building_dir_handle = 0;
-    s_building_readdirx_pending = false;
-}
-
-bool sidetnfs_dir_cache_wait_ready(const char *path, uint32_t max_wait_ms)
-{
-    absolute_time_t start = get_absolute_time();
-    while (absolute_time_diff_us(start, get_absolute_time()) < (int64_t)max_wait_ms * 1000)
-    {
-        int slot = find_cache_slot(path);
-        if (slot >= 0 && s_dir_cache_slots[slot].state == SIDETNFS_CACHE_READY)
-        {
-            return true;
-        }
-        if (slot >= 0 && s_dir_cache_slots[slot].state == SIDETNFS_CACHE_ERROR)
-        {
-            // Fase 5T: negative cache -- a build for this exact path already
-            // failed (e.g. TNFS rc=2, path does not exist). Stop
-            // immediately, never retry within this wait, and never retry on
-            // a later Fsfirst for the same path either (this ERROR slot
-            // stays put until a different path evicts it via
-            // alloc_cache_slot()'s LRU logic, or reboot -- see report).
-            // Fixing this one condition (previously treated the same as
-            // "no slot at all", which re-triggered sidetnfs_dir_cache_request()
-            // every loop iteration) is what caused the repeated
-            // CACHE_BUILD_START/CACHE_BUILD_ERROR storm for /AUTO.
-            return false;
-        }
-        if (slot < 0)
-        {
-            sidetnfs_dir_cache_request(path); // no-op while channel busy elsewhere
-        }
-        cyw43_arch_poll();
-        dir_cache_advance_one_step();
-        sleep_us(SIDETNFS_DIR_CACHE_WAIT_STEP_US);
-    }
-    bool ready = sidetnfs_dir_cache_is_ready(path); // one last check at the deadline
-    if (!ready)
-    {
-        sidetnfs_diag_log(SIDETNFS_DIAG_CACHE_BUILD_TIMEOUT, 0, path, NULL, NULL, 0, 0, 0, 0);
-    }
-    return ready;
-}
-
-static SidetnfsCacheSearchSlot *find_search_slot(uint32_t ndta)
+static SidetnfsFakeSearchSlot *find_search_slot(uint32_t ndta)
 {
     for (int i = 0; i < (int)SIDETNFS_SEARCH_SLOTS; i++)
     {
-        if (s_cache_searches[i].active && s_cache_searches[i].ndta == ndta)
+        if (s_fake_searches[i].active && s_fake_searches[i].ndta == ndta)
         {
-            return &s_cache_searches[i];
+            return &s_fake_searches[i];
         }
     }
     return NULL;
 }
 
-static SidetnfsCacheSearchSlot *alloc_search_slot(void)
+static SidetnfsFakeSearchSlot *alloc_search_slot(void)
 {
     for (int i = 0; i < (int)SIDETNFS_SEARCH_SLOTS; i++)
     {
-        if (!s_cache_searches[i].active)
+        if (!s_fake_searches[i].active)
         {
-            return &s_cache_searches[i];
+            return &s_fake_searches[i];
         }
     }
-    return &s_cache_searches[0]; // extremely unlikely: evict the first slot
+    return &s_fake_searches[0]; // extremely unlikely: evict the first slot
 }
 
-// Shared by sidetnfs_cache_search_start()/sidetnfs_fake_search_start()/
-// next(): scan from next_index onward for the first pattern+attrib match.
-// Pure RAM access -- no network, ever.
-static SidetnfsDirSearchResult cache_search_advance(SidetnfsCacheSearchSlot *search, SidetnfsAtariDirEntry *out_entry)
+// Fase 5Q/6B: advance a fake no-network search -- exactly one synthetic
+// entry ("NO_NETW.TXT") for root, nothing for any other path (see
+// sidetnfs_fake_search_start()). Pure RAM access -- no network, ever.
+static SidetnfsDirSearchResult fake_search_advance(SidetnfsFakeSearchSlot *search, SidetnfsAtariDirEntry *out_entry)
 {
-    if (search->fake)
+    if (search->next_index > 0 || strncmp(search->path, "/", sizeof(search->path)) != 0)
     {
-        // Fase 5Q: exactly one synthetic entry ("NO_NETW.TXT") for root,
-        // nothing for any other path -- see sidetnfs_fake_search_start().
-        if (search->next_index > 0 || strncmp(search->path, "/", sizeof(search->path)) != 0)
-        {
-            search->active = false;
-            return SIDETNFS_DIR_SEARCH_NOT_FOUND;
-        }
-        search->next_index = 1;
-        SidetnfsAtariDirEntry fake_entry;
-        memset(&fake_entry, 0, sizeof(fake_entry));
-        strncpy(fake_entry.name, "NO_NETW.TXT", sizeof(fake_entry.name) - 1);
-        fake_entry.attr = 0; // plain file
-        fake_entry.valid = true;
-        if (sidetnfs_gemdos_pattern_match(fake_entry.name, search->pattern) &&
-            sidetnfs_gemdos_attr_match(fake_entry.attr, search->attribs))
-        {
-            *out_entry = fake_entry;
-            sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_FOUND, search->ndta, search->path, search->pattern,
-                               fake_entry.name, 0, 0, 0, fake_entry.attr);
-            return SIDETNFS_DIR_SEARCH_FOUND;
-        }
         search->active = false;
-        sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_NOT_FOUND, search->ndta, search->path, search->pattern, NULL, 0, 0, 0, 0);
         return SIDETNFS_DIR_SEARCH_NOT_FOUND;
     }
-
-    int slot_idx = find_cache_slot(search->path);
-    if (slot_idx < 0 || s_dir_cache_slots[slot_idx].state != SIDETNFS_CACHE_READY)
+    search->next_index = 1;
+    SidetnfsAtariDirEntry fake_entry;
+    memset(&fake_entry, 0, sizeof(fake_entry));
+    strncpy(fake_entry.name, "NO_NETW.TXT", sizeof(fake_entry.name) - 1);
+    fake_entry.attr = 0; // plain file
+    fake_entry.valid = true;
+    if (sidetnfs_gemdos_pattern_match(fake_entry.name, search->pattern) &&
+        sidetnfs_gemdos_attr_match(fake_entry.attr, search->attribs))
     {
-        // The slot for this path is gone/not ready (evicted, or build
-        // failed after the search started).
-        search->active = false;
-        return SIDETNFS_DIR_SEARCH_ERROR;
-    }
-    SidetnfsDirCacheSlot *cache = &s_dir_cache_slots[slot_idx];
-
-    while (search->next_index < cache->count)
-    {
-        const SidetnfsAtariDirEntry *candidate = &cache->entries[search->next_index++];
-        if (sidetnfs_gemdos_pattern_match(candidate->name, search->pattern) &&
-            sidetnfs_gemdos_attr_match(candidate->attr, search->attribs))
-        {
-            *out_entry = *candidate;
-            return SIDETNFS_DIR_SEARCH_FOUND;
-        }
+        *out_entry = fake_entry;
+        sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_FOUND, search->ndta, search->path, search->pattern, fake_entry.name, 0,
+                           0, 0, fake_entry.attr);
+        return SIDETNFS_DIR_SEARCH_FOUND;
     }
     search->active = false;
+    sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_NOT_FOUND, search->ndta, search->path, search->pattern, NULL, 0, 0, 0, 0);
     return SIDETNFS_DIR_SEARCH_NOT_FOUND;
 }
 
@@ -2380,7 +2429,7 @@ static SidetnfsDirSearchResult cache_search_advance(SidetnfsCacheSearchSlot *sea
 // both old+new ndta and old+new path in one event: old ndta/path go in the
 // ndta/path fields, new path in the pattern field -- the new ndta itself
 // shows up in the FSFIRST_ENTER event logged right after this one.
-static void diag_log_search_overwrite_if_needed(const SidetnfsCacheSearchSlot *search, uint32_t new_ndta,
+static void diag_log_search_overwrite_if_needed(const SidetnfsFakeSearchSlot *search, uint32_t new_ndta,
                                                   const char *new_path)
 {
     if (search->active && search->ndta != new_ndta)
@@ -2389,106 +2438,13 @@ static void diag_log_search_overwrite_if_needed(const SidetnfsCacheSearchSlot *s
     }
 }
 
-SidetnfsDirSearchResult sidetnfs_cache_search_start(uint32_t ndta, const char *path,
-                                                      const char *pattern, uint8_t attribs,
-                                                      SidetnfsAtariDirEntry *out_entry)
-{
-#if SIDETNFS_FSFIRST_REPEAT_CONTINUE
-    // Fase 5U/5V: diagnostic/workaround, NOT a confirmed fix -- see report.
-    // Some GEM/TOS flows apparently re-issue Fsfirst for the same
-    // ndta/path/pattern instead of ever calling Fsnext (hardware testing
-    // never showed a single FSNEXT_ENTER). Detect this and continue the
-    // existing search from its current cursor instead of restarting at
-    // index 0 -- otherwise the listing looks permanently stuck on the
-    // first entry. Per the chosen policy, attribs are allowed to differ
-    // between repeats (the search adopts the newest value for matching
-    // from here on); only ndta+path+pattern need to match. Gated behind
-    // its own switch so it can be disabled later without touching the
-    // rest of the cache/search code.
-    SidetnfsCacheSearchSlot *existing = find_search_slot(ndta);
-    if (existing != NULL && existing->active && !existing->fake &&
-        strncmp(existing->path, path, sizeof(existing->path)) == 0)
-    {
-        if (strncmp(existing->pattern, pattern, sizeof(existing->pattern)) == 0)
-        {
-            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_REPEAT_CONTINUE, ndta, path, pattern, NULL,
-                               existing->next_index, 0, 0, attribs);
-            existing->attribs = attribs;
-            return cache_search_advance(existing, out_entry);
-        }
-        // Same ndta+path but a different pattern -- not a continuation,
-        // genuinely restart (log why, since this looked like a repeat at
-        // first glance).
-        sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_REPEAT_RESTART, ndta, path, pattern, NULL, 0, 0, 0, 0);
-    }
-#endif // SIDETNFS_FSFIRST_REPEAT_CONTINUE
-
-    bool was_ready = sidetnfs_dir_cache_is_ready(path);
-    if (was_ready)
-    {
-        int slot_idx = find_cache_slot(path);
-        sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_CACHE_HIT, ndta, path, NULL, NULL, 0,
-                           slot_idx >= 0 ? s_dir_cache_slots[slot_idx].count : 0, 0, 0);
-    }
-    else
-    {
-        sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_CACHE_MISS, ndta, path, NULL, NULL, 0, 0, 0, 0);
-        bool ready = sidetnfs_dir_cache_wait_ready(path, SIDETNFS_DIR_CACHE_FSFIRST_WAIT_MS);
-        int slot_idx = find_cache_slot(path);
-        if (ready)
-        {
-            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_CACHE_READY, ndta, path, NULL, NULL, 0,
-                               slot_idx >= 0 ? s_dir_cache_slots[slot_idx].count : 0, 0, 0);
-        }
-        else
-        {
-            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_CACHE_ERROR, ndta, path, NULL, NULL, 0, 0,
-                               slot_idx >= 0 ? s_dir_cache_slots[slot_idx].error_rc : 0xFFu, 0);
-            return SIDETNFS_DIR_SEARCH_ERROR;
-        }
-    }
-
-    SidetnfsCacheSearchSlot *search = find_search_slot(ndta);
-    if (!search)
-    {
-        search = alloc_search_slot();
-    }
-    diag_log_search_overwrite_if_needed(search, ndta, path);
-    memset(search, 0, sizeof(*search));
-    search->ndta = ndta;
-    strncpy(search->path, path, sizeof(search->path) - 1);
-    strncpy(search->pattern, pattern, sizeof(search->pattern) - 1);
-    search->attribs = attribs;
-    search->active = true;
-
-    return cache_search_advance(search, out_entry);
-}
-
 SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *path,
                                                      const char *pattern, uint8_t attribs,
                                                      SidetnfsAtariDirEntry *out_entry)
 {
-#if SIDETNFS_FSFIRST_REPEAT_CONTINUE
-    // Fase 5U/5V: same repeat-Fsfirst-as-continuation handling as
-    // sidetnfs_cache_search_start() -- see report.
-    SidetnfsCacheSearchSlot *existing = find_search_slot(ndta);
-    if (existing != NULL && existing->active && existing->fake &&
-        strncmp(existing->path, path, sizeof(existing->path)) == 0)
-    {
-        if (strncmp(existing->pattern, pattern, sizeof(existing->pattern)) == 0)
-        {
-            sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_REPEAT_CONTINUE, ndta, path, pattern, NULL,
-                               existing->next_index, 0, 0, attribs);
-            existing->attribs = attribs;
-            return cache_search_advance(existing, out_entry);
-        }
-        sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_REPEAT_RESTART, ndta, path, pattern, NULL, 0, 0, 0, 0);
-    }
-#endif // SIDETNFS_FSFIRST_REPEAT_CONTINUE
-
     sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_SEARCH_START, ndta, path, pattern, NULL, 0, 0, 0, attribs);
 
-    SidetnfsCacheSearchSlot *search = find_search_slot(ndta);
+    SidetnfsFakeSearchSlot *search = find_search_slot(ndta);
     if (!search)
     {
         search = alloc_search_slot();
@@ -2496,45 +2452,44 @@ SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *pa
     diag_log_search_overwrite_if_needed(search, ndta, path);
     memset(search, 0, sizeof(*search));
     search->ndta = ndta;
-    search->fake = true;
     strncpy(search->path, path, sizeof(search->path) - 1);
     strncpy(search->pattern, pattern, sizeof(search->pattern) - 1);
     search->attribs = attribs;
     search->active = true;
 
-    return cache_search_advance(search, out_entry);
+    return fake_search_advance(search, out_entry);
 }
 
-SidetnfsDirSearchResult sidetnfs_cache_search_next(uint32_t ndta, SidetnfsAtariDirEntry *out_entry)
+SidetnfsDirSearchResult sidetnfs_fake_search_next(uint32_t ndta, SidetnfsAtariDirEntry *out_entry)
 {
-    SidetnfsCacheSearchSlot *search = find_search_slot(ndta);
+    SidetnfsFakeSearchSlot *search = find_search_slot(ndta);
     if (!search)
     {
         return SIDETNFS_DIR_SEARCH_ERROR;
     }
-    return cache_search_advance(search, out_entry);
+    return fake_search_advance(search, out_entry);
 }
 
-bool sidetnfs_cache_search_is_active(uint32_t ndta)
+bool sidetnfs_fake_search_is_active(uint32_t ndta)
 {
     return find_search_slot(ndta) != NULL;
 }
 
-void sidetnfs_cache_search_close(uint32_t ndta)
+void sidetnfs_fake_search_close(uint32_t ndta)
 {
-    SidetnfsCacheSearchSlot *search = find_search_slot(ndta);
+    SidetnfsFakeSearchSlot *search = find_search_slot(ndta);
     if (search)
     {
         search->active = false;
     }
 }
 
-uint16_t sidetnfs_cache_search_count_active(void)
+uint16_t sidetnfs_fake_search_count_active(void)
 {
     uint16_t count = 0;
     for (unsigned i = 0; i < SIDETNFS_SEARCH_SLOTS; i++)
     {
-        if (s_cache_searches[i].active)
+        if (s_fake_searches[i].active)
         {
             count++;
         }
@@ -2658,9 +2613,9 @@ static int build_status_text(char *text, size_t text_size)
         }
     }
 
-    // Fase 5N (experimental): short summary only, never a per-entry line --
-    // independent of the readdirx/sd-scan sections above since this is a
-    // separate opt-in feature (see SIDETNFS_EXPERIMENTAL_FS_LISTING).
+    // Fase 5N: short summary only, never a per-entry line -- independent of
+    // the readdirx/sd-scan sections above since this is a separate,
+    // backend-routed feature (see SIDETNFS_USE_TNFS_LISTING).
     if (s_state.fs_listing_errors > 0)
     {
         snprintf(line6, sizeof(line6), "[ERR] tnfs fs listing - %u errors\r\n", (unsigned)s_state.fs_listing_errors);

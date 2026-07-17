@@ -65,3 +65,4 @@ build/
 dist/
 secrets.sh
 my_fsdata.c
+.claude/settings.local.json

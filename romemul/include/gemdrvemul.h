@@ -194,6 +194,18 @@ typedef struct DTANode
     struct DTANode *next;
 } DTANode;
 
+// Fase 7D: which backend actually opened this descriptor. fobject is only
+// ever populated/touched for GEMDRIVE_FILE_BACKEND_SD; tnfs_handle only for
+// GEMDRIVE_FILE_BACKEND_TNFS. Routing itself stays compile-time
+// (SIDETNFS_USE_TNFS_LISTING, like every other gemdrive_backend_* helper in
+// gemdrvemul.c) -- this tag is an additional runtime confirmation checked
+// before any TNFS-specific field is read, not the routing mechanism itself.
+typedef enum
+{
+    GEMDRIVE_FILE_BACKEND_SD = 0,
+    GEMDRIVE_FILE_BACKEND_TNFS
+} GemdriveFileBackend;
+
 typedef struct FileDescriptors
 {
     char fpath[128];
@@ -201,6 +213,8 @@ typedef struct FileDescriptors
     FIL fobject;
     struct FileDescriptors *next;
     uint32_t offset;
+    GemdriveFileBackend backend;
+    uint8_t tnfs_handle; // valid only when backend == GEMDRIVE_FILE_BACKEND_TNFS
 } FileDescriptors;
 
 typedef struct _pd PD;
