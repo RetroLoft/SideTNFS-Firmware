@@ -48,6 +48,25 @@
 // once TNFS listing became the proven, stable default (see
 // SIDETNFS_PHASE5_DIRECTORY_LISTING.md).
 
+// Fase 8B: two central, single-purpose compile-time options for building a
+// strict TNFS-only firmware image with no SD/FatFS touch at all (Falcon
+// diagnostic build). Passed through from build.sh/CMakeLists.txt the same
+// way _DEBUG already is (env var -> add_definitions()) -- see CMakeLists.txt.
+// Deliberately just two macros, each with one clear meaning, instead of
+// scattered booleans (SIDETNFS_ENABLE_SD_SUPPORT covers every SD/FatFS
+// touch anywhere in the GEMDRIVE/TNFS trap-handling path;
+// SIDETNFS_ENABLE_DEBUG covers the DEBUG.TXT/SELECT-button snapshot).
+// Both default to 1 (today's existing behavior, completely unchanged for
+// every normal build) -- only the explicit Fase 8B diagnostic build sets
+// either to 0.
+#ifndef SIDETNFS_ENABLE_SD_SUPPORT
+#define SIDETNFS_ENABLE_SD_SUPPORT 1
+#endif
+
+#ifndef SIDETNFS_ENABLE_DEBUG
+#define SIDETNFS_ENABLE_DEBUG 1
+#endif
+
 // Fase 5N (stability investigation): compile-time switch for all DEBUG.TXT
 // writes. Independent of the backend/listing routing above -- this
 // lets Testbuild A disable the debug file while keeping the TNFS
@@ -55,9 +74,12 @@
 // isolate whether the SD/FatFS DEBUG.TXT write itself is a source of
 // timing instability. When 0, sidetnfs_debug_file_service() returns
 // immediately -- no f_open/f_write ever happens, DEBUG.TXT is neither
-// created nor overwritten.
+// created nor overwritten. Fase 8B: this function is retired/never called
+// (see report), but the macro is kept working and now also follows
+// SIDETNFS_ENABLE_DEBUG by default, same as SIDETNFS_DEBUG_DUMP_ON_SELECT
+// below.
 #ifndef SIDETNFS_DEBUG_FILE_ENABLED
-#define SIDETNFS_DEBUG_FILE_ENABLED 1
+#define SIDETNFS_DEBUG_FILE_ENABLED SIDETNFS_ENABLE_DEBUG
 #endif
 
 // Fase 6B/6C: the RAM directory-cache layer (root pre-cache, cache slots,
@@ -131,9 +153,14 @@
 // once per press -- see gemdrvemul.c). Independent of
 // SIDETNFS_DEBUG_FILE_ENABLED. Never triggers automatically -- no
 // main-loop tick, no Fsfirst/Fsnext call site, and no network callback
-// ever writes DEBUG.TXT; only the SELECT edge-handler does.
+// ever writes DEBUG.TXT; only the SELECT edge-handler does. Fase 8B: this
+// is the actual, currently-used DEBUG.TXT mechanism (SIDETNFS_DEBUG_FILE_ENABLED
+// above guards a retired function that's never called) -- now follows
+// SIDETNFS_ENABLE_DEBUG by default, the single knob the Fase 8B
+// TNFS-only-nosd-nodebug build sets to 0 to guarantee zero f_open/f_write
+// from diagnostic code.
 #ifndef SIDETNFS_DEBUG_DUMP_ON_SELECT
-#define SIDETNFS_DEBUG_DUMP_ON_SELECT 1
+#define SIDETNFS_DEBUG_DUMP_ON_SELECT SIDETNFS_ENABLE_DEBUG
 #endif
 
 // Fase 7D5: temporary file-I/O diagnosis focus mode -- NOT meant to stay on
@@ -147,6 +174,49 @@
 // directory-listing detail events log normally.
 #ifndef SIDETNFS_DEBUG_FOCUS_FILE_IO
 #define SIDETNFS_DEBUG_FOCUS_FILE_IO 0
+#endif
+
+// Fase 7F-debugfix: temporary Fseek diagnosis focus mode -- NOT meant to
+// stay on permanently (see report). Defaults ON for this phase (unlike
+// SIDETNFS_DEBUG_FOCUS_FILE_IO) since seeing FSEEK_* events was the whole
+// point. When 1: GEMDRVEMUL_COMMAND_ENTER is only logged for the small set
+// of commands relevant to Fopen/Fread/Fclose/Fseek/Fattrib/Fdatetime/
+// Dgetpath/Dsetpath (see the GEMDRVEMUL_COMMAND_ENTER call site in
+// gemdrvemul.c), and directory-listing per-entry detail events
+// (TNFS_READDIRX_ONE/ENTRY/SKIP/MATCH/EOF, TNFS_OPENDIRX_OK) are
+// additionally suppressed -- same reasoning and same "logging only, no
+// control-flow change" contract as SIDETNFS_DEBUG_FOCUS_FILE_IO.
+#ifndef SIDETNFS_DEBUG_FOCUS_FSEEK
+#define SIDETNFS_DEBUG_FOCUS_FSEEK 1
+#endif
+
+// Fase 7G: temporary Fdelete diagnosis focus mode -- same style/contract as
+// SIDETNFS_DEBUG_FOCUS_FSEEK, not meant to stay on permanently. Defaults
+// ON. When 1: GEMDRVEMUL_COMMAND_ENTER also includes GEMDRVEMUL_FDELETE_CALL
+// in its whitelist (composed with SIDETNFS_DEBUG_FOCUS_FSEEK's own
+// whitelist -- either focus mode being on is enough to show its own
+// commands), and directory-listing detail events are suppressed the same
+// way (see SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL in sidetnfs_probe.c).
+#ifndef SIDETNFS_DEBUG_FOCUS_FDELETE
+#define SIDETNFS_DEBUG_FOCUS_FDELETE 1
+#endif
+
+// Fase 7H: temporary Frename diagnosis focus mode -- same style/contract as
+// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE. Defaults ON.
+#ifndef SIDETNFS_DEBUG_FOCUS_FRENAME
+#define SIDETNFS_DEBUG_FOCUS_FRENAME 1
+#endif
+
+// Fase 7I: temporary Dcreate diagnosis focus mode -- same style/contract as
+// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE/FRENAME. Defaults ON.
+#ifndef SIDETNFS_DEBUG_FOCUS_DCREATE
+#define SIDETNFS_DEBUG_FOCUS_DCREATE 1
+#endif
+
+// Fase 7J: temporary Ddelete diagnosis focus mode -- same style/contract as
+// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE/FRENAME/DCREATE. Defaults ON.
+#ifndef SIDETNFS_DEBUG_FOCUS_DDELETE
+#define SIDETNFS_DEBUG_FOCUS_DDELETE 1
 #endif
 
 // Fase 5U/5V (REMOVED in Fase 6B): repeated-Fsfirst-as-continuation was a
@@ -205,6 +275,20 @@ void sidetnfs_debug_file_service(const char *hd_folder);
 // will write a short "[SKIP] tnfs disabled" line once hd_folder is known.
 // Never blocks, never logs, no UART.
 void sidetnfs_mark_network_skipped(void);
+
+// Fase 8A: backend-isolation review I/O counters. Call sidetnfs_note_tnfs_io()
+// from the single central choke point for real TNFS wire traffic
+// (fslisting_ensure_pcb() already does this internally -- callers outside
+// sidetnfs_probe.c should not normally need to call it directly). Call
+// sidetnfs_note_sd_io() from the SD/FatFS backend's own most central choke
+// points (scfs_directory_exists()/scfs_get_disk_info()/scfs_stat() in
+// scfs.c already do this). Both increment their own running total and,
+// gated by the SAME SIDETNFS_USE_TNFS_LISTING/SIDETNFS_USE_SD_LISTING
+// compile-time macro used throughout gemdrvemul.c, the matching cross-mode
+// counter -- see the DEBUG.TXT dump / SidetnfsDebugState comment for full
+// semantics. Passive: RAM-only, no I/O of their own.
+void sidetnfs_note_tnfs_io(void);
+void sidetnfs_note_sd_io(void);
 
 // Fase 5J: one-shot SD/FatFS root directory scan (via f_opendir/f_readdir),
 // purely to compare entry counts against the TNFS READDIRX root scan in
@@ -369,12 +453,24 @@ typedef enum
     SIDETNFS_FILE_OPEN_ERROR
 } SidetnfsFileOpenResult;
 
-// Open tnfs_path read-only over TNFS (GEMDOS mode 0 only -- caller must deny
-// mode 1/2 before ever calling this). Bounded wait, same contract as
-// sidetnfs_tnfs_dta_start() -- never blocks indefinitely, never crashes on a
-// wrong/unsupported opcode guess. On SIDETNFS_FILE_OPEN_OK, *out_handle is
-// the TNFS-side file handle to use for subsequent read/close calls.
-SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint8_t *out_handle);
+// Open tnfs_path over TNFS for GEMDOS Fopen. gemdos_mode is the raw Fopen
+// mode (0=read-only, 1=write-only, 2=read/write); the caller must still
+// deny anything outside 0-2 before ever calling this (see
+// gemdrive_backend_fopen() in gemdrvemul.c). Never creates the file --
+// Fase 7K, use sidetnfs_tnfs_file_create() below for Fcreate instead.
+// Bounded wait, same contract as sidetnfs_tnfs_dta_start() -- never blocks
+// indefinitely, never crashes on a wrong/unsupported opcode guess. On
+// SIDETNFS_FILE_OPEN_OK, *out_handle is the TNFS-side file handle to use
+// for subsequent read/write/close calls.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t gemdos_mode, uint8_t *out_handle);
+
+// Fase 7K: open tnfs_path over TNFS for GEMDOS Fcreate -- always
+// create-if-missing + truncate-to-zero + read/write, matching the SD/FatFS
+// route's own FA_READ|FA_WRITE|FA_CREATE_ALWAYS unconditionally (GEMDOS
+// Fcreate never preserves existing content). Same bounded-wait contract as
+// sidetnfs_tnfs_file_open(). On SIDETNFS_FILE_OPEN_OK, *out_handle is the
+// TNFS-side file handle to use for subsequent write/close calls.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_create(const char *tnfs_path, uint8_t *out_handle);
 
 // Read up to requested bytes (internally chunked and bounded -- see
 // SIDETNFS_TNFS_READ_CHUNK_MAX in sidetnfs_probe.c) from tnfs_handle
@@ -386,12 +482,230 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint8_t *o
 bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *out_buf,
                               uint16_t requested, uint16_t *out_actual);
 
+// Fase 7K: write up to requested bytes (internally chunked and bounded --
+// see SIDETNFS_TNFS_WRITE_CHUNK_MAX in sidetnfs_probe.c) from data (the
+// caller's shared-memory write buffer -- no intermediate stack copy of the
+// chunk payload) to tnfs_handle. guest_fd is only used for diagnostic
+// logging. Loops internally to fill up to `requested`, but -- unlike
+// sidetnfs_tnfs_file_read()'s fill-the-whole-request contract -- stops
+// immediately the first time the server accepts fewer bytes than a given
+// internal chunk asked for (a genuine short/partial write, not an error):
+// *out_actual reports whatever total was actually accepted, matching the
+// SD/FatFS route's f_write() contract of reporting the real (possibly
+// partial) byte count on success. Returns false only on a genuine protocol
+// error/timeout/unexpected wire error, in which case *out_actual is
+// whatever was accepted before the failing round (the caller must still
+// treat the whole call as failed and not act on that count -- matching the
+// SD/FatFS route, which also discards its own bytes_write on an FR_*
+// error). *out_rc (nullable) receives the last raw TNFS wire rc byte seen
+// (0xFF if a send/timeout failure occurred instead).
+bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, const uint8_t *data, uint16_t requested,
+                               uint16_t *out_actual, uint8_t *out_rc);
+
 // Send TNFS CLOSE for tnfs_handle and wait (bounded, same contract as
 // tnfs_dta_closedir()). Always logs the outcome but never reports failure
 // back to the caller -- per Fase 7D requirements, the local file descriptor
 // must always be released regardless of whether the network close
 // succeeded, so there is nothing meaningful for the caller to act on.
 void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle);
+
+// Fase 7E: one-shot TNFS directory-existence probe for GEMDRVEMUL_DSETPATH_CALL
+// -- OPENDIRX followed immediately by CLOSEDIR, never touching the TNFS
+// DTA-registry (sidetnfs_tnfs_dta_start()/next()) or the fake no-network
+// search table, so it can never collide with or pollute an in-progress
+// Fsfirst/Fsnext for some other ndta. Returns true iff tnfs_path exists as
+// a directory; *out_rc receives the raw TNFS wire rc byte (0xFF if no
+// response was ever received) for logging/error-mapping upstream.
+bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc);
+
+// Fase 7F: TNFS SEEK for an already-open file handle. seek_from_end==false
+// always sends an absolute TNFS SEEK_SET request for `offset` (the caller
+// -- gemdrvemul.c's GEMDRVEMUL_FSEEK_CALL TNFS branch -- has already done
+// the GEMDOS SEEK_SET/SEEK_CUR arithmetic itself, mirroring the SD/RAM
+// route's own file->offset math exactly); seek_from_end==true sends a real
+// TNFS SEEK_END request and reads the resulting absolute position back
+// from the response, since only the server knows the file size. On
+// success, *out_new_offset is the new absolute offset (for SEEK_SET this
+// simply echoes back what the caller asked for; for SEEK_END it comes from
+// the server). Returns false on any send/timeout/wire error, or if a
+// SEEK_END response doesn't carry the expected position field. out_rc
+// (nullable, Fase 7F-debugfix) receives the raw TNFS wire rc byte (0xFF if
+// no response was ever received) -- purely additive, for diagnostic
+// counters upstream, does not affect the seek itself.
+bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, bool seek_from_end,
+                              int32_t offset, uint32_t *out_new_offset, uint8_t *out_rc);
+
+// Fase 7G: TNFS delete results. Mirrors the SidetnfsFileOpenResult shape
+// above -- keeps raw TNFS wire errno values (TNFS_ENOENT/TNFS_EACCES/
+// TNFS_EISDIR, private to sidetnfs_probe.c) out of gemdrvemul.c, which only
+// needs to pick a GEMDOS status from this small result set.
+typedef enum
+{
+    SIDETNFS_FILE_DELETE_OK = 0,
+    SIDETNFS_FILE_DELETE_NOT_FOUND,
+    SIDETNFS_FILE_DELETE_ACCESS_DENIED,
+    SIDETNFS_FILE_DELETE_ERROR
+} SidetnfsFileDeleteResult;
+
+// Fase 7G: TNFS UNLINK for a file (never a directory -- see
+// sidetnfs_tnfs_file_delete()'s definition for how the server's own
+// refusal to unlink a directory is handled). out_rc (nullable) receives
+// the raw TNFS wire rc byte (0xFF if no response was ever received), for
+// diagnostic logging/counters upstream (does not affect the result
+// mapping itself).
+SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(const char *tnfs_path, uint8_t *out_rc);
+
+// Fase 7H: TNFS rename results. Same shape/reasoning as
+// SidetnfsFileDeleteResult above. EXISTS is folded into ACCESS_DENIED (see
+// sidetnfs_tnfs_file_rename()'s definition) -- kept as a single result
+// value rather than a separate one, since GEMDOS has no dedicated
+// "destination exists" error code to map it to differently anyway.
+typedef enum
+{
+    SIDETNFS_FILE_RENAME_OK = 0,
+    SIDETNFS_FILE_RENAME_NOT_FOUND,
+    SIDETNFS_FILE_RENAME_ACCESS_DENIED,
+    SIDETNFS_FILE_RENAME_ERROR
+} SidetnfsFileRenameResult;
+
+// Fase 7H: TNFS RENAME from old_path to new_path (both already-resolved
+// TNFS-relative paths). Never called with a pre-check that the source or
+// destination exists -- relies entirely on the server's own rename() rc,
+// so a rename can never be reported as successful unless the server says
+// so. out_rc (nullable) receives the raw TNFS wire rc byte (0xFF if no
+// response was ever received), for diagnostic logging/counters upstream.
+SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(const char *old_path, const char *new_path, uint8_t *out_rc);
+
+// Fase 7I: TNFS mkdir results. PATH_NOT_FOUND is unambiguous here (unlike
+// the Fopen/Fdelete/Frename ENOENT cases) -- for Dcreate, ENOENT can only
+// mean "a parent path component doesn't exist" (the target itself not
+// existing is the expected precondition for creating it, not an error).
+typedef enum
+{
+    SIDETNFS_DIR_CREATE_OK = 0,
+    SIDETNFS_DIR_CREATE_PATH_NOT_FOUND,
+    SIDETNFS_DIR_CREATE_ACCESS_DENIED,
+    SIDETNFS_DIR_CREATE_ERROR
+} SidetnfsDirCreateResult;
+
+// Fase 7I: TNFS MKDIR for tnfs_path (already-resolved TNFS-relative path).
+// Never called with a pre-check that the directory already exists or that
+// its parent exists -- relies entirely on the server's own mkdir() rc, no
+// preceding directory listing. out_rc (nullable) receives the raw TNFS
+// wire rc byte (0xFF if no response was ever received), for diagnostic
+// logging/counters upstream.
+SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(const char *tnfs_path, uint8_t *out_rc);
+
+// Fase 7J: TNFS rmdir results. PATH_NOT_FOUND covers both "directory
+// doesn't exist" (ENOENT) and "not a directory" (ENOTDIR, per the report's
+// explicit EPTHNF mapping choice) -- ACCESS_DENIED covers EACCES and
+// "directory not empty" (ENOTEMPTY).
+typedef enum
+{
+    SIDETNFS_DIR_DELETE_OK = 0,
+    SIDETNFS_DIR_DELETE_PATH_NOT_FOUND,
+    SIDETNFS_DIR_DELETE_ACCESS_DENIED,
+    SIDETNFS_DIR_DELETE_ERROR
+} SidetnfsDirDeleteResult;
+
+// Fase 7J: TNFS RMDIR for tnfs_path (already-resolved TNFS-relative path).
+// Never called with a preceding directory-listing/enumeration to check
+// whether the directory is empty -- relies entirely on the server's own
+// rmdir() rc, so a delete can never be reported as successful unless the
+// server actually performed it, and a non-empty directory is never
+// silently emptied or force-removed. Never falls back to
+// sidetnfs_tnfs_file_delete()/UNLINK. out_rc (nullable) receives the raw
+// TNFS wire rc byte (0xFF if no response was ever received), for
+// diagnostic logging/counters upstream.
+SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(const char *tnfs_path, uint8_t *out_rc);
+
+// Fase 7L: TNFS attribute-query/set results for GEMDRVEMUL_FATTRIB_CALL.
+// Mirrors the OK/NOT_FOUND/PATH_NOT_FOUND/ACCESS_DENIED/ERROR shape used
+// elsewhere in this header -- keeps raw TNFS wire errno codes and the raw
+// POSIX-style mode out of gemdrvemul.c, which only ever needs to pick a
+// GEMDOS status and an FS_ST_* attribute byte from this result.
+typedef enum
+{
+    SIDETNFS_ATTR_OK = 0,
+    SIDETNFS_ATTR_NOT_FOUND,
+    SIDETNFS_ATTR_PATH_NOT_FOUND,
+    SIDETNFS_ATTR_ACCESS_DENIED,
+    SIDETNFS_ATTR_ERROR
+} SidetnfsAttrResult;
+
+// Fase 7L: TNFS STAT -> GEMDOS/DOS-style (FS_ST_*) attributes, for Fattrib
+// inquire (wflag 0). *out_st_attribs (on SIDETNFS_ATTR_OK) is an FS_ST_*
+// bitmask -- only FS_ST_FOLDER and FS_ST_READONLY are ever set (see
+// report: hidden/system/archive/label have no POSIX-mode equivalent this
+// server exposes). out_rc (nullable) receives the raw TNFS wire rc byte
+// (0xFF if no response was ever received).
+SidetnfsAttrResult sidetnfs_tnfs_get_attributes(const char *tnfs_path, uint8_t *out_st_attribs, uint8_t *out_rc);
+
+// Fase 7Lb: for Fattrib set (wflag 1). Confirmed against the actual server
+// source (tnfsd 24.0522.1) that TNFS_CHMODFILE (0x27) is registered in its
+// command-dispatch table but the handler function body is empty (no
+// payload parse, no chmod(), no response) -- this function therefore never
+// sends any wire request at all (no STAT, no CHMOD) and unconditionally
+// reports the operation as unsupported: always returns
+// SIDETNFS_ATTR_ACCESS_DENIED, always sets *out_unsupported (nullable) to
+// true, always sets *out_result_attribs (nullable) to 0 -- the caller must
+// map this to GEMDOS_EACCDN and must never surface *out_result_attribs as
+// if anything were actually changed (no false success, no local attribute
+// cache). requested_attribs/mask are only used for diagnostic logging.
+// out_rc (nullable) is always set to 0xFF (no wire traffic, nothing to
+// report).
+SidetnfsAttrResult sidetnfs_tnfs_set_attributes(const char *tnfs_path, uint8_t requested_attribs, uint8_t mask,
+                                                 uint8_t *out_result_attribs, uint8_t *out_rc, bool *out_unsupported);
+
+// Fase 7M: TNFS STAT -> GEMDOS date/time, for Fdatime inquire (wflag 0).
+// Reuses the same STAT request as sidetnfs_tnfs_get_attributes() above,
+// reading mtime (confirmed at payload offset 0x0E) instead of mode.
+// *out_gemdos_date/*out_gemdos_time (on SIDETNFS_ATTR_OK) are the FAT/
+// GEMDOS-bit-layout date/time words, converted from the Unix mtime using
+// this project's own local-time policy (see get_utc_offset_seconds() in
+// rtcemul.h). *out_unix_mtime (nullable) is the raw value STAT reported.
+// out_rc (nullable) receives the raw TNFS wire rc byte (0xFF if no
+// response was ever received).
+SidetnfsAttrResult sidetnfs_tnfs_get_datetime(const char *tnfs_path, uint16_t *out_gemdos_date,
+                                               uint16_t *out_gemdos_time, uint32_t *out_unix_mtime, uint8_t *out_rc);
+
+// Fase 7M: for Fdatime set (wflag 1). The actual server's protocol header
+// defines no UTIME/SETTIME command at all (confirmed against the tnfsd
+// 24.0522.1 source -- a stronger gap than Fattrib's CHMOD, which at least
+// has a registered-but-empty opcode), so this function never sends any
+// wire request -- it only logs the outcome (SIDETNFS_DIAG_FDATIME_SET_UNSUPPORTED).
+// The caller (GEMDRVEMUL_FDATETIME_CALL in gemdrvemul.c) must map every
+// TNFS Fdatime set to a GEMDOS error and never surface the requested
+// date/time as if it were actually persisted, and must call
+// sidetnfs_note_tnfs_fdatime() itself (this function does not).
+void sidetnfs_tnfs_set_datetime_unsupported(const char *tnfs_path, uint16_t requested_date, uint16_t requested_time);
+
+// Fase 7J: release any active TNFS DTA-registry search (see
+// sidetnfs_tnfs_dta_start()/next() above) whose directory path exactly
+// matches tnfs_path -- targeted, not a broad reset of all DTA slots.
+// Fase 7J-correctie: no longer called by Ddelete (a still-open OPENDIRX
+// handle on the target directory can make the server refuse RMDIR, so the
+// close now has to happen -- and be confirmed -- *before* RMDIR is even
+// attempted; see sidetnfs_tnfs_dta_close_by_path() below and the report).
+// Left in place as a general-purpose targeted-release utility. No-op if no
+// matching search is currently active.
+void sidetnfs_tnfs_dta_release_by_path(const char *tnfs_path);
+
+// Fase 7J-correctie: close (CLOSEDIR) every active TNFS DTA-registry
+// search whose directory path exactly matches tnfs_path, confirming each
+// CLOSEDIR actually succeeded before touching any local state -- unlike
+// releaseTnfsDTA()/sidetnfs_tnfs_dta_release_by_path() (which always clear
+// local state regardless of the server's CLOSEDIR response, matching the
+// general "cleanup can't hang or retry" contract used elsewhere), this
+// function must not silently assume success: RMDIR can only safely be
+// attempted once every matching handle is confirmed closed.
+// *out_matches receives how many active slots matched tnfs_path (0 if
+// none -- nothing to close, safe to proceed). *out_close_rc receives the
+// last raw TNFS wire rc seen for a CLOSEDIR attempt (0xFF if none were
+// sent, or if a send/timeout failure occurred). Returns true iff every
+// matching slot (if any) was successfully closed and released -- the
+// caller (Ddelete) must not send RMDIR when this returns false.
+bool sidetnfs_tnfs_dta_close_by_path(const char *tnfs_path, uint16_t *out_matches, uint8_t *out_close_rc);
 
 // Fase 5O/6B: continue the active fake no-network search for ndta. Pure
 // RAM scan -- no network, no wait, ever.
@@ -413,6 +727,85 @@ uint16_t sidetnfs_fake_search_count_active(void);
 // other debug line -- never a per-entry write).
 void sidetnfs_note_tnfs_fs_hit(void);
 void sidetnfs_note_tnfs_fs_error(void);
+
+// Fase 7F-debugfix: record one GEMDRVEMUL_FSEEK_CALL outcome for the
+// DEBUG.TXT header counters (fseek calls/ok/errors/last mode/last fd/last
+// rc) -- independent of the diagnostic eventlog's fixed-size budget, so
+// these always reflect reality even once the eventlog itself is full.
+void sidetnfs_note_tnfs_fseek(uint16_t mode, uint16_t fd, uint8_t rc, bool ok);
+
+// Fase 7G: record one GEMDRVEMUL_FDELETE_CALL outcome for the DEBUG.TXT
+// header counters (fdelete calls/ok/errors/last rc/last path) --
+// independent of the diagnostic eventlog's fixed-size budget, same
+// contract as sidetnfs_note_tnfs_fseek(). path is copied into a fixed,
+// explicitly null-terminated buffer (may truncate a very long path -- this
+// is a header summary, not a full record).
+void sidetnfs_note_tnfs_fdelete(const char *path, uint8_t rc, bool ok);
+
+// Fase 7H: record one GEMDRVEMUL_FRENAME_CALL outcome for the DEBUG.TXT
+// header counters (frename calls/ok/errors/last rc/last old path/last new
+// path) -- same contract as sidetnfs_note_tnfs_fdelete().
+void sidetnfs_note_tnfs_frename(const char *old_path, const char *new_path, uint8_t rc, bool ok);
+
+// Fase 7I: record one GEMDRVEMUL_DCREATE_CALL outcome for the DEBUG.TXT
+// header counters (dcreate calls/ok/errors/last rc/last path) -- same
+// contract as sidetnfs_note_tnfs_fdelete().
+void sidetnfs_note_tnfs_dcreate(const char *path, uint8_t rc, bool ok);
+
+// Fase 7J: record one GEMDRVEMUL_DDELETE_CALL outcome for the DEBUG.TXT
+// header counters (ddelete calls/ok/errors/last rc/last path) -- same
+// contract as sidetnfs_note_tnfs_dcreate().
+void sidetnfs_note_tnfs_ddelete(const char *path, uint8_t rc, bool ok);
+
+// Fase 7J-correctie: record one sidetnfs_tnfs_dta_close_by_path() outcome
+// for the DEBUG.TXT header counters (ddelete dta matches/closed/close
+// errors/last close rc). matches/closed/close_errors are added to the
+// running totals; last_close_rc is a direct set of the most recent raw
+// CLOSEDIR wire rc (0xFF if none was sent, e.g. no matching slot).
+void sidetnfs_note_tnfs_ddelete_dta(uint16_t matches, uint16_t closed, uint16_t close_errors, uint8_t last_close_rc);
+
+// Fase 7J-correctie-diag: record one GEMDRVEMUL_DDELETE_CALL outcome
+// breakdown for the DEBUG.TXT header counters (ddelete cwd rejects/root
+// rejects/rmdir attempts/last reject reason). cwd_reject/root_reject/
+// rmdir_attempt each add at most 1 when true; reason (pass NULL to leave
+// the stored reason untouched) overwrites the last-reject-reason string.
+void sidetnfs_note_tnfs_ddelete_diag(bool cwd_reject, bool root_reject, bool rmdir_attempt, const char *reason);
+
+// Fase 7J-correctie2: record one GEMDRVEMUL_DDELETE_CALL cwd-target-match/
+// parent-update outcome for the DEBUG.TXT header counters (ddelete cwd
+// target matches/parent updates/last cwd before/last cwd after).
+// target_match/parent_update each add at most 1 when true; cwd_before/
+// cwd_after (pass NULL to leave the corresponding stored string untouched)
+// overwrite the last-cwd-before/-after strings.
+void sidetnfs_note_tnfs_ddelete_cwd(bool target_match, bool parent_update, const char *cwd_before,
+                                     const char *cwd_after);
+
+// Fase 7K: record one GEMDRVEMUL_WRITE_BUFF_CALL outcome for the DEBUG.TXT
+// header counters (fwrite calls/ok/errors/requested bytes/written bytes/
+// partial writes/last handle/last requested/last written/last tnfs rc).
+// requested/written accumulate into running totals; partial adds 1 to the
+// partial-writes counter when true; the rest are direct sets.
+void sidetnfs_note_tnfs_fwrite(uint8_t handle, uint16_t requested, uint16_t written, uint8_t rc, bool ok,
+                                bool partial);
+
+// Fase 7L: record one GEMDRVEMUL_FATTRIB_CALL outcome for the DEBUG.TXT
+// header counters (fattrib calls/inquire calls/set calls/ok/errors/
+// unsupported/last wflag/last requested/last returned/last tnfs rc/last
+// path). wflag (0=inquire, 1=set) picks which sub-counter increments;
+// unsupported adds 1 to the unsupported counter when true; the rest are
+// direct sets/accumulate as documented on sidetnfs_note_tnfs_fwrite()
+// above.
+void sidetnfs_note_tnfs_fattrib(uint16_t wflag, uint8_t requested, uint8_t returned, uint8_t rc, bool ok,
+                                 bool unsupported, const char *path);
+
+// Fase 7M: record one GEMDRVEMUL_FDATETIME_CALL outcome for the DEBUG.TXT
+// header counters (fdatime count/inquire count/set count/error count/
+// unsupported count/last wflag/last handle/last path/last tnfs rc/last
+// unix mtime/last gemdos date/last gemdos time). wflag (0=inquire, 1=set)
+// picks which sub-counter increments; !ok adds 1 to the error counter;
+// unsupported adds 1 to the unsupported counter; the rest are direct sets.
+void sidetnfs_note_tnfs_fdatime(uint16_t wflag, uint8_t handle, const char *path, uint8_t rc, bool ok,
+                                 bool unsupported, uint32_t unix_mtime, uint16_t gemdos_date, uint16_t gemdos_time);
 
 // Fase 5S: RAM-only Fsfirst/Fsnext diagnostic eventlog. See
 // sidetnfs_diag_log()/sidetnfs_diag_dump_on_select() below.
@@ -578,6 +971,172 @@ typedef enum
     // truncation for files >64KB.
     SIDETNFS_DIAG_READ_BUFF_OFFSET_BEFORE,
     SIDETNFS_DIAG_READ_BUFF_OFFSET_AFTER,
+    // Fase 7E: Dsetpath/Dgetpath/current-directory backend-aware. The
+    // TNFS_* events mirror the existing DSETPATH_SD_CHECK/RETURN shape but
+    // for the real TNFS existence check (sidetnfs_tnfs_directory_exists())
+    // that now actually determines BACKEND_TNFS's GEMDOS status, instead of
+    // the (still separately logged, now informational-only)
+    // scfs_directory_exists() SD check. PATH_RESOLVE_* covers the
+    // relative-path + current-directory concatenation step in
+    // GEMDRVEMUL_FSFIRST_CALL (which had no dedicated diagnostics of its
+    // own before this phase) and, via PATH_RESOLVE_CWD only, the same step
+    // inside get_tnfs_relative_pathname() for Fopen (whose raw/resolved
+    // path was already covered by FOPEN_RAW_PATH/FOPEN_TNFS_PATH).
+    SIDETNFS_DIAG_DSETPATH_TNFS_PATH,
+    SIDETNFS_DIAG_DSETPATH_TNFS_EXISTS_RC,
+    SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET,
+    SIDETNFS_DIAG_DGETPATH_RETURN,
+    SIDETNFS_DIAG_PATH_RESOLVE_INPUT,
+    SIDETNFS_DIAG_PATH_RESOLVE_CWD,
+    SIDETNFS_DIAG_PATH_RESOLVE_OUTPUT,
+    // Fase 7F: TNFS Fseek. ENTER/HANDLE/MODE/OFFSET_IN/OFFSET_OUT/RETURN
+    // are logged from gemdrvemul.c (GEMDRVEMUL_FSEEK_CALL's TNFS branch);
+    // TNFS_SEEK/TNFS_RC are logged from sidetnfs_tnfs_file_seek() in
+    // sidetnfs_probe.c (mirrors the FOPEN_*/FOPEN_TNFS_* split).
+    SIDETNFS_DIAG_FSEEK_ENTER,
+    SIDETNFS_DIAG_FSEEK_HANDLE,
+    SIDETNFS_DIAG_FSEEK_MODE,
+    SIDETNFS_DIAG_FSEEK_OFFSET_IN,
+    SIDETNFS_DIAG_FSEEK_BACKEND,
+    SIDETNFS_DIAG_FSEEK_TNFS_SEEK,
+    SIDETNFS_DIAG_FSEEK_TNFS_RC,
+    SIDETNFS_DIAG_FSEEK_OFFSET_OUT,
+    SIDETNFS_DIAG_FSEEK_RETURN,
+    // Fase 7G: TNFS Fdelete (files only -- Ddelete/directories untouched).
+    // ENTER/RAW_PATH/TNFS_PATH/RETURN logged from gemdrvemul.c
+    // (GEMDRVEMUL_FDELETE_CALL's TNFS branch); TNFS_UNLINK/TNFS_RC logged
+    // from sidetnfs_tnfs_file_delete() in sidetnfs_probe.c (mirrors the
+    // FSEEK_*/FSEEK_TNFS_* split). SIDETNFS_DIAG_FDELETE_DENIED_TNFS
+    // (Fase 7C) is no longer reachable for the file-delete path but is
+    // left defined -- see report.
+    SIDETNFS_DIAG_FDELETE_ENTER,
+    SIDETNFS_DIAG_FDELETE_RAW_PATH,
+    SIDETNFS_DIAG_FDELETE_TNFS_PATH,
+    SIDETNFS_DIAG_FDELETE_TNFS_UNLINK,
+    SIDETNFS_DIAG_FDELETE_TNFS_RC,
+    SIDETNFS_DIAG_FDELETE_RETURN,
+    // Fase 7H: TNFS Frename (files, and directories when the server
+    // allows it -- SidecarT/GEMDOS doesn't distinguish file/directory
+    // rename at the trap level). ENTER/RAW_SRC/RAW_DST/TNFS_SRC/TNFS_DST/
+    // HANDLE_UPDATE/RETURN logged from gemdrvemul.c
+    // (GEMDRVEMUL_FRENAME_CALL's TNFS branch); TNFS_RENAME/TNFS_RC logged
+    // from sidetnfs_tnfs_file_rename() in sidetnfs_probe.c (mirrors the
+    // FSEEK_*/FDELETE_* split).
+    SIDETNFS_DIAG_FRENAME_ENTER,
+    SIDETNFS_DIAG_FRENAME_RAW_SRC,
+    SIDETNFS_DIAG_FRENAME_RAW_DST,
+    SIDETNFS_DIAG_FRENAME_TNFS_SRC,
+    SIDETNFS_DIAG_FRENAME_TNFS_DST,
+    SIDETNFS_DIAG_FRENAME_TNFS_RENAME,
+    SIDETNFS_DIAG_FRENAME_TNFS_RC,
+    SIDETNFS_DIAG_FRENAME_HANDLE_UPDATE,
+    SIDETNFS_DIAG_FRENAME_RETURN,
+    // Fase 7I: TNFS Dcreate. ENTER/RAW_PATH/TNFS_PATH/RETURN logged from
+    // gemdrvemul.c (GEMDRVEMUL_DCREATE_CALL's TNFS branch); TNFS_MKDIR/
+    // TNFS_RC logged from sidetnfs_tnfs_directory_create() in
+    // sidetnfs_probe.c (mirrors the FDELETE_*/FRENAME_* split).
+    SIDETNFS_DIAG_DCREATE_ENTER,
+    SIDETNFS_DIAG_DCREATE_RAW_PATH,
+    SIDETNFS_DIAG_DCREATE_TNFS_PATH,
+    SIDETNFS_DIAG_DCREATE_TNFS_MKDIR,
+    SIDETNFS_DIAG_DCREATE_TNFS_RC,
+    SIDETNFS_DIAG_DCREATE_RETURN,
+    // Fase 7J: TNFS Ddelete (single empty directory only -- never
+    // recursive). ENTER/RAW_PATH/TNFS_PATH/CWD_CHECK/RETURN logged from
+    // gemdrvemul.c (GEMDRVEMUL_DDELETE_CALL's TNFS branch); TNFS_RMDIR/
+    // TNFS_RC logged from sidetnfs_tnfs_directory_delete() in
+    // sidetnfs_probe.c (mirrors the DCREATE_*/FRENAME_* split).
+    // SIDETNFS_DIAG_DDELETE_DTA_RELEASE is superseded by the Fase
+    // 7J-correctie DTA_* events below (closing matching search handles
+    // moved from after a successful RMDIR to before attempting it, so a
+    // still-open OPENDIRX handle can never block the server's RMDIR) --
+    // left defined, no longer emitted, see report.
+    SIDETNFS_DIAG_DDELETE_ENTER,
+    SIDETNFS_DIAG_DDELETE_RAW_PATH,
+    SIDETNFS_DIAG_DDELETE_TNFS_PATH,
+    SIDETNFS_DIAG_DDELETE_CWD_CHECK,
+    SIDETNFS_DIAG_DDELETE_TNFS_RMDIR,
+    SIDETNFS_DIAG_DDELETE_TNFS_RC,
+    SIDETNFS_DIAG_DDELETE_DTA_RELEASE,
+    SIDETNFS_DIAG_DDELETE_RETURN,
+    // Fase 7J-correctie: pre-RMDIR targeted directory-search-handle close.
+    // PRECHECK/RELEASE_BEFORE logged from gemdrvemul.c; MATCH/CLOSE/
+    // CLOSE_RC logged from sidetnfs_tnfs_dta_close_by_path() in
+    // sidetnfs_probe.c.
+    SIDETNFS_DIAG_DDELETE_DTA_PRECHECK,
+    SIDETNFS_DIAG_DDELETE_DTA_MATCH,
+    SIDETNFS_DIAG_DDELETE_DTA_CLOSE,
+    SIDETNFS_DIAG_DDELETE_DTA_CLOSE_RC,
+    SIDETNFS_DIAG_DDELETE_DTA_RELEASE_BEFORE,
+    // Fase 7J-correctie2: the local target-path == current-working-directory
+    // reject was proven wrong by hardware evidence (Desktop routinely
+    // Dsetpath's into a folder before deleting it) and is removed --
+    // CWD_MATCH_ALLOWED marks that a Ddelete-of-cwd was let through to
+    // RMDIR instead of being rejected. RMDIR_SENT/RMDIR_OK are
+    // gemdrvemul.c-level bookends around the sidetnfs_tnfs_directory_delete()
+    // call (mirrors the TNFS_RMDIR/TNFS_RC wire-level events already logged
+    // from within that call in sidetnfs_probe.c). CWD_PARENT_UPDATE logged
+    // only when dpath_string is actually rewritten to the parent directory,
+    // which happens only after a confirmed TNFS_OK RMDIR of the directory
+    // that was the CWD.
+    SIDETNFS_DIAG_DDELETE_CWD_MATCH_ALLOWED,
+    SIDETNFS_DIAG_DDELETE_RMDIR_SENT,
+    SIDETNFS_DIAG_DDELETE_RMDIR_OK,
+    SIDETNFS_DIAG_DDELETE_CWD_PARENT_UPDATE,
+    // Fase 7K: TNFS Fwrite -- deliberately minimal (see report: the write
+    // ACK handshake is timing-sensitive, so this phase logs only these 5
+    // failure/partial events, no ENTER/RETURN/per-chunk detail). BAD_HANDLE/
+    // READONLY logged from gemdrvemul.c (GEMDRVEMUL_WRITE_BUFF_CALL's TNFS
+    // branch, local checks before ever contacting the server);
+    // TRANSPORT_ERROR/SERVER_ERROR logged from sidetnfs_tnfs_file_write() in
+    // sidetnfs_probe.c; PARTIAL logged from gemdrvemul.c after a successful
+    // call that wrote fewer bytes than requested. SIDETNFS_DIAG_FWRITE_DENIED_TNFS
+    // (above) is superseded -- TNFS Fwrite is implemented now -- left
+    // defined, no longer emitted.
+    SIDETNFS_DIAG_FWRITE_BAD_HANDLE,
+    SIDETNFS_DIAG_FWRITE_READONLY,
+    SIDETNFS_DIAG_FWRITE_TRANSPORT_ERROR,
+    SIDETNFS_DIAG_FWRITE_SERVER_ERROR,
+    SIDETNFS_DIAG_FWRITE_PARTIAL,
+    // Fase 7L/7Lb: TNFS Fattrib -- deliberately minimal, same reasoning as
+    // Fase 7K's Fwrite (compact counters, only failure/decision events, no
+    // per-field detail). STAT_ERROR covers inquire (set no longer sends
+    // STAT either, see Fase 7Lb). SET_UNSUPPORTED is now the *only* set
+    // (wflag 1) event ever emitted -- confirmed against the actual server
+    // source (tnfsd 24.0522.1) that its TNFS_CHMODFILE (0x27) handler is
+    // an empty function body, so Fase 7Lb removed the CHMOD call entirely
+    // and TNFS Fattrib set is unconditionally reported as unsupported.
+    // SET_DENIED/SET_OK are kept defined (unreachable with this server,
+    // for a hypothetical future server that implements CHMOD for real) but
+    // no longer emitted. SIDETNFS_DIAG_FATTRIB_SET_DENIED_TNFS (above) is
+    // also superseded -- left defined, no longer emitted.
+    SIDETNFS_DIAG_FATTRIB_STAT_ERROR,
+    SIDETNFS_DIAG_FATTRIB_SET_UNSUPPORTED,
+    SIDETNFS_DIAG_FATTRIB_SET_DENIED,
+    SIDETNFS_DIAG_FATTRIB_SET_ERROR,
+    SIDETNFS_DIAG_FATTRIB_SET_OK,
+    // Fase 7M: TNFS Fdatime -- same deliberately-minimal reasoning as
+    // Fase 7L's Fattrib. INQUIRE_OK/INQUIRE_ERR logged from
+    // sidetnfs_tnfs_get_datetime() in sidetnfs_probe.c. SET_UNSUPPORTED is
+    // the only set (wflag 1) event ever emitted -- confirmed against the
+    // actual server source (tnfsd 24.0522.1) that its protocol header
+    // defines no UTIME/SETTIME command at all (a stronger gap than
+    // Fattrib's CHMOD, which at least has a registered-but-empty opcode).
+    // SET_OK/SET_ERR are kept defined (unreachable with this server, for a
+    // hypothetical future server/protocol version that adds a real
+    // set-time operation) but never emitted.
+    SIDETNFS_DIAG_FDATIME_INQUIRE_OK,
+    SIDETNFS_DIAG_FDATIME_INQUIRE_ERR,
+    SIDETNFS_DIAG_FDATIME_SET_OK,
+    SIDETNFS_DIAG_FDATIME_SET_ERR,
+    SIDETNFS_DIAG_FDATIME_SET_UNSUPPORTED,
+    // Fase 7N: GEMDOS Dfree under TNFS -- tnfsd 24.0522.1 has no free/total
+    // disk space command (no SIZE/FREE/SIZEBYTES/FREEBYTES-equivalent, no
+    // statvfs()/statfs() call anywhere in its source). No TNFS packet is
+    // ever sent; fixed synthetic disk-size values are returned instead
+    // (see GEMDRVEMUL_DFREE_CALL in gemdrvemul.c). Logged once per call,
+    // purely informational -- Dfree still always reports GEMDOS_EOK.
+    SIDETNFS_DIAG_DFREE_SYNTHETIC,
 } SidetnfsDiagEventType;
 
 #define SIDETNFS_DIAG_MAX_EVENTS 256

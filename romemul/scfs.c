@@ -7,14 +7,17 @@
 
 #include "include/scfs.h"
 #include "include/filesys.h"
+#include "include/sidetnfs_probe.h" // Fase 8A: sidetnfs_note_sd_io() -- see its own comment
 
 bool scfs_directory_exists(const char *path)
 {
+    sidetnfs_note_sd_io();
     return directory_exists(path) != 0;
 }
 
 bool scfs_get_disk_info(const char *path, ScFsDiskInfo *info)
 {
+    sidetnfs_note_sd_io();
     DWORD fre_clust;
     FATFS *fs;
     FRESULT fr = f_getfree(path, &fre_clust, &fs);
@@ -31,6 +34,7 @@ bool scfs_get_disk_info(const char *path, ScFsDiskInfo *info)
 
 bool scfs_stat(const char *path, ScFsStat *out)
 {
+    sidetnfs_note_sd_io();
     FILINFO fno;
     FRESULT fr = f_stat(path, &fno);
     if (fr != FR_OK)

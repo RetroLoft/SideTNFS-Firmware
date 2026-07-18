@@ -153,6 +153,28 @@ if (NOT _DEBUG)
         set(_DEBUG 0)
 endif()
 
+# Fase 8B: SIDETNFS_ENABLE_SD_SUPPORT/SIDETNFS_ENABLE_DEBUG -- same
+# env-var-to-add_definitions() passthrough as _DEBUG above. Both default to
+# 1 (unchanged behavior) unless explicitly overridden, e.g.:
+#   SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+# NOTE: deliberately checked against the empty string, not `if(NOT ...)` --
+# CMake treats the literal string "0" itself as boolean-false, so
+# `if(NOT _VAR)` would be true (and clobber an explicit "0" back to "1")
+# exactly when the env var is set to the value we most need to respect.
+# _DEBUG above gets away with the simpler NOT-check only because its own
+# default already happens to be 0.
+if("$ENV{SIDETNFS_ENABLE_SD_SUPPORT}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_SD_SUPPORT 1)
+else()
+        set(_SIDETNFS_ENABLE_SD_SUPPORT $ENV{SIDETNFS_ENABLE_SD_SUPPORT})
+endif()
+
+if("$ENV{SIDETNFS_ENABLE_DEBUG}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_DEBUG 1)
+else()
+        set(_SIDETNFS_ENABLE_DEBUG $ENV{SIDETNFS_ENABLE_DEBUG})
+endif()
+
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
@@ -178,6 +200,13 @@ add_definitions(-DLATEST_RELEASE_URL="${LATEST_RELEASE_URL}")
 
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
+
+# Fase 8B: pass SIDETNFS_ENABLE_SD_SUPPORT/SIDETNFS_ENABLE_DEBUG to the C
+# compiler, same as _DEBUG above.
+message("SIDETNFS_ENABLE_SD_SUPPORT: " ${_SIDETNFS_ENABLE_SD_SUPPORT})
+message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
+add_definitions(-DSIDETNFS_ENABLE_SD_SUPPORT=${_SIDETNFS_ENABLE_SD_SUPPORT})
+add_definitions(-DSIDETNFS_ENABLE_DEBUG=${_SIDETNFS_ENABLE_DEBUG})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")

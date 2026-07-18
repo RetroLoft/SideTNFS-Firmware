@@ -437,7 +437,9 @@ static void __not_in_flash_func(add_file)(FileDescriptors **head, FileDescriptor
 // Fase 7D: parallel to add_file() above, for TNFS-backed opens. Never
 // touches fobject (left zeroed by the memset below) -- only tnfs_handle is
 // meaningful for a GEMDRIVE_FILE_BACKEND_TNFS entry.
-static void __not_in_flash_func(add_tnfs_file)(FileDescriptors **head, FileDescriptors *newFDescriptor, const char *fpath, uint8_t tnfs_handle, uint16_t new_fd)
+// Fase 7K: writable records whether this handle was opened for writing
+// (Fopen mode 1/2, or Fcreate) -- see FileDescriptors.tnfs_writable.
+static void __not_in_flash_func(add_tnfs_file)(FileDescriptors **head, FileDescriptors *newFDescriptor, const char *fpath, uint8_t tnfs_handle, uint16_t new_fd, bool writable)
 {
     memset(newFDescriptor, 0, sizeof(*newFDescriptor));
     strncpy(newFDescriptor->fpath, fpath, 127);
@@ -446,9 +448,10 @@ static void __not_in_flash_func(add_tnfs_file)(FileDescriptors **head, FileDescr
     newFDescriptor->offset = 0;
     newFDescriptor->backend = GEMDRIVE_FILE_BACKEND_TNFS;
     newFDescriptor->tnfs_handle = tnfs_handle;
+    newFDescriptor->tnfs_writable = writable;
     newFDescriptor->next = *head;
     *head = newFDescriptor;
-    DPRINTF("TNFS file %s added with fd %i, tnfs handle %u\n", fpath, new_fd, tnfs_handle);
+    DPRINTF("TNFS file %s added with fd %i, tnfs handle %u, writable %d\n", fpath, new_fd, tnfs_handle, (int)writable);
 }
 
 static void __not_in_flash_func(print_file_descriptors)(FileDescriptors *head)
@@ -688,6 +691,11 @@ static void __not_in_flash_func(get_tnfs_relative_pathname)(char *tnfs_path, cha
         {
             snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s", dpath_string);
         }
+        // Fase 7E: this is the one new piece of information not already
+        // covered by FOPEN_RAW_PATH/FOPEN_TNFS_PATH (see the FOPEN_CALL
+        // case body) -- which current-directory value a relative Fopen
+        // path was actually resolved against.
+        sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, 0, dpath_string, NULL, NULL, 0, 0, 0, 0);
     }
     snprintf(tnfs_path, MAX_FOLDER_LENGTH, "%s/%s", tmp_path, path_filename);
     if (out_internal)
@@ -697,6 +705,37 @@ static void __not_in_flash_func(get_tnfs_relative_pathname)(char *tnfs_path, cha
     back_2_forwardslash(tnfs_path);
     remove_dup_slashes(tnfs_path);
     DPRINTF("tnfs_path: %s\n", tnfs_path);
+}
+
+// Fase 7J-correctie2: compute the parent of an already-canonical (forward-
+// slash, get_tnfs_relative_pathname()'d) absolute TNFS path -- "/HALLO" ->
+// "/", "/A/B" -> "/A", "/A/B/C" -> "/A/B". Used only to update dpath_string
+// (the TNFS CWD) after a successful RMDIR of the directory that was the
+// current directory itself -- path is expected to already be the exact
+// dpath_string value being replaced, so no further normalization beyond a
+// defensive trailing-slash strip is needed.
+static void __not_in_flash_func(tnfs_ddelete_parent_path)(const char *path, char *out, size_t out_size)
+{
+    char tmp[MAX_FOLDER_LENGTH];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len > 1 && tmp[len - 1] == '/')
+    {
+        tmp[len - 1] = '\0'; // defensive: strip a trailing slash, if any
+    }
+    char *last_slash = strrchr(tmp, '/');
+    if (last_slash == NULL || last_slash == tmp)
+    {
+        // Either no slash at all (shouldn't happen for a canonical absolute
+        // path) or the only slash is the leading one ("/HALLO") -- either
+        // way, the parent is root.
+        snprintf(out, out_size, "/");
+    }
+    else
+    {
+        *last_slash = '\0';
+        snprintf(out, out_size, "%s", tmp);
+    }
 }
 
 // Thin naming wrapper around get_local_full_pathname(). Kept local to this file
@@ -1407,12 +1446,14 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
 {
 #if SIDETNFS_USE_TNFS_LISTING
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_ENTER, 0, tmp_filepath, NULL, NULL, fopen_mode, 0, 0, 0);
-    if (fopen_mode != 0)
+    if (fopen_mode > 2)
     {
-        // Fase 7D: only GEMDOS mode 0 (read-only) is allowed under
-        // BACKEND_TNFS -- write/read-write opens must be denied before any
-        // TNFS OPEN (write not implemented) or SD f_open() call. No SD
-        // call, no SD handle, ever, for this backend.
+        // Fase 7K: only GEMDOS modes 0 (read-only), 1 (write-only) and 2
+        // (read/write) are defined by Fopen -- anything else is denied
+        // locally, same as before. Modes 1/2 themselves are no longer
+        // denied here (Fase 7C/7D's blanket "write not implemented" denial
+        // is superseded now that TNFS OPEN is sent with write-capable
+        // flags below -- see sidetnfs_tnfs_file_open()).
         DPRINTF("ERROR: TNFS backend denies fopen mode: %x\n", fopen_mode);
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_DENY_MODE, 0, tmp_filepath, NULL, NULL, fopen_mode, 0, 0, 0);
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_RETURN, 0, tmp_filepath, NULL, NULL, 0, 0, (uint8_t)GEMDOS_EACCDN, 0);
@@ -1420,7 +1461,7 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
         return;
     }
     uint8_t tnfs_handle = 0;
-    SidetnfsFileOpenResult result = sidetnfs_tnfs_file_open(tmp_filepath, &tnfs_handle);
+    SidetnfsFileOpenResult result = sidetnfs_tnfs_file_open(tmp_filepath, fopen_mode, &tnfs_handle);
     if (result != SIDETNFS_FILE_OPEN_OK)
     {
         DPRINTF("ERROR: Could not open TNFS file %s (result %d)\n", tmp_filepath, (int)result);
@@ -1441,7 +1482,7 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
         return;
     }
-    add_tnfs_file(&fdescriptors, newFDescriptor, tmp_filepath, tnfs_handle, fd_counter);
+    add_tnfs_file(&fdescriptors, newFDescriptor, tmp_filepath, tnfs_handle, fd_counter, fopen_mode != 0);
     DPRINTF("TNFS file opened with file descriptor: %d\n", fd_counter);
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_RETURN, fd_counter, tmp_filepath, NULL, NULL, 0, 0, 0, 0);
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
@@ -1779,6 +1820,7 @@ void init_gemdrvemul(bool safe_config_reboot)
     // Only try to get the datetime from the network if the wifi is configured
     if (gemdrive_rtc_enabled && strlen(find_entry(PARAM_WIFI_SSID)->value) > 0)
     {
+#if SIDETNFS_ENABLE_SD_SUPPORT
         // Initialize SD card
         if (!sd_init_driver())
         {
@@ -1796,6 +1838,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 DPRINTF("Wifi password file not found.\n");
             }
         }
+#else
+        // Fase 8B: SIDETNFS_ENABLE_SD_SUPPORT==0 -- no SD-based WiFi
+        // password file override is even attempted; wifi_password_file_content
+        // stays NULL, so network_init() below falls back to the flash-stored
+        // PARAM_WIFI_PASSWORD config entry (its existing, already-supported
+        // fallback for *pass == NULL -- see network.c, no new configuration
+        // mechanism added here).
+        DPRINTF("SD support disabled -- using flash-stored WiFi credentials only\r\n");
+#endif
 
         cyw43_arch_deinit();
 
@@ -2033,10 +2084,34 @@ void init_gemdrvemul(bool safe_config_reboot)
         // sessions short: this logs EVERY command, so a long session will
         // fill the 256-slot budget with unrelated Fopen/Fread/etc. noise
         // before the interesting part is even reached.
+        //
+        // Fase 7F-debugfix/7G: under SIDETNFS_DEBUG_FOCUS_FSEEK and/or
+        // SIDETNFS_DEBUG_FOCUS_FDELETE, only log COMMAND_ENTER for the
+        // small set of commands relevant to whichever focus mode(s) are
+        // on -- the same "logging only, no control-flow change" contract
+        // as SIDETNFS_DEBUG_FOCUS_FILE_IO. active_command_id itself is
+        // read, never modified, by this block.
+#if SIDETNFS_DEBUG_FOCUS_FSEEK || SIDETNFS_DEBUG_FOCUS_FDELETE || SIDETNFS_DEBUG_FOCUS_FRENAME || \
+    SIDETNFS_DEBUG_FOCUS_DCREATE || SIDETNFS_DEBUG_FOCUS_DDELETE
+        if ((SIDETNFS_DEBUG_FOCUS_FSEEK &&
+             (active_command_id == GEMDRVEMUL_FOPEN_CALL || active_command_id == GEMDRVEMUL_READ_BUFF_CALL ||
+              active_command_id == GEMDRVEMUL_FCLOSE_CALL || active_command_id == GEMDRVEMUL_FSEEK_CALL ||
+              active_command_id == GEMDRVEMUL_FATTRIB_CALL || active_command_id == GEMDRVEMUL_FDATETIME_CALL ||
+              active_command_id == GEMDRVEMUL_DGETPATH_CALL || active_command_id == GEMDRVEMUL_DSETPATH_CALL ||
+              active_command_id == GEMDRVEMUL_PEXEC_CALL)) ||
+            (SIDETNFS_DEBUG_FOCUS_FDELETE && active_command_id == GEMDRVEMUL_FDELETE_CALL) ||
+            (SIDETNFS_DEBUG_FOCUS_FRENAME && active_command_id == GEMDRVEMUL_FRENAME_CALL) ||
+            (SIDETNFS_DEBUG_FOCUS_DCREATE && active_command_id == GEMDRVEMUL_DCREATE_CALL) ||
+            (SIDETNFS_DEBUG_FOCUS_DDELETE && active_command_id == GEMDRVEMUL_DDELETE_CALL))
+        {
+            sidetnfs_diag_log(SIDETNFS_DIAG_COMMAND_ENTER, active_command_id, NULL, NULL, NULL, 0, 0, 0, 0);
+        }
+#else
         if (active_command_id != 0xFFFF)
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_COMMAND_ENTER, active_command_id, NULL, NULL, NULL, 0, 0, 0, 0);
         }
+#endif
         switch (active_command_id)
         {
         case GEMDRVEMUL_DEBUG:
@@ -2126,6 +2201,60 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             if (!hd_folder_ready)
             {
+#if SIDETNFS_USE_TNFS_LISTING
+                // Fase 8A: GEMDRIVE readiness must never depend on a
+                // physical SD card under the TNFS backend -- the SD/FatFS
+                // branch below (kept byte-identical for BACKEND_SD)
+                // treated a failed/missing SD mount as "GEMDRIVE not
+                // ready" (PING_STATUS 0x0), which made the whole TNFS
+                // drive invisible to the Atari whenever no SD card was
+                // present, even though TNFS itself needs no SD card at
+                // all. SD mount is still attempted here, best-effort,
+                // purely so hd_folder (used only by the SELECT-button
+                // DEBUG.TXT snapshot -- see sidetnfs_diag_dump_on_select(),
+                // which already no-ops safely on a NULL hd_folder) is
+                // populated when a card happens to be present; a missing
+                // or failed SD mount is not fatal here and never blocks
+                // readiness. No FatFS file/directory operation beyond the
+                // mount itself is ever attempted in this branch.
+#if SIDETNFS_ENABLE_SD_SUPPORT
+                if (!sd_init_driver())
+                {
+                    DPRINTF("INFO: No SD card detected -- TNFS-only, DEBUG.TXT snapshot unavailable\r\n");
+                }
+                else
+                {
+                    FRESULT fr = f_mount(&fs, "0:", 1);
+                    if (fr == FR_OK)
+                    {
+                        hd_folder = find_entry(PARAM_GEMDRIVE_FOLDERS)->value;
+                        DPRINTF("SD card also mounted (diagnostics only) in folder: %s\n", hd_folder);
+                    }
+                    else
+                    {
+                        DPRINTF("INFO: No SD filesystem mounted (%d) -- TNFS-only, DEBUG.TXT snapshot unavailable\r\n", fr);
+                    }
+                }
+#else
+                // Fase 8B: SIDETNFS_ENABLE_SD_SUPPORT==0 -- sd_init_driver()/
+                // f_mount() are not even called, let alone reached. hd_folder
+                // stays NULL for this whole boot (sidetnfs_diag_dump_on_select()
+                // already no-ops safely on that, and SIDETNFS_ENABLE_DEBUG==0
+                // disables it entirely anyway in this build).
+#endif
+                // Iterate over fdescriptors and close all files -- backend-
+                // agnostic bookkeeping, needed regardless of whether SD
+                // mounted above.
+                close_all_files(&fdescriptors);
+                cleanDTAHashTable();
+                delete_all_files(&fdescriptors);
+                DPRINTF("DTA table elements: %d\n", countDTA());
+                DPRINTF("File descriptors: %d\n", count_fdesc(fdescriptors));
+                dpath_string[0] = '\\'; // Set the root folder as default
+                dpath_string[1] = '\0';
+                hd_folder_ready = true;
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
+#else
                 // Initialize SD card
                 if (!sd_init_driver())
                 {
@@ -2166,6 +2295,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                         *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
                     }
                 }
+#endif
             }
             DPRINTF("PING received. Answering with: %d\n", *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)));
             write_random_token(memory_shared_address);
@@ -2230,8 +2360,32 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             // Check the free space
+#if SIDETNFS_USE_TNFS_LISTING
+            // Fase 7N: tnfsd 24.0522.1 has no TNFS command for free/total
+            // disk space -- no SIZE/FREE/SIZEBYTES/FREEBYTES-equivalent
+            // opcode, and no statvfs()/statfs() call anywhere in its
+            // source (same server-source verification approach as Fase
+            // 7Lb's CHMOD finding and Fase 7M's UTIME/SETTIME finding). No
+            // TNFS packet is ever sent for Dfree. This is deliberately
+            // NOT reported as an unsupported-operation error the way
+            // Fattrib set/Fdatime set are -- GEMDOS Dfree has no sensible
+            // "unsupported" GEMDOS error code, and software calling Dfree
+            // generally expects *some* plausible disk-size answer rather
+            // than a hard failure. Fixed synthetic values are returned
+            // instead: ~256 MiB total (65535 clusters * 8 sectors/cluster
+            // * 512 bytes/sector), ~128 MiB free (32768 of those
+            // clusters).
+            sidetnfs_diag_log(SIDETNFS_DIAG_DFREE_SYNTHETIC, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+            ScFsDiskInfo disk_info;
+            disk_info.free_clusters = 32768;
+            disk_info.total_clusters = 65535;
+            disk_info.bytes_per_sector = 512;
+            disk_info.sectors_per_cluster = 8;
+            bool disk_info_ok = true;
+#else
             ScFsDiskInfo disk_info;
             bool disk_info_ok = scfs_get_disk_info(hd_folder, &disk_info);
+#endif
             if (!disk_info_ok)
             {
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_DFREE_STATUS)) = GEMDOS_ERROR;
@@ -2268,6 +2422,15 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             DPRINTF("Dpath backslash string (no last backslash: %s\n", tmp_path);
 
+#if SIDETNFS_USE_TNFS_LISTING
+            // Fase 7E: informational only -- Dgetpath's logic itself is
+            // unchanged (dpath_string was already forward-slash-form
+            // internally, and this conversion back to backslash for GEMDOS
+            // already existed); this just makes what's actually returned
+            // visible in DEBUG.TXT now that Dsetpath can correctly update
+            // dpath_string for a real TNFS subdirectory.
+            sidetnfs_diag_log(SIDETNFS_DIAG_DGETPATH_RETURN, 0, tmp_path, NULL, NULL, 0, 0, 0, 0);
+#endif
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(tmp_path, memory_shared_address + GEMDRVEMUL_DEFAULT_PATH, MAX_FOLDER_LENGTH);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -2276,10 +2439,10 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_DSETPATH_CALL:
         {
 #if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7D-debug: diagnosis only -- Dsetpath is still
-            // unconditionally hard-SD (scfs_directory_exists() below), no
-            // behavior change here, purely observing whether/how it's
-            // involved when a TNFS-only folder is set current.
+            // Fase 8A: the old "still unconditionally hard-SD" note here is
+            // stale -- see the SIDETNFS_USE_TNFS_LISTING/#else split further
+            // down in this case (Fase 8A), which now never calls
+            // scfs_directory_exists()/touches hd_folder under this backend.
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
 #endif
             payloadPtr += 6; // Skip six words
@@ -2291,8 +2454,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_PATH_RAW, 0, dpath_tmp, NULL, NULL, 0, 0, 0, 0);
 #endif
             // Check if the directory exists
-            char tmp_path[MAX_FOLDER_LENGTH] = {0};
-
             if (dpath_tmp[0] == drive_letter)
             {
                 DPRINTF("Drive letter found: %c. Removing it.\n", drive_letter);
@@ -2318,34 +2479,66 @@ void init_gemdrvemul(bool safe_config_reboot)
                 DPRINTF("Do not concatenate the path\n");
             }
             back_2_forwardslash(dpath_tmp);
-            // Concatenate the path with the hd_folder
-            snprintf(tmp_path, sizeof(tmp_path), "%s/%s", hd_folder, dpath_tmp);
-
             // Remove duplicated forward slashes
-            remove_dup_slashes(tmp_path);
             remove_dup_slashes(dpath_tmp);
 
-            bool dsetpath_sd_exists = scfs_directory_exists(tmp_path);
 #if SIDETNFS_USE_TNFS_LISTING
-            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_SD_CHECK, 0, tmp_path, NULL, NULL, 0, 0,
-                               dsetpath_sd_exists ? 1 : 0, 0);
-#endif
-            if (dsetpath_sd_exists)
+            // Fase 8A: the old unconditional scfs_directory_exists(tmp_path)
+            // "SD_CHECK" (comparison-only, never affecting dsetpath_exists
+            // under this backend) touched the physical SD card via FatFS
+            // even when the TNFS backend is active -- a real cross-backend
+            // isolation violation, and, worse, tmp_path was built from
+            // hd_folder which is NULL whenever the SD card never mounted,
+            // making the snprintf() below it undefined behavior. Removed
+            // entirely; TNFS mode now never builds an SD path or touches
+            // hd_folder here at all. See report.
+            //
+            // dpath_tmp is already the fully-resolved,
+            // forward-slash, drive-letter-stripped, cwd-relative path (e.g.
+            // "/CONFIG") -- the exact same shape Fsfirst/Fopen already read
+            // out of dpath_string (see get_tnfs_relative_pathname() and
+            // FSFIRST_CALL's own relative-path concatenation below). A
+            // trailing slash is stripped only for this existence check (a
+            // local copy -- dpath_tmp/dpath_string themselves are left
+            // untouched, exactly as before) to match how
+            // gemdrive_backend_fsfirst() already normalizes tnfs_path.
+            char dsetpath_tnfs_path[MAX_FOLDER_LENGTH];
+            snprintf(dsetpath_tnfs_path, sizeof(dsetpath_tnfs_path), "%s", dpath_tmp);
+            size_t dsetpath_tnfs_path_len = strlen(dsetpath_tnfs_path);
+            if (dsetpath_tnfs_path_len > 1 && dsetpath_tnfs_path[dsetpath_tnfs_path_len - 1] == '/')
             {
-                DPRINTF("Directory exists: %s\n", tmp_path);
+                dsetpath_tnfs_path[dsetpath_tnfs_path_len - 1] = '\0';
+            }
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_PATH, 0, dsetpath_tnfs_path, NULL, NULL, 0, 0, 0, 0);
+            uint8_t dsetpath_tnfs_rc = 0;
+            bool dsetpath_exists = sidetnfs_tnfs_directory_exists(dsetpath_tnfs_path, &dsetpath_tnfs_rc);
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_EXISTS_RC, 0, dsetpath_tnfs_path, NULL, NULL, 0, 0,
+                               dsetpath_tnfs_rc, 0);
+#else
+            char tmp_path[MAX_FOLDER_LENGTH] = {0};
+            // Concatenate the path with the hd_folder
+            snprintf(tmp_path, sizeof(tmp_path), "%s/%s", hd_folder, dpath_tmp);
+            remove_dup_slashes(tmp_path);
+            bool dsetpath_exists = scfs_directory_exists(tmp_path);
+#endif
+            if (dsetpath_exists)
+            {
+                DPRINTF("Directory exists: %s\n", dpath_tmp);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EOK;
             }
             else
             {
-                DPRINTF("Directory does not exist: %s\n", tmp_path);
+                DPRINTF("Directory does not exist: %s\n", dpath_tmp);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EPTHNF;
             }
             // Copy dpath_tmp to dpath_string
             strcpy(dpath_string, dpath_tmp);
             DPRINTF("The new default path is: %s\n", dpath_string);
 #if SIDETNFS_USE_TNFS_LISTING
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string, NULL, NULL, 0, 0,
+                               (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_RETURN, 0, dpath_string, NULL, NULL, 0, 0,
-                               (uint8_t)(dsetpath_sd_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
+                               (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
 #endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -2353,20 +2546,55 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_DCREATE_CALL:
         {
-#if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Dcreate is mutating (creates a directory) -- must
-            // never silently f_mkdir() the physical SD card while the TNFS
-            // backend is active. TNFS directory creation isn't implemented
-            // yet; see report.
-            sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EACCDN;
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
             // Obtain the pathname string and keep it in memory
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
+#if SIDETNFS_USE_TNFS_LISTING
+            // Fase 7I: real TNFS mkdir. No pre-check that the directory
+            // already exists (no directory listing, no stat) -- the
+            // server's own mkdir() rc alone determines the result, so a
+            // create can never be reported as successful unless the
+            // server actually performed it.
+            char tnfs_dcreate_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char tnfs_dcreate_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(tnfs_dcreate_path, tnfs_dcreate_raw_path, NULL);
+            DPRINTF("TNFS folder to create: %s\n", tnfs_dcreate_path);
+
+            sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_RAW_PATH, 0, tnfs_dcreate_raw_path, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_TNFS_PATH, 0, tnfs_dcreate_path, NULL, NULL, 0, 0, 0, 0);
+
+            uint8_t tnfs_dcreate_rc = 0xFFu;
+            SidetnfsDirCreateResult tnfs_dcreate_result =
+                sidetnfs_tnfs_directory_create(tnfs_dcreate_path, &tnfs_dcreate_rc);
+            sidetnfs_note_tnfs_dcreate(tnfs_dcreate_path, tnfs_dcreate_rc,
+                                        tnfs_dcreate_result == SIDETNFS_DIR_CREATE_OK);
+
+            uint16_t tnfs_dcreate_status;
+            switch (tnfs_dcreate_result)
+            {
+            case SIDETNFS_DIR_CREATE_OK:
+                tnfs_dcreate_status = GEMDOS_EOK;
+                break;
+            case SIDETNFS_DIR_CREATE_PATH_NOT_FOUND:
+                tnfs_dcreate_status = GEMDOS_EPTHNF;
+                break;
+            case SIDETNFS_DIR_CREATE_ACCESS_DENIED:
+                tnfs_dcreate_status = GEMDOS_EACCDN;
+                break;
+            case SIDETNFS_DIR_CREATE_ERROR:
+            default:
+                tnfs_dcreate_status = GEMDOS_EINTRN;
+                break;
+            }
+            sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_RETURN, 0, tnfs_dcreate_path, NULL, NULL, 0, 0,
+                               (uint8_t)tnfs_dcreate_status, 0);
+            // Fase 7I: matches the existing (SD-established) plain
+            // uint16_t write for this specific status field -- see report
+            // for why this differs from the uint32_t+SWAP_LONGWORD pattern
+            // used by Fdelete/Frename/Fseek's status fields.
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = tnfs_dcreate_status;
+#else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
             DPRINTF("Folder to create: %s\n", tmp_pathname);
@@ -2392,26 +2620,147 @@ void init_gemdrvemul(bool safe_config_reboot)
                     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EOK;
                 }
             }
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
         }
         case GEMDRVEMUL_DDELETE_CALL:
         {
-#if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Ddelete is mutating (deletes a directory) -- must
-            // never silently f_unlink() the physical SD card while the
-            // TNFS backend is active. TNFS directory deletion isn't
-            // implemented yet; see report.
-            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
             // Obtain the pathname string and keep it in memory
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
+#if SIDETNFS_USE_TNFS_LISTING
+            // Fase 7J: real TNFS rmdir. No pre-check via directory
+            // listing/enumeration to see whether the directory is empty --
+            // the server must bear that responsibility atomically, and a
+            // refusal (e.g. not empty) is always mapped to a GEMDOS error,
+            // never treated as success. Never a recursive delete, never a
+            // fallback to UNLINK.
+            char tnfs_ddelete_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char tnfs_ddelete_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(tnfs_ddelete_path, tnfs_ddelete_raw_path, NULL);
+            DPRINTF("TNFS folder to delete: %s\n", tnfs_ddelete_path);
+
+            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_RAW_PATH, 0, tnfs_ddelete_raw_path, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_TNFS_PATH, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0, 0);
+
+            uint16_t tnfs_ddelete_status;
+            // Fase 7J-correctie2: root removal must still never succeed, and
+            // is still denied locally before ever contacting the server.
+            // The cwd-equals-target denial that used to sit alongside it is
+            // REMOVED -- hardware evidence (see report) showed GEM Desktop
+            // routinely Dsetpath()'s into a folder to inspect it, then
+            // Ddelete's that same folder by its full path, which is a
+            // perfectly normal, expected sequence. It must be let through to
+            // TNFS RMDIR exactly like the SD/FatFS route always has (that
+            // route never denied this case at all).
+            bool tnfs_ddelete_is_cwd = strcmp(tnfs_ddelete_path, dpath_string) == 0;
+            bool tnfs_ddelete_is_root = strcmp(tnfs_ddelete_path, "/") == 0;
+            if (tnfs_ddelete_is_root)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_CHECK, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 1, 0);
+                tnfs_ddelete_status = GEMDOS_EACCDN;
+                sidetnfs_note_tnfs_ddelete(tnfs_ddelete_path, 0xFFu, false);
+                sidetnfs_note_tnfs_ddelete_diag(false, true, false, "ROOT");
+            }
+            else
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_CHECK, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0, 0);
+
+                if (tnfs_ddelete_is_cwd)
+                {
+                    sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_MATCH_ALLOWED, 0, tnfs_ddelete_path, NULL, NULL, 0,
+                                       0, 0, 0);
+                    sidetnfs_note_tnfs_ddelete_cwd(true, false, dpath_string, NULL);
+                }
+
+                // Fase 7J-correctie: close every active TNFS DTA-registry
+                // search handle whose path exactly matches the target
+                // directory BEFORE ever sending RMDIR -- a still-open
+                // OPENDIRX handle on this exact directory (e.g. Desktop's
+                // own enumeration of it, not yet closed) can make the
+                // server refuse RMDIR. Unlike the old post-success release,
+                // this close is confirmed: if it fails, RMDIR is never
+                // attempted.
+                sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_PRECHECK, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0, 0);
+                uint16_t tnfs_ddelete_dta_matches = 0;
+                uint8_t tnfs_ddelete_dta_close_rc = 0xFFu;
+                bool tnfs_ddelete_dta_ok = sidetnfs_tnfs_dta_close_by_path(
+                    tnfs_ddelete_path, &tnfs_ddelete_dta_matches, &tnfs_ddelete_dta_close_rc);
+                sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_RELEASE_BEFORE, 0, tnfs_ddelete_path, NULL, NULL,
+                                    tnfs_ddelete_dta_matches, 0, tnfs_ddelete_dta_close_rc,
+                                    tnfs_ddelete_dta_ok ? 1 : 0);
+
+                if (!tnfs_ddelete_dta_ok)
+                {
+                    // At least one matching search handle could not be
+                    // confirmed closed -- the server may still consider the
+                    // directory open, so RMDIR must not be attempted.
+                    tnfs_ddelete_status = GEMDOS_EINTRN;
+                    sidetnfs_note_tnfs_ddelete(tnfs_ddelete_path, tnfs_ddelete_dta_close_rc, false);
+                    sidetnfs_note_tnfs_ddelete_diag(false, false, false, "DTA_CLOSE");
+                }
+                else
+                {
+                    sidetnfs_note_tnfs_ddelete_diag(false, false, true, NULL);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_RMDIR_SENT, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0, 0);
+                    uint8_t tnfs_ddelete_rc = 0xFFu;
+                    SidetnfsDirDeleteResult tnfs_ddelete_result =
+                        sidetnfs_tnfs_directory_delete(tnfs_ddelete_path, &tnfs_ddelete_rc);
+                    sidetnfs_note_tnfs_ddelete(tnfs_ddelete_path, tnfs_ddelete_rc,
+                                                tnfs_ddelete_result == SIDETNFS_DIR_DELETE_OK);
+
+                    switch (tnfs_ddelete_result)
+                    {
+                    case SIDETNFS_DIR_DELETE_OK:
+                        tnfs_ddelete_status = GEMDOS_EOK;
+                        sidetnfs_note_tnfs_ddelete_diag(false, false, false, "OK");
+                        sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_RMDIR_OK, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0,
+                                           0);
+                        if (tnfs_ddelete_is_cwd)
+                        {
+                            // Fase 7J-correctie2: only ever rewrite the TNFS
+                            // CWD after a *confirmed* TNFS_OK RMDIR of the
+                            // directory that was the CWD -- never on any
+                            // other outcome. Same canonicalization the path
+                            // resolver already produced for tnfs_ddelete_path
+                            // itself (forward-slash, no trailing slash), so
+                            // no re-normalization is needed beyond the
+                            // parent-path computation itself.
+                            char tnfs_ddelete_new_cwd[MAX_FOLDER_LENGTH];
+                            tnfs_ddelete_parent_path(tnfs_ddelete_path, tnfs_ddelete_new_cwd,
+                                                      sizeof(tnfs_ddelete_new_cwd));
+                            strcpy(dpath_string, tnfs_ddelete_new_cwd);
+                            sidetnfs_note_tnfs_ddelete_cwd(false, true, NULL, dpath_string);
+                            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_PARENT_UPDATE, 0, dpath_string, NULL, NULL,
+                                               0, 0, 0, 0);
+                        }
+                        break;
+                    case SIDETNFS_DIR_DELETE_PATH_NOT_FOUND:
+                        tnfs_ddelete_status = GEMDOS_EPTHNF;
+                        sidetnfs_note_tnfs_ddelete_diag(false, false, false, "RMDIR_PTHNF");
+                        break;
+                    case SIDETNFS_DIR_DELETE_ACCESS_DENIED:
+                        tnfs_ddelete_status = GEMDOS_EACCDN;
+                        sidetnfs_note_tnfs_ddelete_diag(false, false, false, "RMDIR_ACCDN");
+                        break;
+                    case SIDETNFS_DIR_DELETE_ERROR:
+                    default:
+                        tnfs_ddelete_status = GEMDOS_EINTRN;
+                        sidetnfs_note_tnfs_ddelete_diag(false, false, false, "RMDIR_ERROR");
+                        break;
+                    }
+                }
+            }
+            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_RETURN, 0, tnfs_ddelete_path, NULL, NULL, 0, 0,
+                               (uint8_t)tnfs_ddelete_status, 0);
+            // Fase 7J: matches the existing (SD-established) plain
+            // uint16_t write for this status field -- same convention as
+            // Dcreate's GEMDRVEMUL_DCREATE_STATUS (see Fase 7I report).
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = tnfs_ddelete_status;
+#else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
             DPRINTF("Folder to delete: %s\n", tmp_pathname);
@@ -2448,6 +2797,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 }
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = scfs_fresult_to_gemdos_error(fr);
             }
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -2521,6 +2871,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 snprintf(tmp_string, MAX_FOLDER_LENGTH, "%s", tmp_string + 2);
                 DPRINTF("New path_filename: %s\n", tmp_string);
             }
+            bool fsfirst_path_was_relative = false;
             if (tmp_string[0] == '/')
             {
                 DPRINTF("Root folder found. Ignoring default path.\n");
@@ -2529,6 +2880,16 @@ void init_gemdrvemul(bool safe_config_reboot)
             else
             {
                 DPRINTF("Need to concatenate the default path: %s\n", dpath_string);
+#if SIDETNFS_USE_TNFS_LISTING
+                // Fase 7E: Fsfirst had no dedicated path-resolve
+                // diagnostics of its own before this phase (unlike Fopen's
+                // FOPEN_RAW_PATH/FOPEN_TNFS_PATH) -- these three cover the
+                // same raw-input/cwd/resolved-output shape for the
+                // relative-fspec case.
+                fsfirst_path_was_relative = true;
+                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_INPUT, ndta, tmp_string, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, ndta, dpath_string, NULL, NULL, 0, 0, 0, 0);
+#endif
                 snprintf(fspec_string, sizeof(fspec_string), "%s/%s", dpath_string, tmp_string);
                 DPRINTF("Full fspec string: %s\n", fspec_string);
             }
@@ -2539,6 +2900,12 @@ void init_gemdrvemul(bool safe_config_reboot)
             seach_path_2_st(fspec_string, internal_path, path_forwardslash, pattern);
 
             back_2_forwardslash(path_forwardslash);
+#if SIDETNFS_USE_TNFS_LISTING
+            if (fsfirst_path_was_relative)
+            {
+                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_OUTPUT, ndta, path_forwardslash, NULL, NULL, 0, 0, 0, 0);
+            }
+#endif
 
             // Testing if the FSfirst changes the default path or not
             // DPRINTF("Old dpath string: %s, new dpath string: %s\n", dpath_string, path_forwardslash);
@@ -2617,16 +2984,52 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_FCREATE_CALL:
         {
 #if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Fcreate is mutating (creates/truncates a file) --
-            // must never silently f_open(..., FA_CREATE_ALWAYS) the
-            // physical SD card while the TNFS backend is active. TNFS file
-            // creation isn't implemented yet; see report.
-            sidetnfs_diag_log(SIDETNFS_DIAG_FCREATE_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EACCDN;
+            // Fase 7K: real TNFS create+truncate (Fcreate always creates a
+            // new file or truncates an existing one -- see
+            // sidetnfs_tnfs_file_create()). fcreate_mode is the Atari
+            // attribute byte for the new file (hidden/system/etc.) -- not
+            // acted on yet, same "MISSING ATTRIBUTE MODIFICATION" gap the
+            // SD/FatFS route below already has.
+            fcreate_mode = payloadPtr[0]; // d3 register
+            payloadPtr += 6;              // Skip six words
+            char tnfs_fcreate_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char tnfs_fcreate_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(tnfs_fcreate_path, tnfs_fcreate_raw_path, NULL);
+            DPRINTF("TNFS file to create: %s (attr %x)\n", tnfs_fcreate_path, fcreate_mode);
+
+            uint8_t tnfs_fcreate_handle = 0;
+            SidetnfsFileOpenResult tnfs_fcreate_result = sidetnfs_tnfs_file_create(tnfs_fcreate_path, &tnfs_fcreate_handle);
+            if (tnfs_fcreate_result != SIDETNFS_FILE_OPEN_OK)
+            {
+                DPRINTF("ERROR: Could not create TNFS file %s (result %d)\n", tnfs_fcreate_path, (int)tnfs_fcreate_result);
+                int32_t tnfs_fcreate_gemdos_rc =
+                    tnfs_fcreate_result == SIDETNFS_FILE_OPEN_NOT_FOUND ? GEMDOS_EPTHNF : GEMDOS_EINTRN;
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = tnfs_fcreate_gemdos_rc;
+            }
+            else
+            {
+                uint16_t tnfs_fcreate_fd_counter = get_first_available_fd(fdescriptors);
+                FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
+                if (newFDescriptor == NULL)
+                {
+                    DPRINTF("Memory allocation failed for new FileDescriptors\n");
+                    // Best-effort -- don't leak the TNFS-side handle just
+                    // because the local tracking entry couldn't be allocated.
+                    sidetnfs_tnfs_file_close(tnfs_fcreate_fd_counter, tnfs_fcreate_handle);
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EINTRN;
+                }
+                else
+                {
+                    add_tnfs_file(&fdescriptors, newFDescriptor, tnfs_fcreate_path, tnfs_fcreate_handle,
+                                  tnfs_fcreate_fd_counter, true);
+                    DPRINTF("TNFS file created with file descriptor: %d\n", tnfs_fcreate_fd_counter);
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = tnfs_fcreate_fd_counter;
+                }
+            }
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
-#endif
+#else
             fcreate_mode = payloadPtr[0]; // d3 register
             payloadPtr += 6;              // Skip six words
             // Obtain the fname string and keep it in memory
@@ -2674,22 +3077,73 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
+#endif
         }
         case GEMDRVEMUL_FDELETE_CALL:
         {
+            payloadPtr += 6; // Skip six words
 #if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Fdelete is mutating -- must never silently
-            // f_unlink() the physical SD card while the TNFS backend is
-            // active. TNFS file deletion isn't implemented yet; see
-            // report. Deliberately skips even the "is it open, close it
-            // first" step -- no SD file handle lookup/close at all.
-            sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) = SWAP_LONGWORD(GEMDOS_EACCDN);
+            // Fase 7G: real TNFS file delete. Directories are never
+            // deleted here -- see sidetnfs_tnfs_file_delete()'s comment:
+            // relies on the server's own unlink() refusing a directory
+            // (standard POSIX semantics) rather than a separate
+            // TNFS_CMD_STAT type-check, and any refusal is always mapped
+            // to a GEMDOS error, never success.
+            char tnfs_delete_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char tnfs_delete_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(tnfs_delete_path, tnfs_delete_raw_path, NULL);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_RAW_PATH, 0, tnfs_delete_raw_path, NULL, NULL, 0, 0, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_TNFS_PATH, 0, tnfs_delete_path, NULL, NULL, 0, 0, 0, 0);
+
+            // Fase 7G: mirrors the SD route's own "if it's open, close it
+            // first" step below, using the existing TNFS close helper (no
+            // change to Fclose itself) -- avoids leaving a dangling TNFS
+            // handle/local descriptor behind for a file we're about to
+            // delete.
+            FileDescriptors *tnfs_delete_file = get_file_by_fpath(fdescriptors, tnfs_delete_path);
+            if (tnfs_delete_file != NULL && tnfs_delete_file->backend == GEMDRIVE_FILE_BACKEND_TNFS)
+            {
+                DPRINTF("File is open. Closing it first\n");
+                sidetnfs_tnfs_file_close(tnfs_delete_file->fd, tnfs_delete_file->tnfs_handle);
+                delete_file_by_fdesc(&fdescriptors, tnfs_delete_file->fd);
+            }
+
+            uint8_t tnfs_delete_rc = 0xFFu;
+            SidetnfsFileDeleteResult tnfs_delete_result = sidetnfs_tnfs_file_delete(tnfs_delete_path, &tnfs_delete_rc);
+            sidetnfs_note_tnfs_fdelete(tnfs_delete_path, tnfs_delete_rc, tnfs_delete_result == SIDETNFS_FILE_DELETE_OK);
+
+            uint32_t tnfs_delete_status;
+            switch (tnfs_delete_result)
+            {
+            case SIDETNFS_FILE_DELETE_OK:
+                tnfs_delete_status = GEMDOS_EOK;
+                break;
+            case SIDETNFS_FILE_DELETE_NOT_FOUND:
+                // TNFS's single ENOENT doesn't distinguish "file not
+                // found" from "path not found" -- same limitation already
+                // noted for Fopen (Fase 7D) and Dsetpath (Fase 7E).
+                tnfs_delete_status = GEMDOS_EFILNF;
+                break;
+            case SIDETNFS_FILE_DELETE_ACCESS_DENIED:
+                // Covers both a real access-denied and the server
+                // refusing to unlink a directory (EISDIR) -- either way,
+                // deny, never silently treat as deleted.
+                tnfs_delete_status = GEMDOS_EACCDN;
+                break;
+            case SIDETNFS_FILE_DELETE_ERROR:
+            default:
+                tnfs_delete_status = GEMDOS_EINTRN;
+                break;
+            }
+            sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_RETURN, 0, tnfs_delete_path, NULL, NULL, 0, 0,
+                               (uint8_t)tnfs_delete_status, 0);
+            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) =
+                SWAP_LONGWORD(tnfs_delete_status);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
-#endif
-            payloadPtr += 6; // Skip six words
+#else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
             char tmp_filepath[MAX_FOLDER_LENGTH] = {0};
@@ -2750,6 +3204,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
+#endif
         }
         case GEMDRVEMUL_FSEEK_CALL:
         {
@@ -2769,15 +3224,79 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_USE_TNFS_LISTING
             else if (file->backend == GEMDRIVE_FILE_BACKEND_TNFS)
             {
-                // Fase 7D (known risk, reported before implementation):
-                // Fseek on a TNFS-backed handle is not implemented this
-                // phase. In particular, SEEK_END below would read
-                // f_size(&file->fobject) -- but fobject is never populated
-                // for a TNFS entry (only file->tnfs_handle is), so it is
-                // denied cleanly here instead of reading uninitialized
-                // FatFs state. See Fase 7E.
-                DPRINTF("ERROR: Fseek not implemented for TNFS-backed fd %x\n", fseek_fd);
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FSEEK_STATUS, GEMDOS_EINTRN);
+                // Fase 7F: real TNFS Fseek. SEEK_SET/SEEK_CUR are resolved
+                // to an absolute target offset locally -- exactly mirroring
+                // the SD/RAM route's own arithmetic below, including its
+                // existing (here intentionally unchanged) clamp checks --
+                // then sent as an absolute TNFS SEEK_SET so the server-side
+                // read cursor actually moves there too (GEMDRVEMUL_READ_BUFF_CALL's
+                // TNFS path is unchanged this phase and just keeps reading
+                // sequentially from wherever the server cursor is). Only
+                // SEEK_END asks the server directly, since only it knows
+                // the file size.
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_ENTER, fseek_fd, NULL, NULL, NULL, fseek_mode, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_HANDLE, fseek_fd, NULL, NULL, NULL, file->tnfs_handle, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_MODE, fseek_fd, NULL, NULL, NULL, fseek_mode, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_BACKEND, fseek_fd, NULL, NULL, NULL, 0, 0,
+                                   (uint8_t)file->backend, 0);
+                {
+                    char off_in_str[24];
+                    snprintf(off_in_str, sizeof(off_in_str), "in=%ld", (long)(int32_t)fseek_offset);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_OFFSET_IN, fseek_fd, off_in_str, NULL, NULL, 0, 0, 0, 0);
+                }
+
+                bool fseek_ok = false;
+                uint32_t fseek_new_offset = file->offset;
+                uint8_t fseek_tnfs_rc = 0xFFu;
+                switch (fseek_mode)
+                {
+                case 0: // SEEK_SET
+                {
+                    uint32_t target = fseek_offset;
+                    fseek_ok = sidetnfs_tnfs_file_seek(fseek_fd, file->tnfs_handle, false, (int32_t)target,
+                                                        &fseek_new_offset, &fseek_tnfs_rc);
+                    break;
+                }
+                case 1: // SEEK_CUR
+                {
+                    uint32_t target = file->offset + fseek_offset;
+                    fseek_ok = sidetnfs_tnfs_file_seek(fseek_fd, file->tnfs_handle, false, (int32_t)target,
+                                                        &fseek_new_offset, &fseek_tnfs_rc);
+                    break;
+                }
+                case 2: // SEEK_END
+                {
+                    fseek_ok = sidetnfs_tnfs_file_seek(fseek_fd, file->tnfs_handle, true, (int32_t)fseek_offset,
+                                                        &fseek_new_offset, &fseek_tnfs_rc);
+                    break;
+                }
+                default:
+                    DPRINTF("ERROR: Invalid Fseek mode for TNFS-backed fd %x: %x\n", fseek_fd, fseek_mode);
+                    fseek_ok = false;
+                    break;
+                }
+
+                // Fase 7F-debugfix: always recorded, independent of the
+                // eventlog's fixed-size budget (see
+                // sidetnfs_note_tnfs_fseek()).
+                sidetnfs_note_tnfs_fseek(fseek_mode, fseek_fd, fseek_tnfs_rc, fseek_ok);
+
+                if (!fseek_ok)
+                {
+                    DPRINTF("ERROR: TNFS seek failed for fd %x\n", fseek_fd);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_RETURN, fseek_fd, NULL, NULL, NULL, 0, 0,
+                                       (uint8_t)GEMDOS_EINTRN, 0);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FSEEK_STATUS, GEMDOS_EINTRN);
+                }
+                else
+                {
+                    file->offset = fseek_new_offset;
+                    char off_out_str[24];
+                    snprintf(off_out_str, sizeof(off_out_str), "out=%lu", (unsigned long)fseek_new_offset);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_OFFSET_OUT, fseek_fd, off_out_str, NULL, NULL, 0, 0, 0, 0);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_RETURN, fseek_fd, NULL, NULL, NULL, 0, 0, 0, 0);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FSEEK_STATUS, fseek_new_offset);
+                }
             }
 #endif
             else
@@ -2826,6 +3345,104 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Obtain the new attributes, if FATTRIB_SET is set
             uint16_t fattrib_new = payloadPtr[0]; // d4 register
             payloadPtr += 4;                      // Skip four words
+#if SIDETNFS_USE_TNFS_LISTING
+            // Fase 7L/7Lb: real TNFS Fattrib inquire via STAT (see
+            // sidetnfs_tnfs_get_attributes() in sidetnfs_probe.c for the
+            // wire-level detail). Fattrib SET is unconditionally reported
+            // as unsupported -- confirmed against the actual server
+            // source (tnfsd 24.0522.1): it registers command 0x27
+            // (TNFS_CHMODFILE) in its dispatch table, but the handler
+            // function body is empty (no payload parse, no chmod(), no
+            // response), so sending it would only ever time out. TNFS
+            // Fattrib set is therefore reported as unsupported.
+            // STAT-based inquiry remains supported. Never touches the
+            // physical SD card.
+            char tnfs_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char tnfs_fattrib_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(tnfs_fattrib_path, tnfs_fattrib_raw_path, NULL);
+            DPRINTF("TNFS Fattrib flag: %x, new attributes: %x, path: %s\n", fattrib_flag, fattrib_new,
+                     tnfs_fattrib_path);
+
+            if (fattrib_flag == FATTRIB_INQUIRE)
+            {
+                uint8_t tnfs_fattrib_st_attribs = 0;
+                uint8_t tnfs_fattrib_rc = 0xFFu;
+                SidetnfsAttrResult tnfs_fattrib_result =
+                    sidetnfs_tnfs_get_attributes(tnfs_fattrib_path, &tnfs_fattrib_st_attribs, &tnfs_fattrib_rc);
+                bool tnfs_fattrib_ok = tnfs_fattrib_result == SIDETNFS_ATTR_OK;
+                sidetnfs_note_tnfs_fattrib(fattrib_flag, 0, tnfs_fattrib_st_attribs, tnfs_fattrib_rc, tnfs_fattrib_ok,
+                                            false, tnfs_fattrib_path);
+                switch (tnfs_fattrib_result)
+                {
+                case SIDETNFS_ATTR_OK:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             (uint32_t)tnfs_fattrib_st_attribs);
+                    break;
+                case SIDETNFS_ATTR_NOT_FOUND:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
+                    break;
+                case SIDETNFS_ATTR_PATH_NOT_FOUND:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EPTHNF);
+                    break;
+                case SIDETNFS_ATTR_ACCESS_DENIED:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EACCDN);
+                    break;
+                case SIDETNFS_ATTR_ERROR:
+                default:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EINTRN);
+                    break;
+                }
+            }
+            else
+            {
+                // Fase 7Lb: mask is passed through for diagnostic/logging
+                // purposes only -- sidetnfs_tnfs_set_attributes() always
+                // reports SIDETNFS_ATTR_ACCESS_DENIED/unsupported now (see
+                // its own header comment), never actually applies
+                // anything, and never contacts the server.
+                uint8_t tnfs_fattrib_result_attribs = 0;
+                uint8_t tnfs_fattrib_rc = 0xFFu;
+                bool tnfs_fattrib_unsupported = false;
+                SidetnfsAttrResult tnfs_fattrib_result = sidetnfs_tnfs_set_attributes(
+                    tnfs_fattrib_path, (uint8_t)fattrib_new,
+                    (uint8_t)(FS_ST_READONLY | FS_ST_HIDDEN | FS_ST_SYSTEM), &tnfs_fattrib_result_attribs,
+                    &tnfs_fattrib_rc, &tnfs_fattrib_unsupported);
+                bool tnfs_fattrib_ok = tnfs_fattrib_result == SIDETNFS_ATTR_OK;
+                sidetnfs_note_tnfs_fattrib(fattrib_flag, (uint8_t)fattrib_new, tnfs_fattrib_result_attribs,
+                                            tnfs_fattrib_rc, tnfs_fattrib_ok, tnfs_fattrib_unsupported,
+                                            tnfs_fattrib_path);
+                switch (tnfs_fattrib_result)
+                {
+                case SIDETNFS_ATTR_OK:
+                    // Fase 7Lb: unreachable with the current server (see
+                    // sidetnfs_tnfs_set_attributes(), which always returns
+                    // SIDETNFS_ATTR_ACCESS_DENIED) -- kept only so this
+                    // switch stays exhaustive/correct if a future TNFS
+                    // server ever implements CHMOD for real. Would return
+                    // the NEW (just-applied) attributes, the standard
+                    // documented GEMDOS Fattrib behavior.
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             (uint32_t)tnfs_fattrib_result_attribs);
+                    break;
+                case SIDETNFS_ATTR_NOT_FOUND:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
+                    break;
+                case SIDETNFS_ATTR_PATH_NOT_FOUND:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EPTHNF);
+                    break;
+                case SIDETNFS_ATTR_ACCESS_DENIED:
+                    // Fase 7Lb: the actual path taken today -- TNFS
+                    // Fattrib set is unconditionally unsupported on this
+                    // server (see sidetnfs_tnfs_set_attributes()).
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EACCDN);
+                    break;
+                case SIDETNFS_ATTR_ERROR:
+                default:
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EINTRN);
+                    break;
+                }
+            }
+#else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
             char tmp_filepath[MAX_FOLDER_LENGTH] = {0};
@@ -2850,23 +3467,10 @@ void init_gemdrvemul(bool safe_config_reboot)
                 if (fattrib_flag == FATTRIB_INQUIRE)
                 {
                     DPRINTF("File attributes: %s\n", fattrib_st_str);
-                    // Fase 7C (analysis): this inquiry path still reads
-                    // attributes via scfs_stat() on the physical SD card
-                    // regardless of backend -- not a mutation, so left
-                    // unguarded here, but it is not yet TNFS-correct; see
-                    // report (Fase 7E: TNFS stat/inquiry).
                 }
                 else
                 {
                     // WE will assume here FATTRIB_SET
-#if SIDETNFS_USE_TNFS_LISTING
-                    // Fase 7C: Fattrib-set is mutating -- must never
-                    // silently f_chmod() the physical SD card while the
-                    // TNFS backend is active. TNFS attribute writes aren't
-                    // implemented yet; see report.
-                    sidetnfs_diag_log(SIDETNFS_DIAG_FATTRIB_SET_DENIED_TNFS, 0, tmp_filepath, NULL, NULL, 0, 0, 0, 0);
-                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EACCDN);
-#else
                     // Set the attributes of the file
                     char fattrib_st_str[7] = "";
                     get_attribs_st_str(fattrib_st_str, fattrib_new);
@@ -2878,25 +3482,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                         DPRINTF("ERROR: Could not set file attributes (%d)\r\n", fr);
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EACCDN);
                     }
-#endif
                 }
             }
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
         }
         case GEMDRVEMUL_FRENAME_CALL:
         {
-#if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Frename is mutating -- must never silently
-            // f_rename() the physical SD card while the TNFS backend is
-            // active. TNFS rename isn't implemented yet; see report.
-            sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) = SWAP_LONGWORD(GEMDOS_EACCDN);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
             payloadPtr += 6; // Skip six words
             // Obtain the src name from the payload
             char *origin = (char *)payloadPtr;
@@ -2904,10 +3498,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             char frename_fname_dst[MAX_FOLDER_LENGTH] = {0};
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(origin, frename_fname_src, MAX_FOLDER_LENGTH);
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(origin + MAX_FOLDER_LENGTH, frename_fname_dst, MAX_FOLDER_LENGTH);
-            // DPRINTF("Renaming file: %s to %s\n", frename_fname_src, frename_fname_dst);
-            // get_local_full_pathname(frename_fname_src);
-            // get_local_full_pathname(frename_fname_dst);
-            // DPRINTF("Renaming file: %s to %s\n", frename_fname_src, frename_fname_dst);
 
             char drive_src[3] = {0};
             char folders_src[MAX_FOLDER_LENGTH] = {0};
@@ -2925,6 +3515,78 @@ void init_gemdrvemul(bool safe_config_reboot)
                 DPRINTF("ERROR: Different drives\n");
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) = SWAP_LONGWORD(GEMDOS_EPTHNF);
             }
+#if SIDETNFS_USE_TNFS_LISTING
+            else
+            {
+                // Fase 7H: real TNFS rename. payloadPtr is still at the src
+                // raw string here (unchanged by the COPY_AND_CHANGE_ENDIANESS_BLOCK16
+                // calls above, which read via the local `origin` copy, not
+                // payloadPtr itself) -- same precondition the SD route
+                // below relies on for its own get_local_full_pathname()
+                // calls.
+                char tnfs_rename_raw_src[MAX_FOLDER_LENGTH] = {0};
+                char tnfs_rename_raw_dst[MAX_FOLDER_LENGTH] = {0};
+                char tnfs_rename_src[MAX_FOLDER_LENGTH] = {0};
+                char tnfs_rename_dst[MAX_FOLDER_LENGTH] = {0};
+                get_tnfs_relative_pathname(tnfs_rename_src, tnfs_rename_raw_src, NULL);
+                payloadPtr += MAX_FOLDER_LENGTH / 2; // MAX_FOLDER_LENGTH * 2 bytes per uint16_t
+                get_tnfs_relative_pathname(tnfs_rename_dst, tnfs_rename_raw_dst, NULL);
+
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_RAW_SRC, 0, tnfs_rename_raw_src, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_RAW_DST, 0, tnfs_rename_raw_dst, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_TNFS_SRC, 0, tnfs_rename_src, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_TNFS_DST, 0, tnfs_rename_dst, NULL, NULL, 0, 0, 0, 0);
+
+                uint8_t tnfs_rename_rc = 0xFFu;
+                SidetnfsFileRenameResult tnfs_rename_result =
+                    sidetnfs_tnfs_file_rename(tnfs_rename_src, tnfs_rename_dst, &tnfs_rename_rc);
+                sidetnfs_note_tnfs_frename(tnfs_rename_src, tnfs_rename_dst, tnfs_rename_rc,
+                                            tnfs_rename_result == SIDETNFS_FILE_RENAME_OK);
+
+                uint32_t tnfs_rename_status;
+                switch (tnfs_rename_result)
+                {
+                case SIDETNFS_FILE_RENAME_OK:
+                {
+                    tnfs_rename_status = GEMDOS_EOK;
+                    // Fase 7H: targeted registration update, not a broad
+                    // cache reset -- a TNFS-backed handle currently open
+                    // under the OLD path stays perfectly valid after a
+                    // server-side rename (the TNFS handle refers to the
+                    // open file object, not the path), so we only correct
+                    // the local fpath bookkeeping to the new name instead
+                    // of closing it. Fsfirst/Fsnext never cache directory
+                    // entries (see Fase 5Y/6B report), so no
+                    // directory-search state needs touching either.
+                    FileDescriptors *tnfs_rename_open_file = get_file_by_fpath(fdescriptors, tnfs_rename_src);
+                    if (tnfs_rename_open_file != NULL && tnfs_rename_open_file->backend == GEMDRIVE_FILE_BACKEND_TNFS)
+                    {
+                        strncpy(tnfs_rename_open_file->fpath, tnfs_rename_dst,
+                                sizeof(tnfs_rename_open_file->fpath) - 1);
+                        tnfs_rename_open_file->fpath[sizeof(tnfs_rename_open_file->fpath) - 1] = '\0';
+                        sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_HANDLE_UPDATE, (uint32_t)tnfs_rename_open_file->fd,
+                                           tnfs_rename_dst, NULL, NULL, 0, 0, 0, 0);
+                    }
+                    break;
+                }
+                case SIDETNFS_FILE_RENAME_NOT_FOUND:
+                    tnfs_rename_status = GEMDOS_EFILNF;
+                    break;
+                case SIDETNFS_FILE_RENAME_ACCESS_DENIED:
+                    tnfs_rename_status = GEMDOS_EACCDN;
+                    break;
+                case SIDETNFS_FILE_RENAME_ERROR:
+                default:
+                    tnfs_rename_status = GEMDOS_EINTRN;
+                    break;
+                }
+                sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_RETURN, 0, tnfs_rename_dst, NULL, NULL, 0, 0,
+                                   (uint8_t)tnfs_rename_status, 0);
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
+                    SWAP_LONGWORD(tnfs_rename_status);
+            }
+#else
             else
             {
                 DPRINTF("Renaming file: %s to %s\n", frename_fname_src, frename_fname_dst);
@@ -2964,6 +3626,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                     *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) = GEMDOS_EOK;
                 }
             }
+#endif
 
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -2989,15 +3652,83 @@ void init_gemdrvemul(bool safe_config_reboot)
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
             }
+#if SIDETNFS_USE_TNFS_LISTING
+            else if (fd->backend == GEMDRIVE_FILE_BACKEND_TNFS)
+            {
+                // Fase 7M: real TNFS Fdatime inquire via STAT (see
+                // sidetnfs_tnfs_get_datetime() in sidetnfs_probe.c).
+                // fd->fpath already holds the TNFS-relative path this
+                // handle was opened with (set at Fopen/Fcreate time) -- no
+                // separate path lookup or new handle-table field needed.
+                // Set is unconditionally unsupported -- confirmed against
+                // the actual server source (tnfsd 24.0522.1) that its
+                // protocol header defines no UTIME/SETTIME command at all.
+                if (fdatetime_flag == FDATETIME_INQUIRE)
+                {
+                    DPRINTF("TNFS inquire file date and time: %s fd: %d\n", fd->fpath, fdatetime_fd);
+                    uint16_t tnfs_fdatime_gemdos_date = 0;
+                    uint16_t tnfs_fdatime_gemdos_time = 0;
+                    uint32_t tnfs_fdatime_unix_mtime = 0;
+                    uint8_t tnfs_fdatime_rc = 0xFFu;
+                    SidetnfsAttrResult tnfs_fdatime_result =
+                        sidetnfs_tnfs_get_datetime(fd->fpath, &tnfs_fdatime_gemdos_date, &tnfs_fdatime_gemdos_time,
+                                                    &tnfs_fdatime_unix_mtime, &tnfs_fdatime_rc);
+                    bool tnfs_fdatime_ok = tnfs_fdatime_result == SIDETNFS_ATTR_OK;
+                    sidetnfs_note_tnfs_fdatime(fdatetime_flag, (uint8_t)fdatetime_fd, fd->fpath, tnfs_fdatime_rc,
+                                                tnfs_fdatime_ok, false, tnfs_fdatime_unix_mtime,
+                                                tnfs_fdatime_gemdos_date, tnfs_fdatime_gemdos_time);
+                    switch (tnfs_fdatime_result)
+                    {
+                    case SIDETNFS_ATTR_OK:
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EOK);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE,
+                                                 tnfs_fdatime_gemdos_date);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME,
+                                                 tnfs_fdatime_gemdos_time);
+                        break;
+                    case SIDETNFS_ATTR_NOT_FOUND:
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EFILNF);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                        break;
+                    case SIDETNFS_ATTR_PATH_NOT_FOUND:
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EPTHNF);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                        break;
+                    case SIDETNFS_ATTR_ACCESS_DENIED:
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EACCDN);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                        break;
+                    case SIDETNFS_ATTR_ERROR:
+                    default:
+                        // Fase 7M: covers both a genuine transport/server
+                        // error and a too-short STAT response (see
+                        // sidetnfs_tnfs_get_datetime()/tnfs_stat_raw()) --
+                        // never a partial date/time written either way.
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EINTRN);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                        break;
+                    }
+                }
+                else
+                {
+                    DPRINTF("TNFS modify file date and time (unsupported): %s fd: %d\n", fd->fpath, fdatetime_fd);
+                    sidetnfs_tnfs_set_datetime_unsupported(fd->fpath, date_dos, time_dos);
+                    sidetnfs_note_tnfs_fdatime(fdatetime_flag, (uint8_t)fdatetime_fd, fd->fpath, 0xFFu, false, true,
+                                                0, date_dos, time_dos);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EACCDN);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                }
+            }
+#endif
             else
             {
                 if (fdatetime_flag == FDATETIME_INQUIRE)
                 {
-                    // Fase 7C (analysis): this inquiry path still reads
-                    // date/time via scfs_stat() on the physical SD card
-                    // regardless of backend -- not a mutation, so left
-                    // unguarded here, but it is not yet TNFS-correct; see
-                    // report (Fase 7E: TNFS stat/inquiry).
                     DPRINTF("Inquire file date and time: %s fd: %d\n", fd->fpath, fdatetime_fd);
                     ScFsStat stat_info;
                     bool stat_ok = scfs_stat(fd->fpath, &stat_info);
@@ -3032,16 +3763,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                 else
                 {
                     DPRINTF("Modify file date and time: %s fd: %d\n", fd->fpath, fdatetime_fd);
-#if SIDETNFS_USE_TNFS_LISTING
-                    // Fase 7C: Fdatetime-set is mutating -- must never
-                    // silently f_utime() the physical SD card while the
-                    // TNFS backend is active. TNFS datetime writes aren't
-                    // implemented yet; see report.
-                    sidetnfs_diag_log(SIDETNFS_DIAG_FDATETIME_SET_DENIED_TNFS, 0, fd->fpath, NULL, NULL, 0, 0, 0, 0);
-                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EACCDN);
-                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
-                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
-#else
 #if defined(_DEBUG) && (_DEBUG != 0)
                     // Save some memory and cycles if not in debug mode
                     // Convert the date and time
@@ -3076,7 +3797,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
                         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
                     }
-#endif
                 }
             }
             write_random_token(memory_shared_address);
@@ -3103,17 +3823,6 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_WRITE_BUFF_CALL:
         {
-#if SIDETNFS_USE_TNFS_LISTING
-            // Fase 7C: Fwrite is mutating -- must never silently
-            // f_lseek()/f_write() the physical SD card while the TNFS
-            // backend is active. TNFS write isn't implemented yet; see
-            // report. No offset update, no SD file access at all.
-            sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_DENIED_TNFS, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EACCDN);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
             uint16_t writebuff_fd = payloadPtr[0];                                                       // d3 register
             payloadPtr += 2;                                                                             // Skip two words
             uint32_t writebuff_bytes_to_write = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];         // d4 register constains the number of bytes to write
@@ -3126,8 +3835,122 @@ void init_gemdrvemul(bool safe_config_reboot)
             if (file == NULL)
             {
                 DPRINTF("ERROR: File descriptor not found\n");
+#if SIDETNFS_USE_TNFS_LISTING
+                sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_BAD_HANDLE, writebuff_fd, NULL, NULL, NULL, 0, 0, 0xFFu, 0);
+                sidetnfs_note_tnfs_fwrite(0, (uint16_t)writebuff_pending_bytes_to_write, 0, 0xFFu, false, false);
+#endif
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EIHNDL);
             }
+#if SIDETNFS_USE_TNFS_LISTING
+            else if (file->backend == GEMDRIVE_FILE_BACKEND_TNFS)
+            {
+                // Fase 7K: real TNFS write. Checksum/endianness handling is
+                // unchanged from the SD/FatFS route below (68k-side
+                // handshake is backend-agnostic) -- only the actual
+                // byte-write and the offset-repositioning that precedes it
+                // are TNFS instead of FatFS.
+                if (!file->tnfs_writable)
+                {
+                    DPRINTF("ERROR: TNFS handle fd %x is read-only\n", writebuff_fd);
+                    sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_READONLY, writebuff_fd, NULL, NULL, NULL,
+                                       file->tnfs_handle, 0, 0, 0);
+                    sidetnfs_note_tnfs_fwrite(file->tnfs_handle, (uint16_t)writebuff_pending_bytes_to_write, 0,
+                                               0xFFu, false, false);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EACCDN);
+                }
+                else
+                {
+                    uint32_t writebuff_offset = file->offset;
+                    uint16_t buff_size = writebuff_pending_bytes_to_write > DEFAULT_FWRITE_BUFFER_SIZE
+                                              ? DEFAULT_FWRITE_BUFFER_SIZE
+                                              : (uint16_t)writebuff_pending_bytes_to_write;
+                    uint16_t *target = payloadPtr;
+                    // Checksum computed exactly like the SD/FatFS route
+                    // below -- over the whole fixed DEFAULT_FWRITE_BUFFER_SIZE
+                    // region regardless of buff_size, since the 68k side
+                    // verifies it against the source buffer it sent, not
+                    // against how many bytes actually ended up written.
+                    uint16_t chk = 0;
+                    UINT words_to_write = (DEFAULT_FWRITE_BUFFER_SIZE) / 2;
+                    UINT pending_bytes = (DEFAULT_FWRITE_BUFFER_SIZE) % 2;
+                    uint16_t *target16 = (uint16_t *)target;
+                    for (int i = 0; i < words_to_write; i++)
+                    {
+                        chk += target16[i];
+                    }
+                    if (pending_bytes > 0)
+                    {
+                        uint16_t pending_long_word = target16[words_to_write];
+                        chk += pending_long_word & (0x00FF << (pending_bytes * 8));
+                    }
+                    DPRINTF("Checksum: x%x\n", chk);
+
+                    if (buff_size == 0)
+                    {
+                        // Nothing requested this call -- no TNFS traffic
+                        // needed (e.g. an Fwrite with count 0).
+                        sidetnfs_note_tnfs_fwrite(file->tnfs_handle, 0, 0, 0, true, false);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_CHK, (uint32_t)chk);
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, 0);
+                    }
+                    else
+                    {
+                        // Change the endianness of the bytes to write
+                        CHANGE_ENDIANESS_BLOCK16(target, buff_size + (buff_size % 2));
+
+                        // Reposition the TNFS file cursor to file->offset
+                        // first -- mirrors f_lseek()'s always-seek-before-write
+                        // behavior below exactly, so a retry (68k re-sends
+                        // the same chunk without having confirmed/advanced
+                        // the offset via GEMDRVEMUL_WRITE_BUFF_CHECK)
+                        // correctly overwrites the same spot instead of
+                        // silently continuing past it.
+                        uint32_t writebuff_new_offset = writebuff_offset;
+                        uint8_t writebuff_seek_rc = 0xFFu;
+                        bool writebuff_seek_ok =
+                            sidetnfs_tnfs_file_seek(writebuff_fd, file->tnfs_handle, false,
+                                                     (int32_t)writebuff_offset, &writebuff_new_offset,
+                                                     &writebuff_seek_rc);
+                        if (!writebuff_seek_ok)
+                        {
+                            DPRINTF("ERROR: Could not seek TNFS file before write (fd %x)\n", writebuff_fd);
+                            sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_TRANSPORT_ERROR, writebuff_fd, NULL, NULL, NULL,
+                                               file->tnfs_handle, 0, writebuff_seek_rc, 0);
+                            sidetnfs_note_tnfs_fwrite(file->tnfs_handle, buff_size, 0, writebuff_seek_rc, false,
+                                                       false);
+                            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EINTRN);
+                        }
+                        else
+                        {
+                            uint16_t bytes_write = 0;
+                            uint8_t writebuff_rc = 0xFFu;
+                            bool writebuff_ok = sidetnfs_tnfs_file_write(writebuff_fd, file->tnfs_handle,
+                                                                          (const uint8_t *)target, buff_size,
+                                                                          &bytes_write, &writebuff_rc);
+                            bool writebuff_partial = writebuff_ok && bytes_write < buff_size;
+                            sidetnfs_note_tnfs_fwrite(file->tnfs_handle, buff_size, bytes_write, writebuff_rc,
+                                                       writebuff_ok, writebuff_partial);
+                            if (writebuff_partial)
+                            {
+                                sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_PARTIAL, writebuff_fd, NULL, NULL, NULL,
+                                                   file->tnfs_handle, bytes_write, writebuff_rc, 0);
+                            }
+                            if (!writebuff_ok)
+                            {
+                                DPRINTF("ERROR: Could not write TNFS file (fd %x)\n", writebuff_fd);
+                                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EINTRN);
+                            }
+                            else
+                            {
+                                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_CHK, (uint32_t)chk);
+                                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES,
+                                                         (uint32_t)bytes_write);
+                            }
+                        }
+                    }
+                }
+            }
+#endif
             else
             {
                 uint32_t writebuff_offset = file->offset;
@@ -3370,10 +4193,23 @@ void init_gemdrvemul(bool safe_config_reboot)
             // via the TNFS DTA registry (see sidetnfs_tnfs_dta_start()/
             // next() in sidetnfs_probe.c).
         }
+#if SIDETNFS_USE_SD_LISTING
         // Fase 5J: one-shot SD-root scan for the DEBUG.TXT SD-vs-TNFS
-        // comparison. Pure FatFS, independent of network state, guarded
-        // internally to run at most once per boot.
+        // comparison, from back when TNFS listing was new and unproven and
+        // this comparison mattered for bring-up. Fase 8A: no longer called
+        // under SIDETNFS_USE_TNFS_LISTING -- with TNFS long since the
+        // proven, stable default (see sidetnfs_probe.h), this was the one
+        // remaining unconditional FatFS/SD touch (f_opendir/f_readdir/
+        // f_closedir on hd_folder, every boot) left running regardless of
+        // backend, a direct violation of TNFS-mode SD isolation. Left
+        // enabled only under SIDETNFS_USE_SD_LISTING, where it's harmless
+        // (SD is already the live backend there) though no longer
+        // meaningful either (nothing to compare against) -- kept rather
+        // than deleted per this project's "don't delete, mark superseded"
+        // convention; sidetnfs_scan_sd_root_if_needed() itself is
+        // unchanged.
         sidetnfs_scan_sd_root_if_needed(hd_folder);
+#endif
         // Fase 5S/6F: automatic per-tick DEBUG.TXT writes
         // (sidetnfs_debug_file_service()) are permanently retired -- see
         // the SELECT-button edge-handler above, which is the only place

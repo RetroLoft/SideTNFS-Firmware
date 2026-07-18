@@ -215,6 +215,13 @@ typedef struct FileDescriptors
     uint32_t offset;
     GemdriveFileBackend backend;
     uint8_t tnfs_handle; // valid only when backend == GEMDRIVE_FILE_BACKEND_TNFS
+    // Fase 7K: whether this handle was opened for writing (Fopen mode 1/2,
+    // or Fcreate). Only meaningful/checked for GEMDRIVE_FILE_BACKEND_TNFS --
+    // the SD/FatFS backend already enforces this itself (f_write() on an
+    // FA_READ-only FIL returns FR_DENIED), so no equivalent check is added
+    // there. Lets GEMDRVEMUL_WRITE_BUFF_CALL deny a write to a read-only
+    // TNFS handle locally, before ever contacting the server.
+    bool tnfs_writable;
 } FileDescriptors;
 
 typedef struct _pd PD;
