@@ -17,6 +17,14 @@ static uint32_t random_token;
 
 static char *fullpath_a = NULL;
 static char *hd_folder = NULL;
+// Fase 8C: explicit "SD card is currently mounted and usable" status, set
+// only alongside a genuinely successful f_mount() (both in the TNFS
+// backend's best-effort diagnostic mount attempt and the SD backend's own
+// real mount -- see GEMDRVEMUL_PING). Distinct from hd_folder != NULL only
+// in that it's a clearly-named, explicitly-documented status bit rather
+// than an implicit pointer-nullness convention -- see the hd_folder_ready
+// comment below for why that distinction matters here.
+static bool sd_available = false;
 static bool debug = false;
 static char drive_letter = 'C';
 
@@ -1711,6 +1719,20 @@ void init_gemdrvemul(bool safe_config_reboot)
 {
     FRESULT fr; /* FatFs function common result code */
     FATFS fs;
+    // Fase 8C investigation: hd_folder_ready's actual current meaning is
+    // narrower than its name suggests, and does NOT imply SD, WiFi, or
+    // TNFS are available. It only means "the one-time GEMDRVEMUL_PING
+    // first-call initialization has run" -- resetting fdescriptors/the DTA
+    // table/dpath_string, and (only for the SD backend) a successful SD
+    // mount. For the TNFS backend it becomes true on the very first PING
+    // regardless of whether SD, WiFi, or TNFS actually ended up available
+    // (see GEMDRVEMUL_PING below) -- it exists purely so that one-time
+    // setup is never repeated on subsequent PINGs, not as a backend- or
+    // hardware-readiness signal. Left named as-is (renaming a
+    // widely-referenced variable is a bigger, riskier change than this
+    // phase's scope calls for) -- use sd_available / sidetnfs_network_ok /
+    // sidetnfs_tnfs_listing_ready() for actual backend availability
+    // instead, never this flag.
     bool hd_folder_ready = false;
 
     char *ntp_server_host = NULL;
@@ -1968,9 +1990,34 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             bool dns_query_done = false;
 
-            // Wait until the RTC is set by the NTP server
-            while (get_rtc_time()->year == 0)
+            // Fase 8C: this loop previously had NO bound at all -- only
+            // `while (get_rtc_time()->year == 0)`, with no timeout
+            // decrement anywhere in its body. The "Timeout reached. RTC
+            // not set." DPRINTF in the else-branch right after this loop
+            // (unchanged below) already implies a timeout was intended,
+            // but nothing ever produced one: a DNS failure or unreachable
+            // NTP server would spin here forever, and since this all runs
+            // *before* the main GEMDRVEMUL command-dispatch loop further
+            // down, the Atari's PING (and the entire GEMDRIVE handshake)
+            // would never be answered -- exactly the unbounded-network-wait
+            // class of bug this phase requires eliminating. Bounded here
+            // the same way the WiFi-connect wait above it already is:
+            // reuses the same configured PARAM_GEMDRIVE_TIMEOUT_SEC value
+            // (gemdrive_timeout_sec, default 45s), decremented once per
+            // second. On expiry, falls through to the existing (already
+            // correct) "RTC not set" else-branch below -- no other
+            // behavior change.
+            uint32_t ntp_timeout_sec = gemdrive_timeout_sec;
+            absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(ntp_second_t, 0);
+
+            // Wait until the RTC is set by the NTP server, or the timeout expires
+            while (get_rtc_time()->year == 0 && ntp_timeout_sec > 0)
             {
+                if (time_passed(&ntp_second_t, 1000) == 1)
+                {
+                    ntp_timeout_sec--;
+                    ntp_second_t = make_timeout_time_ms(0);
+                }
 
 #if PICO_CYW43_ARCH_POLL
                 network_safe_poll();
@@ -2228,6 +2275,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                     if (fr == FR_OK)
                     {
                         hd_folder = find_entry(PARAM_GEMDRIVE_FOLDERS)->value;
+                        sd_available = true;
                         DPRINTF("SD card also mounted (diagnostics only) in folder: %s\n", hd_folder);
                     }
                     else
@@ -2275,6 +2323,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                     else
                     {
                         hd_folder = find_entry(PARAM_GEMDRIVE_FOLDERS)->value;
+                        sd_available = true;
                         DPRINTF("Emulating GEMDRIVE in folder: %s\n", hd_folder);
                         // Iterate over fdescriptors and close all files
                         close_all_files(&fdescriptors);

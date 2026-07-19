@@ -458,24 +458,6 @@ typedef struct
     uint16_t tnfs_fdatime_last_gemdos_date;
     uint16_t tnfs_fdatime_last_gemdos_time;
 
-    // Fase 8A: backend-isolation review counters. tnfs_io_count/sd_io_count
-    // are incremented at the two most central choke points that actually
-    // exist for each backend (fslisting_ensure_pcb() for every real TNFS
-    // wire operation; scfs_directory_exists()/scfs_get_disk_info()/
-    // scfs_stat() for SD/FatFS -- see sidetnfs_note_tnfs_io()/
-    // sidetnfs_note_sd_io()). The two cross-mode counters are bumped
-    // alongside them, gated by the SAME SIDETNFS_USE_TNFS_LISTING/
-    // SIDETNFS_USE_SD_LISTING compile-time macro that already determines
-    // which backend's GEMDRIVE trap code even exists in this binary --
-    // sd_io_while_tnfs_mode can only ever become nonzero if SD/FatFS code
-    // that shouldn't exist in a TNFS build actually ran (a real, provable
-    // isolation violation, not a runtime guess), and symmetrically for
-    // tnfs_io_while_sd_mode. Both must read 0 after any normal test.
-    uint32_t sd_io_count;
-    uint32_t tnfs_io_count;
-    uint32_t sd_io_while_tnfs_mode;
-    uint32_t tnfs_io_while_sd_mode;
-
 #if SIDETNFS_DEBUG_SHOW_RAW
     uint16_t last_response_len;
     uint8_t last_raw[SIDETNFS_DEBUG_RAW_SIZE];
@@ -1308,20 +1290,6 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
     {
         f_write(&file, line, (UINT)len, &written);
     }
-    // Fase 8A: backend-isolation I/O counters -- always printed. The two
-    // cross-mode counters must read 0 after any normal test; see
-    // SidetnfsDebugState comment for exactly what increments each one.
-    len = snprintf(line, sizeof(line),
-                    "sd io count: %lu\r\n"
-                    "tnfs io count: %lu\r\n"
-                    "sd io while tnfs mode: %lu\r\n"
-                    "tnfs io while sd mode: %lu\r\n\r\n",
-                    (unsigned long)s_state.sd_io_count, (unsigned long)s_state.tnfs_io_count,
-                    (unsigned long)s_state.sd_io_while_tnfs_mode, (unsigned long)s_state.tnfs_io_while_sd_mode);
-    if (len > 0)
-    {
-        f_write(&file, line, (UINT)len, &written);
-    }
 
     for (unsigned i = 0; i < SIDETNFS_TNFS_DTA_SLOTS; i++)
     {
@@ -2050,40 +2018,6 @@ void sidetnfs_probe_service(void)
 #endif
 }
 
-// Fase 8A: call from the one central choke point for real TNFS wire
-// traffic (fslisting_ensure_pcb(), called first by every fslisting_send_*()
-// helper). See SidetnfsDebugState comment for the counter semantics.
-void sidetnfs_note_tnfs_io(void)
-{
-    s_state.tnfs_io_count++;
-#if SIDETNFS_USE_SD_LISTING
-    // Structurally unreachable in a real SD-backend build (this whole file
-    // still compiles for reference/tooling, but GEMDRVEMUL's trap code
-    // never calls into any fslisting_send_*() path under
-    // SIDETNFS_USE_SD_LISTING) -- kept so the counter's cross-mode meaning
-    // stays correct if that ever changes.
-    s_state.tnfs_io_while_sd_mode++;
-#endif
-    s_state.debug_dirty = true;
-}
-
-// Fase 8A: call from the SD/FatFS backend's own most central choke points
-// (scfs_directory_exists()/scfs_get_disk_info()/scfs_stat() in scfs.c --
-// the only SD helpers actually shared across multiple GEMDRIVE trap
-// handlers; raw f_open/f_read/f_write/f_close in the Fopen/Fread/Fwrite/
-// Fclose SD branches are not separately instrumented, see report). See
-// SidetnfsDebugState comment for the counter semantics.
-void sidetnfs_note_sd_io(void)
-{
-    s_state.sd_io_count++;
-#if SIDETNFS_USE_TNFS_LISTING
-    // A nonzero count here is a real, provable isolation violation --
-    // scfs_*() should never be reachable from any TNFS-backend code path.
-    s_state.sd_io_while_tnfs_mode++;
-#endif
-    s_state.debug_dirty = true;
-}
-
 // Fase 5H: record that networking/TNFS was skipped this boot (no WiFi
 // configured, connect/NTP timeout, or ESC/CANCEL during either wait). Only
 // touches RAM state -- safe to call regardless of WiFi/cyw43 state.
@@ -2508,10 +2442,6 @@ static void tnfs_fslisting_recv_callback(void *arg, struct udp_pcb *pcb, struct 
 
 static bool fslisting_ensure_pcb(void)
 {
-    // Fase 8A: called first by every fslisting_send_*() helper -- the one
-    // central choke point for every real TNFS wire operation this file
-    // ever attempts. See sidetnfs_note_tnfs_io().
-    sidetnfs_note_tnfs_io();
     if (s_fslisting_pcb != NULL)
     {
         return true;

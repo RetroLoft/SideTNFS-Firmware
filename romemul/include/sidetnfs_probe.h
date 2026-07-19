@@ -276,19 +276,13 @@ void sidetnfs_debug_file_service(const char *hd_folder);
 // Never blocks, never logs, no UART.
 void sidetnfs_mark_network_skipped(void);
 
-// Fase 8A: backend-isolation review I/O counters. Call sidetnfs_note_tnfs_io()
-// from the single central choke point for real TNFS wire traffic
-// (fslisting_ensure_pcb() already does this internally -- callers outside
-// sidetnfs_probe.c should not normally need to call it directly). Call
-// sidetnfs_note_sd_io() from the SD/FatFS backend's own most central choke
-// points (scfs_directory_exists()/scfs_get_disk_info()/scfs_stat() in
-// scfs.c already do this). Both increment their own running total and,
-// gated by the SAME SIDETNFS_USE_TNFS_LISTING/SIDETNFS_USE_SD_LISTING
-// compile-time macro used throughout gemdrvemul.c, the matching cross-mode
-// counter -- see the DEBUG.TXT dump / SidetnfsDebugState comment for full
-// semantics. Passive: RAM-only, no I/O of their own.
-void sidetnfs_note_tnfs_io(void);
-void sidetnfs_note_sd_io(void);
+// Fase 8A introduced sidetnfs_note_tnfs_io()/sidetnfs_note_sd_io() and four
+// I/O counters here as one-time backend-isolation review instrumentation.
+// Fase 8C removed them: the isolation review is complete, its findings are
+// now permanent code fixes (see gemdrvemul.c), and the review-only counters
+// added no lasting production value over the new sd_available/
+// sidetnfs_network_ok/sidetnfs_tnfs_listing_ready() status model. See
+// report.
 
 // Fase 5J: one-shot SD/FatFS root directory scan (via f_opendir/f_readdir),
 // purely to compare entry counts against the TNFS READDIRX root scan in
