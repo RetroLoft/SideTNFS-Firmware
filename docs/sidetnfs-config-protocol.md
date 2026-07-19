@@ -1,14 +1,16 @@
-# SIDETNFS config-protocol — contract (protocolversie 2, Fase 9C)
+# SIDETNFS config-protocol — contract (protocolversie 2, Fase 9C/9D)
 
-Status: **persistente drivelijst, nog niet actief in de runtime**. Eén
-verplichte configdrive (alleen een driveletter) plus maximaal acht gewone
-drives (SD of TNFS) leven in RAM en kunnen via
+Status: **persistente drivelijst, sinds Fase 9D actief voor de eerste
+TNFS-drive**. Eén verplichte configdrive (alleen een driveletter) plus
+maximaal acht gewone drives (SD of TNFS) leven in RAM en kunnen via
 `GET_CONFIG_INFO`/`GET_DRIVE`/`SET_DRIVE`/`DELETE_DRIVE`/
 `SET_CONFIG_DRIVE` gelezen en gewijzigd worden; `SAVE_CONFIG` is het enige
-commando dat ooit naar flash schrijft. Nog niet geïmplementeerd: echte
-gelijktijdige multi-drive-emulatie, en het laten meewegen van deze lijst
-door de daadwerkelijke TNFS-runtime (die blijft hardcoded, zie
-"Bestaande runtime" hieronder) — dat is Fase 9D of later.
+commando dat ooit naar flash schrijft. Sinds Fase 9D bepaalt de eerste
+gebruikte TNFS/UDP-drive uit deze lijst bij boot de daadwerkelijke actieve
+server EN de GEMDRIVE-driveletter (zie "Bestaande runtime" hieronder) —
+wijzigingen via `SIDETNFS.PRG` worden pas actief na een herstart. Nog niet
+geïmplementeerd: echte gelijktijdige multi-drive-emulatie (nog steeds maar
+één actieve TNFS-drive tegelijk).
 
 Dit vervangt het Fase 9B2-model (max. 8 servers, geen configdrive) volledig
 — dat model is nooit gecommit.
@@ -346,20 +348,35 @@ commando synchroon, schrijft de respons, schrijft daarna dezelfde seed
 terug op `GEMDRVEMUL_RANDOM_TOKEN` (offset 0) als "klaar"-signaal, en reset
 `active_command_id` naar `0xFFFF`.
 
-## Bestaande runtime
+## Bestaande runtime (Fase 9D)
 
-De daadwerkelijke TNFS-client (`sidetnfs_probe.c`) gebruikt deze fase nog
-steeds zijn eigen hardcoded waarden — **niet** de RAM- of flash-drivelijst:
+De daadwerkelijke TNFS-client (`sidetnfs_probe.c`) gebruikt niet langer
+hardcoded compile-time constanten. Bij boot roept `main.c` (na
+`sidetnfs_config_init()`, vóór `init_gemdrvemul()`) éénmalig
+`sidetnfs_probe_load_active_server()` aan: deze doorloopt de RAM-drivelijst
+(index 0..`SIDETNFS_MAX_DRIVES-1`) en neemt de **eerste** `used`-record met
+`type == SIDETNFS_DRIVE_TNFS` én `transport == SIDETNFS_TRANSPORT_UDP` over
+als actieve server (`host`, `port`, `mount_path`, `drive_letter`). TCP-drives
+worden overgeslagen (TCP blijft expliciet niet-ondersteund) — het scannen
+gaat door naar de volgende gebruikte drive. Bij lege/ongeldige config of
+alleen SD/TCP-drives blijft de actieve server "niet geconfigureerd": elke
+netwerkaanroep in `sidetnfs_probe.c` heeft al een bestaande
+`if (!ipaddr_aton(...))`-controle die dan gewoon zijn bestaande, veilige
+faalpad neemt (`ipaddr_aton("")` faalt altijd) — geen extra guards nodig,
+GEMDRIVE blijft zonder WiFi/netwerk volledig responsief (zelfde gedrag als
+`sidetnfs_mark_network_skipped()`).
 
-```
-N:
-192.168.178.10
-UDP 16384
-Atari.ST
-```
+De GEMDRIVE-driveletter komt sindsdien ook uit deze actieve server
+(`sidetnfs_probe_get_active_drive_letter()`) in plaats van uitsluitend uit
+`PARAM_GEMDRIVE_DRIVE` (`gemdrvemul.c`, `init_gemdrvemul()`) — met
+`PARAM_GEMDRIVE_DRIVE`/`'C'` als terugval wanneer geen bruikbare TNFS/UDP-
+drive gevonden is.
 
-Deze fase voegt geen multi-drivegedrag toe en wijzigt geen open handles,
-DTA's, TNFS-sessies of `hd_folder`. Het laten meewegen van de opgeslagen
-lijst door de daadwerkelijke runtime (en het daadwerkelijk activeren van
-meerdere drives) is toekomstig werk, ná een reboot met de nieuwe flash-
-inhoud.
+Deze fase voegt geen multi-drivegedrag toe (nog steeds maar één actieve
+TNFS-drive) en wijzigt geen open handles, DTA's, TNFS-sessies of
+`hd_folder` tijdens een lopende sessie — een wijziging via `SIDETNFS.PRG`
+(`SET_DRIVE`/`SAVE_CONFIG`) wordt pas bij de eerstvolgende boot opgepikt,
+omdat `sidetnfs_probe_load_active_server()` alleen bij boot draait.
+`SIDETNFS_ENABLE_SD_SUPPORT` blijft een onafhankelijke compile-time schakelaar
+(SD/FatFS-toegang voor WiFi-wachtwoord/DEBUG.TXT), losstaand van deze
+TNFS-serverkeuze.

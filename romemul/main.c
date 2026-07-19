@@ -12,6 +12,7 @@
 #include "include/rtcemul.h"
 #include "include/gemdrvemul.h"
 #include "include/sidetnfs_config.h"
+#include "include/sidetnfs_probe.h"
 
 int main()
 {
@@ -212,11 +213,27 @@ int main()
         // The "H" character stands for "HARDISK"
         blink_morse('H');
 
-        // Fase 9B2: load/validate the standalone SideTNFS server-list flash
-        // config exactly once, before GEMDRIVE can process
-        // GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO/GET_SERVER. Read-only this
-        // phase -- never writes to flash.
+        // Fase 9C: load/validate the persistent SideTNFS drive-list flash
+        // config exactly once, before GEMDRIVE can process any of the
+        // GEMDRVEMUL_SIDETNFS_* configuration commands. Read-only here --
+        // only SAVE_CONFIG (via SIDETNFS.PRG) ever writes to flash.
         sidetnfs_config_init();
+
+        // Fase 9D: pick the first usable (used, TNFS, UDP) drive from that
+        // same config as the active server for the real TNFS connection,
+        // replacing the old hardcoded IP/port/mount-name constants in
+        // sidetnfs_probe.c. Must run after sidetnfs_config_init() and
+        // before init_gemdrvemul() (which is where the drive letter is
+        // decided and where the actual mount probe eventually fires). If
+        // no usable drive is found -- missing/invalid config, only SD
+        // drives, or only TCP-configured TNFS drives (TCP stays
+        // unsupported) -- this leaves the active server "not configured"
+        // and GEMDRIVE still boots normally, falling back to its existing
+        // no-network behavior (see sidetnfs_mark_network_skipped()).
+        // (Briefly rolled back and re-confirmed: a stale/incorrect IP in
+        // the saved flash config, not this wiring, caused the earlier
+        // NO_NETW.TXT symptom -- fixed by re-saving the config.)
+        sidetnfs_probe_load_active_server();
 
         init_gemdrvemul(safe_config_reboot);
 

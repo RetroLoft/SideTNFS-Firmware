@@ -164,9 +164,25 @@ sidetnfs_config_status_t sidetnfs_config_set_config_drive_letter(uint8_t new_let
 // success. Returns FLASH_WRITE_FAILED if the readback magic/version don't
 // match, CRC_MISMATCH if the CRC doesn't match, or the validation failure
 // code if validation itself failed (nothing is erased/programmed in that
-// case). Never retries and never reboots. Does NOT change the currently
-// active TNFS session/hd_folder/open handles/DTAs -- a reboot is required
-// before any future runtime code uses the saved list.
+// case). Never retries and never reboots. On success, also marks the
+// config "pending" (see sidetnfs_config_is_pending() below) -- writing
+// flash alone never changes the currently active TNFS session/drive
+// letter/open handles/DTAs; a reboot is required for that, and an Atari
+// RESET does not reboot the Pico (see report, Fase 9E).
 sidetnfs_config_status_t sidetnfs_config_save(void);
+
+// Fase 9E: true from the moment a SAVE_CONFIG succeeds until the newly
+// saved configuration has actually been adopted by the running GEMDRIVE
+// session (see sidetnfs_probe_reinit_active_server() in sidetnfs_probe.c,
+// invoked from the proven Atari-reset boundary in gemdrvemul.c --
+// GEMDRVEMUL_PING, but only the first one after the very first PING this
+// Pico boot). Always false before the first SAVE_CONFIG this boot.
+bool sidetnfs_config_is_pending(void);
+
+// Fase 9E: clear the pending flag. Must only be called once the new
+// configuration has been safely read back into the active server/drive
+// state -- never on a failed or skipped reinit attempt, so a later Atari
+// reset still retries.
+void sidetnfs_config_clear_pending(void);
 
 #endif // SIDETNFS_CONFIG_H

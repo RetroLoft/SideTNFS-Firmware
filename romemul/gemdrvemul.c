@@ -786,21 +786,40 @@ static void __not_in_flash_func(delete_all_files)(FileDescriptors **head)
     }
 }
 
-// Close all the open files, if any
+// Close all the open files, if any. Fase 9E: was unconditionally
+// f_close(&current->fobject) for every entry -- harmless only because this
+// was previously called solely at the very first PING this Pico boot
+// (hd_folder_ready == false), when fdescriptors is always still empty
+// under the TNFS backend (every entry added there is
+// GEMDRIVE_FILE_BACKEND_TNFS -- see gemdrive_backend_fclose(), whose
+// fobject is never populated by a real f_open()). Now also called from
+// sidetnfs_probe_reinit_active_server()'s Atari-reset boundary, where TNFS
+// files legitimately can be open, so each entry is closed via the correct
+// backend -- same distinction gemdrive_backend_fclose() already makes.
 static void __not_in_flash_func(close_all_files)(FileDescriptors **head)
 {
     FileDescriptors *current = *head;
     while (current != NULL)
     {
         FileDescriptors *next = current->next;
-        FRESULT fr = f_close(&current->fobject);
-        if (fr != FR_OK)
+#if SIDETNFS_USE_TNFS_LISTING
+        if (current->backend == GEMDRIVE_FILE_BACKEND_TNFS)
         {
-            DPRINTF("ERROR: Could not close file (%d)\r\n", fr);
+            sidetnfs_tnfs_file_close(current->fd, current->tnfs_handle);
+            DPRINTF("TNFS file %s closed\n", current->fpath);
         }
         else
+#endif
         {
-            DPRINTF("File %s closed successfully\n", current->fpath);
+            FRESULT fr = f_close(&current->fobject);
+            if (fr != FR_OK)
+            {
+                DPRINTF("ERROR: Could not close file (%d)\r\n", fr);
+            }
+            else
+            {
+                DPRINTF("File %s closed successfully\n", current->fpath);
+            }
         }
         current = next;
     }
@@ -1715,6 +1734,26 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 #endif
 }
 
+// Fase 9D/9E: single shared drive-letter selection, used both at Pico cold
+// boot (init_gemdrvemul()'s startup, below) and at the Atari-reset
+// boundary (GEMDRVEMUL_PING's reinit branch, below) -- deliberately one
+// implementation, not two, per the report's requirement. Prefers the
+// active TNFS drive's own letter (sidetnfs_probe_has_active_server(),
+// reflecting whatever sidetnfs_probe_load_active_server() most recently
+// loaded from the persistent config); falls back to the legacy
+// PARAM_GEMDRIVE_DRIVE config-store entry (default 'C') when no usable
+// TNFS/UDP drive is configured -- missing/invalid config must never leave
+// GEMDRIVE without a drive letter to boot with.
+static char select_gemdrive_drive_letter(void)
+{
+    if (sidetnfs_probe_has_active_server())
+    {
+        return sidetnfs_probe_get_active_drive_letter();
+    }
+    ConfigEntry *drive_letter_conf = find_entry(PARAM_GEMDRIVE_DRIVE);
+    return (drive_letter_conf != NULL) ? drive_letter_conf->value[0] : 'C';
+}
+
 void init_gemdrvemul(bool safe_config_reboot)
 {
     FRESULT fr; /* FatFs function common result code */
@@ -1784,12 +1823,9 @@ void init_gemdrvemul(bool safe_config_reboot)
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_TIMEOUT_SEC, gemdrive_timeout_sec);
     DPRINTF("Timeout in seconds: %d\n", gemdrive_timeout_sec);
 
-    ConfigEntry *drive_letter_conf = find_entry(PARAM_GEMDRIVE_DRIVE);
-    char drive_letter = 'C';
-    if (drive_letter_conf != NULL)
-    {
-        drive_letter = drive_letter_conf->value[0];
-    }
+    // Fase 9D/9E: see select_gemdrive_drive_letter() above -- the one
+    // shared implementation, also used by GEMDRVEMUL_PING's reinit branch.
+    char drive_letter = select_gemdrive_drive_letter();
     uint32_t drive_letter_num = (uint8_t)toupper(drive_letter);
     uint32_t drive_number = drive_letter_num - 65; // Convert the drive letter to a number. Add 1 because 0 is the current drive
 
@@ -2345,6 +2381,55 @@ void init_gemdrvemul(bool safe_config_reboot)
                     }
                 }
 #endif
+            }
+            else if (sidetnfs_config_is_pending())
+            {
+                // Fase 9E: a SAVE_CONFIG happened since this GEMDRIVE
+                // runtime was last activated (Pico cold boot, or a
+                // previous reinit). hd_folder_ready is already true, so
+                // the first-PING block above never runs again -- this is
+                // the first PING of a NEW Atari boot/reset, the proven
+                // moment to safely adopt the newly saved drive-list config
+                // (see report: CMD_PING is sent once per Atari reset,
+                // always before the GEMDOS/GEMDRIVE driver installs its
+                // trap -- sidecart-gemdrive-atari/src/gemdrive.s,
+                // test_ping/_ping_ready before save_vectors -- and never
+                // again during normal use). Backend-agnostic: harmless
+                // no-op for the TNFS-specific parts under the SD-only
+                // backend, since no TNFS session/handles would exist there.
+                close_all_files(&fdescriptors);
+                cleanDTAHashTable();
+                delete_all_files(&fdescriptors);
+                DPRINTF("Fase 9E reinit -- DTA table elements: %d\n", countDTA());
+                DPRINTF("Fase 9E reinit -- File descriptors: %d\n", count_fdesc(fdescriptors));
+                dpath_string[0] = '\\'; // Set the root folder as default
+                dpath_string[1] = '\0';
+
+                // Closes old TNFS directory handles/fake-search state,
+                // resets mount/session identity, reloads the persistent
+                // config, and (re)selects the active server -- same init
+                // path as Pico cold boot, never blocks.
+                sidetnfs_probe_reinit_active_server(sidetnfs_network_ok);
+
+                // Fase 9D/9E: select_gemdrive_drive_letter() above -- the
+                // one shared implementation, using the freshly reloaded
+                // active server. The Atari driver reads
+                // SHARED_VARIABLE_DRIVE_LETTER right after this PING
+                // succeeds (gemdrive.s), before installing its GEMDOS trap,
+                // so it always picks up whatever is published here.
+                char reinit_drive_letter = select_gemdrive_drive_letter();
+                uint32_t reinit_drive_letter_num = (uint8_t)toupper(reinit_drive_letter);
+                uint32_t reinit_drive_number = reinit_drive_letter_num - 65;
+                set_shared_var(SHARED_VARIABLE_DRIVE_LETTER, reinit_drive_letter_num, memory_shared_address);
+                set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER, reinit_drive_number, memory_shared_address);
+
+                // Only now, after the new config/drive/server have all
+                // been adopted, clear the pending flag -- a later
+                // SAVE_CONFIG sets it again for the next reset. Never
+                // cleared on a path that skipped adoption.
+                sidetnfs_config_clear_pending();
+
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
             }
             DPRINTF("PING received. Answering with: %d\n", *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)));
             write_random_token(memory_shared_address);

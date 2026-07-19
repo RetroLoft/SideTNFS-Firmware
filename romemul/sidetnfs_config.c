@@ -35,6 +35,7 @@ static const sidetnfs_drive_config_t SIDETNFS_DEFAULT_DRIVE = {
 
 static sidetnfs_drive_flash_t g_config;
 static bool g_config_ready = false;
+static bool g_config_pending = false; // Fase 9E: see sidetnfs_config_is_pending()
 
 // Standard bit-by-bit CRC32 (IEEE 802.3 / zlib polynomial 0xEDB88320, init
 // and final XOR 0xFFFFFFFF). Same method as Fase 9B2 -- no table, this only
@@ -480,5 +481,21 @@ sidetnfs_config_status_t sidetnfs_config_save(void)
     // Success -- mirror the exact persisted (clean) image in RAM too.
     g_config = clean;
     g_config_ready = true;
+    // Fase 9E: flash now holds the new config, but the active TNFS
+    // session/drive letter do not change here -- only the proven
+    // Atari-reset boundary (sidetnfs_probe_reinit_active_server(), driven
+    // from GEMDRVEMUL_PING in gemdrvemul.c) may clear this flag, once it
+    // has actually adopted the new config.
+    g_config_pending = true;
     return SIDETNFS_CONFIG_STATUS_OK;
+}
+
+bool sidetnfs_config_is_pending(void)
+{
+    return g_config_pending;
+}
+
+void sidetnfs_config_clear_pending(void)
+{
+    g_config_pending = false;
 }

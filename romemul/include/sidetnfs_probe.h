@@ -227,6 +227,55 @@
 // its code are gone; a repeated Fsfirst for the same ndta now always starts
 // fresh, same as the SD/FatFS backend.
 
+// Fase 9D: load the first usable (used, TNFS, UDP) drive from the
+// persistent sidetnfs_config drive-list (sidetnfs_config_init() must
+// already have run this boot) into this module's "active server" state,
+// replacing the old hardcoded SIDETNFS_SERVER_IP/PORT/MOUNT_NAME
+// constants. Must be called exactly once at boot, before any other
+// function in this file that touches the network -- in practice, before
+// sidetnfs_udp_connect_test() is first called from init_gemdrvemul().
+// Pure RAM lookup: never touches WiFi/cyw43, never blocks. A TNFS drive
+// whose transport is TCP is skipped (TCP stays explicitly unsupported
+// this phase) -- scanning continues to the next drive. If no usable
+// drive is found at all (missing/invalid config, only SD drives, or only
+// TCP-configured TNFS drives), the active-server state stays "not
+// configured": every network-touching function below already has an
+// existing "if (!ipaddr_aton(...)) { <graceful bail> }" check (there to
+// handle a theoretical bad address, though the old hardcoded literal
+// never actually exercised it) -- an empty host string makes every one of
+// those checks take its already-safe failure path, so GEMDRIVE stays
+// fully responsive with no blocking and no crash, falling back to the
+// same no-network behavior as sidetnfs_mark_network_skipped().
+void sidetnfs_probe_load_active_server(void);
+
+// True if sidetnfs_probe_load_active_server() found and loaded a usable
+// TNFS/UDP drive. False before that call, or if none was found.
+bool sidetnfs_probe_has_active_server(void);
+
+// The drive letter (uppercase ASCII) of the active TNFS drive loaded by
+// sidetnfs_probe_load_active_server(). Only meaningful when
+// sidetnfs_probe_has_active_server() is true; returns '\0' otherwise.
+char sidetnfs_probe_get_active_drive_letter(void);
+
+// Fase 9E: re-activate the SideTNFS drive-list config at the proven
+// Atari-reset boundary (GEMDRVEMUL_PING in gemdrvemul.c, guarded by
+// sidetnfs_config_is_pending()) -- closes the old TNFS directory search
+// state (both the DTA registry and the offline fallback table), resets
+// mount/session identity (never the DEBUG.TXT counters), reloads the
+// persistent config and active server/drive letter from it
+// (sidetnfs_config_init() + sidetnfs_probe_load_active_server(), the same
+// calls used at Pico cold boot -- one shared init path), then -- only if
+// wifi_connected -- fires the same non-blocking mount probe used at cold
+// boot. Never blocks: a failed/missing new mount just leaves
+// sidetnfs_tnfs_listing_ready() false, same as any other offline boot.
+void sidetnfs_probe_reinit_active_server(bool wifi_connected);
+
+// Fase 9E: bulk-release every active TNFS DTA-registry search slot (each
+// with a real CLOSEDIR, same as releaseTnfsDTA() does for one slot) --
+// used by sidetnfs_probe_reinit_active_server() so no directory handle
+// from the OLD server/session is left open across an Atari reset.
+void sidetnfs_tnfs_dta_release_all(void);
+
 // Fase 5B: create a UDP PCB and udp_connect() it to the TNFS server, then
 // immediately remove it again. Sends no payload at all -- udp_connect() is a
 // local lwIP operation (sets the PCB's remote ip/port filter) and does not
@@ -711,6 +760,11 @@ bool sidetnfs_fake_search_is_active(uint32_t ndta);
 // Fase 5O: explicitly close the active fake no-network search for ndta, if
 // it is the one currently active (no-op otherwise).
 void sidetnfs_fake_search_close(uint32_t ndta);
+
+// Fase 9E: clear every active fake (no-network) directory search slot.
+// Pure RAM, no network -- companion to sidetnfs_tnfs_dta_release_all(),
+// used by sidetnfs_probe_reinit_active_server().
+void sidetnfs_fake_search_close_all(void);
 
 // Fase 5Z: number of currently-active fake no-network searches -- see
 // sidetnfs_tnfs_dta_count_active() above.

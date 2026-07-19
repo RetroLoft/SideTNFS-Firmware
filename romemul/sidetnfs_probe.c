@@ -19,10 +19,79 @@
 #include "include/filesys.h"  // FS_ST_* Atari attribute bits
 #include "include/commands.h" // GEMDRVEMUL_*_CALL ids -- for COMMAND_ENTER name decode only
 #include "include/rtcemul.h"  // Fase 7M: get_utc_offset_seconds() -- same local-time policy as NTP->RTC
+#include "include/sidetnfs_config.h" // Fase 9D: sidetnfs_config_get_drive() -- source of the active server
 
-#define SIDETNFS_SERVER_IP "192.168.178.10"
-#define SIDETNFS_SERVER_PORT 16384
-#define SIDETNFS_MOUNT_NAME "Atari.ST"
+// Fase 9D: these used to be hardcoded compile-time constants. They are now
+// runtime state, loaded once at boot from the first usable (used, TNFS,
+// UDP) drive in the persistent sidetnfs_config drive-list (Fase 9C) by
+// sidetnfs_probe_load_active_server(). A brief rollback to hardcoded
+// defaults confirmed the wiring itself was correct -- the earlier
+// NO_NETW.TXT symptom traced to a stale/incorrect IP left over in the
+// saved flash config from an earlier bug, not to this code. Re-enabled
+// once the user corrected and re-saved the config. s_active_host defaults
+// to an empty string deliberately: every network-touching function below
+// already has an existing "if (!ipaddr_aton(...)) { <graceful bail> }"
+// check (needed in theory even when the old literal was hardcoded, though
+// that branch was then unreachable) -- ipaddr_aton("") reliably fails, so
+// with no active server configured every one of those existing checks
+// takes its already-safe failure path, with no extra guards needed
+// anywhere else in this file.
+static char s_active_host[SIDETNFS_HOST_LEN] = "";
+static uint16_t s_active_port = 0;
+static char s_active_mount_path[SIDETNFS_MOUNTPATH_LEN] = "";
+static char s_active_drive_letter = '\0';
+static bool s_active_server_configured = false;
+
+void sidetnfs_probe_load_active_server(void)
+{
+    uint8_t i;
+
+    s_active_server_configured = false;
+    s_active_host[0] = '\0';
+    s_active_port = 0;
+    s_active_mount_path[0] = '\0';
+    s_active_drive_letter = '\0';
+
+    for (i = 0; i < SIDETNFS_MAX_DRIVES; i++)
+    {
+        sidetnfs_drive_config_t drive;
+        sidetnfs_config_status_t status = sidetnfs_config_get_drive(i, &drive);
+
+        if (status != SIDETNFS_CONFIG_STATUS_OK)
+        {
+            continue;
+        }
+        if (drive.type != SIDETNFS_DRIVE_TNFS)
+        {
+            continue;
+        }
+        if (drive.transport != SIDETNFS_TRANSPORT_UDP)
+        {
+            // TCP stays explicitly unsupported this phase -- keep
+            // scanning for the next usable drive rather than adopting it.
+            continue;
+        }
+
+        strncpy(s_active_host, drive.host, SIDETNFS_HOST_LEN - 1);
+        s_active_host[SIDETNFS_HOST_LEN - 1] = '\0';
+        s_active_port = drive.port;
+        strncpy(s_active_mount_path, drive.mount_path, SIDETNFS_MOUNTPATH_LEN - 1);
+        s_active_mount_path[SIDETNFS_MOUNTPATH_LEN - 1] = '\0';
+        s_active_drive_letter = (char)drive.drive_letter;
+        s_active_server_configured = true;
+        break;
+    }
+}
+
+bool sidetnfs_probe_has_active_server(void)
+{
+    return s_active_server_configured;
+}
+
+char sidetnfs_probe_get_active_drive_letter(void)
+{
+    return s_active_drive_letter;
+}
 
 // Fase 7F-debugfix: either focus mode suppresses the same per-entry
 // directory-listing detail events (see the SIDETNFS_DEBUG_FOCUS_FSEEK
@@ -1376,18 +1445,19 @@ typedef struct
 
 static SidetnfsFsListingResponse s_fslisting_resp = {0};
 
-// The MOUNT PCB is intentionally never removed once created: the udp_recv()
-// callback must still be able to fire whenever the server's reply happens
-// to arrive (for MOUNT, OPENDIRX and READDIRX, all sent over the same PCB),
-// and this probe is a one-shot, once-per-boot action, so leaking a single
-// PCB for the remaining lifetime of the firmware is the smallest safe
-// choice (no risk of removing it out from under an in-flight callback).
+// Fase 9E: this used to be "intentionally never removed once created" --
+// true only while sidetnfs_send_mount_probe() was a genuine one-shot,
+// once-per-Pico-boot action. It can now run again on every Atari reset
+// (see sidetnfs_probe_reinit_active_server()), so sidetnfs_send_mount_probe()
+// itself now removes any existing s_mount_pcb before creating a new one --
+// still never removed from anywhere else, so no risk of removing it out
+// from under an in-flight callback.
 static struct udp_pcb *s_mount_pcb = NULL;
 
 bool sidetnfs_udp_connect_test(void)
 {
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -1401,7 +1471,7 @@ bool sidetnfs_udp_connect_test(void)
         return false;
     }
 
-    bool connected = (udp_connect(pcb, &server_ip, SIDETNFS_SERVER_PORT) == ERR_OK);
+    bool connected = (udp_connect(pcb, &server_ip, s_active_port) == ERR_OK);
 
     udp_remove(pcb);
     cyw43_arch_lwip_end();
@@ -1412,7 +1482,7 @@ bool sidetnfs_udp_connect_test(void)
 void sidetnfs_send_udp_probe(void)
 {
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return;
     }
@@ -1435,7 +1505,7 @@ void sidetnfs_send_udp_probe(void)
     }
 
     memcpy(p->payload, SIDETNFS_PROBE_PAYLOAD, sizeof(SIDETNFS_PROBE_PAYLOAD) - 1);
-    udp_sendto(pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(pcb, p, &server_ip, s_active_port);
 
     pbuf_free(p);
     udp_remove(pcb);
@@ -1443,7 +1513,14 @@ void sidetnfs_send_udp_probe(void)
     cyw43_arch_lwip_end();
 }
 
-// Fase 5K: strict, uppercase-only 8.3 name check -- see sidetnfs_probe.h.
+// Fase 9D-R: strict, uppercase-only 8.3 name check. Investigation traced
+// the missing "Atari.ST" root-listing entry to this lowercase rejection
+// (mixed-case names are silently dropped by sidetnfs_normalize_dir_entry(),
+// out->skipped = true, while an already-uppercase sibling like "DOS"
+// passes) -- confirmed unrelated to directory position, "."/".." handling,
+// or path normalization. Reverted back to rejecting lowercase on request:
+// entries with lowercase letters are intentionally ignored -- rename them
+// uppercase on the TNFS server instead of relaxing this check.
 bool sidetnfs_is_supported_83_name(const char *name)
 {
     if (name == NULL || name[0] == '\0')
@@ -1480,7 +1557,7 @@ bool sidetnfs_is_supported_83_name(const char *name)
         }
         if (c >= 'a' && c <= 'z')
         {
-            return false; // lowercase unsupported for now -- see report
+            return false; // lowercase unsupported -- entries must be renamed uppercase on the server
         }
     }
     if (dot_count > 1)
@@ -1817,10 +1894,38 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 }
 
 // Fase 5C/5F: send a single TNFS MOUNT request and register a receive
+// Fase 9D-R: canonical TNFS mount-path join. The task's own tie-break rule
+// (prefer an empty internal root representation unless the TNFS client
+// demonstrably requires "/") resolves to "/": AtariConfig's own UI already
+// rejects an empty mount_path on save (buf_nonempty() check), so the
+// client demonstrably requires a non-empty value -- "/" is therefore the
+// one canonical representation, never "". Always emits exactly one
+// leading '/' followed by mount_path with any redundant leading slash(es)
+// stripped first, so "", "/", "Atari.ST" and "/Atari.ST" all produce
+// well-formed wire paths and neither "" nor "/Atari.ST" ever becomes the
+// double-slash "//Atari.ST" that mount_path == "/Atari.ST" used to send
+// (the old code unconditionally prepended '/' in front of whatever
+// mount_path already contained).
+static void build_canonical_mount_path(const char *mount_path, char *out, size_t out_size)
+{
+    const char *p = (mount_path != NULL) ? mount_path : "";
+    while (*p == '/')
+    {
+        p++;
+    }
+    snprintf(out, out_size, "/%s", p);
+}
+
 // callback for the (optional, asynchronous) reply. Fire-and-forget from the
 // caller's point of view -- this function never waits, never retries, never
 // logs, and always returns immediately regardless of whether a reply ever
 // arrives. Must only be called after WiFi is confirmed connected.
+//
+// Fase 9E: this can now be called more than once per Pico boot (once per
+// Atari reset, via sidetnfs_probe_reinit_active_server() below) -- the old
+// s_mount_pcb, if any, is removed first so repeated resets never leak a
+// PCB (the original one-PCB-for-the-firmware's-lifetime comment on
+// s_mount_pcb above only held while this was truly a once-per-boot call).
 void sidetnfs_send_mount_probe(void)
 {
     // Mark as attempted regardless of what happens below -- this is a
@@ -1829,12 +1934,18 @@ void sidetnfs_send_mount_probe(void)
     s_state.debug_dirty = true;
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return;
     }
 
     cyw43_arch_lwip_begin();
+
+    if (s_mount_pcb != NULL)
+    {
+        udp_remove(s_mount_pcb);
+        s_mount_pcb = NULL;
+    }
 
     struct udp_pcb *pcb = udp_new();
     if (!pcb)
@@ -1848,18 +1959,21 @@ void sidetnfs_send_mount_probe(void)
     udp_recv(pcb, tnfs_recv_callback, NULL);
 
     // Header: session=0x0000 (new session), seq=0x00, cmd=TNFS_CMD_MOUNT.
-    // Payload: proto version (minor, major) + null-terminated mount path
-    // "/Atari.ST" + empty user + empty password.
-    uint8_t buf[6 + 1 + sizeof(SIDETNFS_MOUNT_NAME) + 2];
+    // Payload: proto version (minor, major) + null-terminated canonical
+    // mount path (see build_canonical_mount_path()) + empty user + empty
+    // password.
+    char canonical_mount_path[SIDETNFS_MOUNTPATH_LEN + 1]; // +1 for the always-present leading '/'
+    build_canonical_mount_path(s_active_mount_path, canonical_mount_path, sizeof(canonical_mount_path));
+    size_t mount_path_len = strlen(canonical_mount_path) + 1; // includes '\0'
+    uint8_t buf[6 + SIDETNFS_MOUNTPATH_LEN + 1 + 2];
     buf[0] = 0x00;
     buf[1] = 0x00;
     buf[2] = 0x00; // seq 0 for MOUNT
     buf[3] = TNFS_CMD_MOUNT;
     buf[4] = TNFS_PROTO_VER_MINOR;
     buf[5] = TNFS_PROTO_VER_MAJOR;
-    buf[6] = '/';
-    memcpy(&buf[7], SIDETNFS_MOUNT_NAME, sizeof(SIDETNFS_MOUNT_NAME)); // includes '\0'
-    size_t offset = 7 + sizeof(SIDETNFS_MOUNT_NAME);
+    memcpy(&buf[6], canonical_mount_path, mount_path_len); // includes leading '/' and '\0'
+    size_t offset = 6 + mount_path_len;
     buf[offset++] = '\0'; // user: anonymous
     buf[offset++] = '\0'; // password: none
 
@@ -1872,7 +1986,7 @@ void sidetnfs_send_mount_probe(void)
     }
 
     memcpy(p->payload, buf, offset);
-    udp_sendto(pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
 
     // Keep the PCB alive (see s_mount_pcb comment above) so the callback
@@ -1896,7 +2010,7 @@ static void send_opendirx_probe(void)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return;
     }
@@ -1929,7 +2043,7 @@ static void send_opendirx_probe(void)
     }
 
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_mount_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_mount_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
 
     cyw43_arch_lwip_end();
@@ -1952,7 +2066,7 @@ static void send_readdirx_probe(void)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return;
     }
@@ -1977,7 +2091,7 @@ static void send_readdirx_probe(void)
     }
 
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_mount_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_mount_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
 
     cyw43_arch_lwip_end();
@@ -2472,7 +2586,7 @@ static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2504,7 +2618,7 @@ static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2521,7 +2635,7 @@ static bool fslisting_send_readdirx(uint8_t dir_handle, uint8_t max_entries, uin
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2544,7 +2658,7 @@ static bool fslisting_send_readdirx(uint8_t dir_handle, uint8_t max_entries, uin
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2561,7 +2675,7 @@ static bool fslisting_send_closedir(uint8_t dir_handle, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2583,7 +2697,7 @@ static bool fslisting_send_closedir(uint8_t dir_handle, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2603,7 +2717,7 @@ static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t 
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2633,7 +2747,7 @@ static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t 
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2650,7 +2764,7 @@ static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2676,7 +2790,7 @@ static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2692,7 +2806,7 @@ static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2718,7 +2832,7 @@ static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2742,7 +2856,7 @@ static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2768,7 +2882,7 @@ static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(mkdir_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, mkdir_p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, mkdir_p, &server_ip, s_active_port);
     pbuf_free(mkdir_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2785,7 +2899,7 @@ static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2811,7 +2925,7 @@ static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(rmdir_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, rmdir_p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, rmdir_p, &server_ip, s_active_port);
     pbuf_free(rmdir_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2827,7 +2941,7 @@ static bool fslisting_send_rename(const char *old_path, const char *new_path, ui
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2857,7 +2971,7 @@ static bool fslisting_send_rename(const char *old_path, const char *new_path, ui
         return false;
     }
     memcpy(rename_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, rename_p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, rename_p, &server_ip, s_active_port);
     pbuf_free(rename_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2874,7 +2988,7 @@ static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2898,7 +3012,7 @@ static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2921,7 +3035,7 @@ static bool fslisting_send_write(uint8_t tnfs_handle, const uint8_t *data, uint1
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2949,7 +3063,7 @@ static bool fslisting_send_write(uint8_t tnfs_handle, const uint8_t *data, uint1
     {
         memcpy((uint8_t *)p->payload + sizeof(header), data, size);
     }
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2966,7 +3080,7 @@ static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -2988,7 +3102,7 @@ static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3006,7 +3120,7 @@ static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t pos
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(SIDETNFS_SERVER_IP, &server_ip))
+    if (!ipaddr_aton(s_active_host, &server_ip))
     {
         return false;
     }
@@ -3034,7 +3148,7 @@ static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t pos
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, SIDETNFS_SERVER_PORT);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3204,6 +3318,22 @@ static void releaseTnfsDTA(uint32_t ndta)
         }
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_DTA_RELEASE, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
         slot->active = false;
+    }
+}
+
+// Fase 9E: bulk-release every active TNFS DTA-registry search slot (each
+// with a real CLOSEDIR via releaseTnfsDTA(), same as a single-slot
+// release) -- used by sidetnfs_probe_reinit_active_server() so no
+// directory handle from the OLD server/session is left open when a newly
+// saved config is adopted after an Atari reset.
+void sidetnfs_tnfs_dta_release_all(void)
+{
+    for (int i = 0; i < (int)SIDETNFS_TNFS_DTA_SLOTS; i++)
+    {
+        if (s_tnfs_dta_searches[i].active)
+        {
+            releaseTnfsDTA(s_tnfs_dta_searches[i].ndta);
+        }
     }
 }
 
@@ -4624,6 +4754,18 @@ void sidetnfs_fake_search_close(uint32_t ndta)
     }
 }
 
+// Fase 9E: clear every active fake (no-network) directory search slot.
+// Pure RAM, no network -- companion to sidetnfs_tnfs_dta_release_all()
+// for the offline/no-network fallback listing path, used by
+// sidetnfs_probe_reinit_active_server().
+void sidetnfs_fake_search_close_all(void)
+{
+    for (unsigned i = 0; i < SIDETNFS_SEARCH_SLOTS; i++)
+    {
+        s_fake_searches[i].active = false;
+    }
+}
+
 uint16_t sidetnfs_fake_search_count_active(void)
 {
     uint16_t count = 0;
@@ -4635,6 +4777,69 @@ uint16_t sidetnfs_fake_search_count_active(void)
         }
     }
     return count;
+}
+
+// Fase 9E: re-activate the SideTNFS drive-list config at the proven
+// Atari-reset boundary -- see gemdrvemul.c, where this is called from
+// GEMDRVEMUL_PING, but only the first PING after the very first one this
+// Pico boot, and only when sidetnfs_config_is_pending() is true. Never
+// blocks: the new mount probe below is the same fire-and-forget,
+// non-blocking call used at Pico cold boot -- if the new server never
+// responds, sidetnfs_tnfs_listing_ready() simply stays false and GEMDRIVE
+// falls back to the existing no-network (fake NO_NETW.TXT) listing, same
+// as any other offline boot; the command dispatch loop is never held up
+// waiting for a response. Does not touch WiFi/cyw43 itself -- an Atari
+// reset does not affect the Pico's own WiFi/NTP state, so wifi_connected
+// must be supplied by the caller (already known there as
+// sidetnfs_network_ok, determined once at Pico cold boot).
+void sidetnfs_probe_reinit_active_server(bool wifi_connected)
+{
+    // Close every old TNFS directory search (a real CLOSEDIR per open
+    // handle) and clear the offline fallback table -- neither may survive
+    // into the new session.
+    sidetnfs_tnfs_dta_release_all();
+    sidetnfs_fake_search_close_all();
+
+    // Reset mount/session identity only -- never the cumulative DEBUG.TXT
+    // diagnostic counters elsewhere in s_state (those intentionally persist
+    // across a reinit for continuity of the SELECT-button dump).
+    s_state.mount_probe_sent = false;
+    s_state.mount_response_received = false;
+    s_state.sid = 0;
+    s_state.mount_rc = 0;
+    s_state.network_skipped = false;
+    s_state.opendir_sent = false;
+    s_state.opendir_response_received = false;
+    s_state.debug_dirty = true;
+
+    // Reload the persistent config and pick the active server/drive letter
+    // from it, exactly like Pico cold boot (main.c) -- one shared path, no
+    // second implementation.
+    sidetnfs_config_init();
+    sidetnfs_probe_load_active_server();
+
+    if (!wifi_connected)
+    {
+        // No WiFi this boot -- same as the existing offline path; never
+        // attempt a network call with no network.
+        sidetnfs_mark_network_skipped();
+        return;
+    }
+
+    if (!s_active_server_configured)
+    {
+        // No usable TNFS/UDP drive in the (re)loaded config -- nothing to
+        // mount. network_skipped stays false (WiFi IS up), but with no
+        // server to probe, mount_response_received simply stays false, so
+        // sidetnfs_tnfs_listing_ready() stays false too and GEMDRIVE falls
+        // back to the no-network listing -- never blocking.
+        return;
+    }
+
+    // Fire the same non-blocking probe sequence used at Pico cold boot.
+    // Never waits for a response here.
+    sidetnfs_udp_connect_test();
+    sidetnfs_send_mount_probe();
 }
 
 // Fase 5G/5H/5I: build the short status text. No raw dumps by default (see
