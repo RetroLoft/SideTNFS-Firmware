@@ -80,14 +80,50 @@
 #define GEMDRVEMUL_REENTRY_XBIOS_LOCK  (APP_GEMDRVEMUL << 8 | 11)     // Enable reentry XBIOS calls
 #define GEMDRVEMUL_REENTRY_XBIOS_UNLOCK (APP_GEMDRVEMUL << 8 | 12)    // Disable reentry XBIOS calls
 
-// Fase 9B1: SIDETNFS config-protocol probe -- subcommand 0x0D, re-verified free
-// in both this file and the Atari-side sidecart-gemdrive-atari/src/gemdrive.s
-// CMD_* table (highest used code there and here is 0x0C/0x8B; 0x0D-0x18 is
-// free on both sides). No request payload, no SD/WiFi/TNFS/flash access, no
-// handle/session changes -- returns only protocol_version/max_servers/
-// server_count/status. See docs/sidetnfs-config-protocol.md for the full
-// contract.
+// Fase 9B1/9C: SIDETNFS config-protocol probe -- subcommand 0x0D,
+// re-verified free in both this file and the Atari-side
+// sidecart-gemdrive-atari/src/gemdrive.s CMD_* table (highest used code
+// there and here is 0x0C/0x8B; 0x0D-0x18 is free on both sides). No request
+// payload, no SD/WiFi/TNFS/flash access, no handle/session changes --
+// returns protocol_version/max_drives/drive_count/config_drive_letter/
+// status (Fase 9C: protocol version bumped to 2, fields renamed from the
+// Fase 9B2 server-list model -- see docs/sidetnfs-config-protocol.md).
 #define GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x0D) // Get SIDETNFS config-protocol info
+
+// Fase 9C: subcommand 0x0E, same free range as 0x0D above. Replaces the
+// never-committed Fase 9B2 GEMDRVEMUL_SIDETNFS_GET_SERVER (same code
+// point) -- the server-list model is gone, replaced by the drive-list
+// model (romemul/include/sidetnfs_config.h). Request: one uint32_t index
+// (0..SIDETNFS_MAX_DRIVES-1, ordinary drives only -- the config drive has
+// no index, see GET_CONFIG_INFO's config_drive_letter). Response: one
+// read-only drive record plus a status. See
+// docs/sidetnfs-config-protocol.md.
+#define GEMDRVEMUL_SIDETNFS_GET_DRIVE (APP_GEMDRVEMUL << 8 | 0x0E) // Get one SIDETNFS drive record
+
+// Fase 9C: sets/replaces one ordinary drive record in the RAM copy only --
+// no flash write. Request: uint32_t index followed by the same field
+// layout as GET_DRIVE's response (minus status). Response: status only
+// (GEMDRVEMUL_SIDETNFS_DRIVE_STATUS). See docs/sidetnfs-config-protocol.md.
+#define GEMDRVEMUL_SIDETNFS_SET_DRIVE (APP_GEMDRVEMUL << 8 | 0x0F) // Set one SIDETNFS drive record (RAM only)
+
+// Fase 9C: clears one ordinary drive record in the RAM copy only -- no
+// flash write, and can never touch the config drive (it has no index in
+// this array). Request: uint32_t index. Response: status only.
+#define GEMDRVEMUL_SIDETNFS_DELETE_DRIVE (APP_GEMDRVEMUL << 8 | 0x10) // Delete one SIDETNFS drive record (RAM only)
+
+// Fase 9C: changes the config drive letter in the RAM copy only -- no
+// flash write. Request: uint32_t new_config_drive_letter (ASCII code).
+// Response: status only.
+#define GEMDRVEMUL_SIDETNFS_SET_CONFIG_DRIVE (APP_GEMDRVEMUL << 8 | 0x11) // Set the config drive letter (RAM only)
+
+// Fase 9C: validates the full RAM drive list and, only if valid, erases +
+// programs the standalone SIDETNFS_CONFIG_FLASH_OFFSET sector, reads it
+// back via XIP, and verifies magic/version/CRC before reporting success.
+// The only command in this protocol that ever touches flash. Does not
+// change the currently active TNFS session -- a reboot is required before
+// any future runtime code uses the saved list. Request: none. Response:
+// status only.
+#define GEMDRVEMUL_SIDETNFS_SAVE_CONFIG (APP_GEMDRVEMUL << 8 | 0x12) // Persist the RAM drive list to flash
 
 #define GEMDRVEMUL_DGETDRV_CALL (APP_GEMDRVEMUL << 8 | 0x19)   // Show the Dgetdrv call
 #define GEMDRVEMUL_FSETDTA_CALL (APP_GEMDRVEMUL << 8 | 0x1A)   // Show the Fsetdta call

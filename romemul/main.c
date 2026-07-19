@@ -11,6 +11,7 @@
 #include "include/floppyemul.h"
 #include "include/rtcemul.h"
 #include "include/gemdrvemul.h"
+#include "include/sidetnfs_config.h"
 
 int main()
 {
@@ -210,6 +211,12 @@ int main()
 
         // The "H" character stands for "HARDISK"
         blink_morse('H');
+
+        // Fase 9B2: load/validate the standalone SideTNFS server-list flash
+        // config exactly once, before GEMDRIVE can process
+        // GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO/GET_SERVER. Read-only this
+        // phase -- never writes to flash.
+        sidetnfs_config_init();
 
         init_gemdrvemul(safe_config_reboot);
 

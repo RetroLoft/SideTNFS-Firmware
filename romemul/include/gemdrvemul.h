@@ -12,6 +12,7 @@
 #include "debug.h"
 #include "constants.h"
 #include "firmware_gemdrvemul.h"
+#include "sidetnfs_config.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -119,15 +120,48 @@
 // offset in the 64KB ROM3 shared-memory window (offset 0x4398/17304 of
 // 65536 -- ~48KB of headroom remains after this whole block).
 #define GEMDRVEMUL_SIDETNFS_CONFIG (GEMDRVEMUL_EXEC_PD + 256) // exec pd + sizeof(PD) bytes
-#define GEMDRVEMUL_SIDETNFS_CONFIG_VERSION (GEMDRVEMUL_SIDETNFS_CONFIG + 0)             // uint32_t, protocol version
-#define GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS (GEMDRVEMUL_SIDETNFS_CONFIG_VERSION + 4) // uint32_t, max server slots
-#define GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT (GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS + 4) // uint32_t, current server count
-#define GEMDRVEMUL_SIDETNFS_CONFIG_STATUS (GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT + 4) // uint32_t, status code (0 = OK)
 
-// SIDETNFS config-protocol constants (Fase 9B1)
-#define SIDETNFS_CONFIG_PROTOCOL_VERSION 1
-#define SIDETNFS_CONFIG_MAX_SERVERS 8
-#define SIDETNFS_CONFIG_STATUS_OK 0
+// Fase 9C: GET_CONFIG_INFO response block -- protocol version bumped to 2,
+// fields renamed/extended from the never-committed Fase 9B2 server-list
+// model (max_servers/server_count -> max_drives/drive_count, plus the new
+// config_drive_letter field). All five fields are 32-bit swapped longs
+// (WRITE_AND_SWAP_LONGWORD), same proven convention as Fase 9B1/9B2.
+#define GEMDRVEMUL_SIDETNFS_CONFIG_VERSION (GEMDRVEMUL_SIDETNFS_CONFIG + 0)                        // uint32_t, protocol version (2)
+#define GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES (GEMDRVEMUL_SIDETNFS_CONFIG_VERSION + 4)             // uint32_t, SIDETNFS_MAX_DRIVES
+#define GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT (GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES + 4)         // uint32_t, used ordinary-drive count
+#define GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER (GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT + 4)       // uint32_t, config drive letter (ASCII)
+#define GEMDRVEMUL_SIDETNFS_CONFIG_STATUS (GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER + 4)            // uint32_t, status code (0 = OK)
+// Block ends at GEMDRVEMUL_SIDETNFS_CONFIG_STATUS + 4 (20 bytes total).
+
+#define SIDETNFS_CONFIG_PROTOCOL_VERSION 2
+
+// Fase 9C: GET_DRIVE/SET_DRIVE/DELETE_DRIVE/SET_CONFIG_DRIVE/SAVE_CONFIG
+// share this one block, immediately after the 20-byte GET_CONFIG_INFO
+// block above. GEMDRVEMUL_SIDETNFS_DRIVE_STATUS is GET_DRIVE's status
+// field AND the sole response field written by SET_DRIVE/DELETE_DRIVE/
+// SET_CONFIG_DRIVE/SAVE_CONFIG (none of those four ever need the rest of
+// this block at the same time). used/drive_letter/type/transport/port are
+// single 16-bit words (WRITE_WORD, no swap needed -- same convention as
+// e.g. GEMDRVEMUL_REENTRY_TRAP elsewhere in this file); STATUS follows the
+// proven WRITE_AND_SWAP_LONGWORD 32-bit convention. String fields are
+// written byte-by-byte then corrected in place with
+// CHANGE_ENDIANESS_BLOCK16, the same pattern populate_dta() already uses
+// for Pico->Atari string transfer. SET_DRIVE's request payload mirrors
+// this exact field order (minus STATUS), read via payloadPtr the same way
+// GEMDRVEMUL_FOPEN_CALL/DSETPATH_CALL already read string arguments. See
+// docs/sidetnfs-config-protocol.md.
+#define GEMDRVEMUL_SIDETNFS_DRIVE (GEMDRVEMUL_SIDETNFS_CONFIG_STATUS + 4)
+#define GEMDRVEMUL_SIDETNFS_DRIVE_STATUS (GEMDRVEMUL_SIDETNFS_DRIVE + 0)                                // uint32_t, swapped long
+#define GEMDRVEMUL_SIDETNFS_DRIVE_USED (GEMDRVEMUL_SIDETNFS_DRIVE_STATUS + 4)                           // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_DRIVE_LETTER (GEMDRVEMUL_SIDETNFS_DRIVE_USED + 2)                           // uint16_t, plain word (ASCII)
+#define GEMDRVEMUL_SIDETNFS_DRIVE_TYPE (GEMDRVEMUL_SIDETNFS_DRIVE_LETTER + 2)                           // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_DRIVE_TRANSPORT (GEMDRVEMUL_SIDETNFS_DRIVE_TYPE + 2)                        // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_DRIVE_PORT (GEMDRVEMUL_SIDETNFS_DRIVE_TRANSPORT + 2)                        // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_DRIVE_NICKNAME (GEMDRVEMUL_SIDETNFS_DRIVE_PORT + 2)                         // char[SIDETNFS_NICKNAME_LEN]
+#define GEMDRVEMUL_SIDETNFS_DRIVE_HOST (GEMDRVEMUL_SIDETNFS_DRIVE_NICKNAME + SIDETNFS_NICKNAME_LEN)     // char[SIDETNFS_HOST_LEN]
+#define GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH (GEMDRVEMUL_SIDETNFS_DRIVE_HOST + SIDETNFS_HOST_LEN)       // char[SIDETNFS_MOUNTPATH_LEN]
+#define GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH (GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH + SIDETNFS_MOUNTPATH_LEN) // char[SIDETNFS_SDPATH_LEN]
+// Block ends at GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN (198 bytes total).
 
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00

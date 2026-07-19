@@ -2407,19 +2407,147 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO:
         {
-            // Fase 9B1: minimal, read-only probe. No request payload, no
+            // Fase 9C: minimal, read-only probe. No request payload, no
             // SD/FatFS/WiFi/TNFS/flash access, no handle or session
-            // changes -- just four fixed 32-bit fields. See
+            // changes -- five fixed 32-bit fields, protocol version 2. See
             // docs/sidetnfs-config-protocol.md.
-            // Fase 9B1-fix: longs must go through WRITE_AND_SWAP_LONGWORD
-            // (memfunc.h), same as GEMDRVEMUL_DFREE_STRUCT -- a plain
-            // *(volatile uint32_t*)= leaves the two 16-bit halves in
-            // RP2040-native order, which the 68000's move.l reads as a
-            // word-swapped value (1 read back as 0x00010000).
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_VERSION, SIDETNFS_CONFIG_PROTOCOL_VERSION);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS, SIDETNFS_CONFIG_MAX_SERVERS);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT, 0);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES, sidetnfs_config_get_max_drives());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT, sidetnfs_config_get_drive_count());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER, sidetnfs_config_get_config_drive_letter());
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_STATUS, SIDETNFS_CONFIG_STATUS_OK);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_GET_DRIVE:
+        {
+            // Fase 9C: read-only lookup of one ordinary drive record from
+            // the RAM drive list. No SD/WiFi/TNFS/flash access, no
+            // handle/session changes. Request: one uint32_t index (same
+            // d3-register convention as GEMDRVEMUL_DFREE_CALL/
+            // shared-variable reads above). See
+            // docs/sidetnfs-config-protocol.md for the exact wire layout.
+            uint32_t drive_index = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            sidetnfs_drive_config_t drive;
+            sidetnfs_config_status_t result = sidetnfs_config_get_drive((uint8_t)drive_index, &drive);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_USED, (uint16_t)drive.used);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_LETTER, (uint16_t)drive.drive_letter);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_TYPE, (uint16_t)drive.type);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_TRANSPORT, (uint16_t)drive.transport);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_PORT, drive.port);
+
+            // Pico->Atari string transfer: byte-copy + CHANGE_ENDIANESS_BLOCK16
+            // in place -- same pattern populate_dta() uses. Fase 9C-R:
+            // an earlier revision of this code removed the
+            // CHANGE_ENDIANESS_BLOCK16 step based on a host-only
+            // simulation that modeled Atari reads as plain, unmodified
+            // byte fetches of Pico RAM. Hardware testing disproved that:
+            // without the swap, "RetroLoft" came back as "eRtLofo" --
+            // exact pairwise byte swap. The real ROM3 bus evidently
+            // reorders byte-granularity reads of the 16-bit-wide shared
+            // memory (68000 UDS/LDS byte-lane selection against the
+            // RP2040's little-endian storage), which the host simulation
+            // did not model -- WRITE_WORD/WRITE_AND_SWAP_LONGWORD fields
+            // are unaffected because those are single word/long bus
+            // cycles, not sequences of independent byte reads. This swap
+            // is required and must not be removed without a corrected
+            // hardware-validated model. See docs/sidetnfs-config-protocol.md.
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_NICKNAME), drive.nickname, SIDETNFS_NICKNAME_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_NICKNAME, SIDETNFS_NICKNAME_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_HOST), drive.host, SIDETNFS_HOST_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_HOST, SIDETNFS_HOST_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH), drive.mount_path, SIDETNFS_MOUNTPATH_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH, SIDETNFS_MOUNTPATH_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH), drive.sd_path, SIDETNFS_SDPATH_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH, SIDETNFS_SDPATH_LEN);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SET_DRIVE:
+        {
+            // Fase 9C: RAM-only write of one ordinary drive record. No
+            // flash access. Request payload mirrors GET_DRIVE's response
+            // field order (minus status): index, then the same
+            // used/drive_letter/type/transport/port/nickname/host/
+            // mount_path/sd_path fields, read sequentially from
+            // payloadPtr -- the same word-by-word/COPY_AND_CHANGE_ENDIANESS_BLOCK16
+            // convention GEMDRVEMUL_FOPEN_CALL/DSETPATH_CALL already use to
+            // read Atari->Pico string arguments. See
+            // docs/sidetnfs-config-protocol.md.
+            uint32_t drive_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+
+            sidetnfs_drive_config_t drive;
+            memset(&drive, 0, sizeof(drive));
+
+            drive.used = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            drive.drive_letter = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            drive.type = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            drive.transport = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            drive.port = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, drive.nickname, SIDETNFS_NICKNAME_LEN);
+            payloadPtr += SIDETNFS_NICKNAME_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, drive.host, SIDETNFS_HOST_LEN);
+            payloadPtr += SIDETNFS_HOST_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, drive.mount_path, SIDETNFS_MOUNTPATH_LEN);
+            payloadPtr += SIDETNFS_MOUNTPATH_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, drive.sd_path, SIDETNFS_SDPATH_LEN);
+            payloadPtr += SIDETNFS_SDPATH_LEN / 2;
+
+            sidetnfs_config_status_t result = sidetnfs_config_set_drive((uint8_t)drive_index, &drive);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_DELETE_DRIVE:
+        {
+            // Fase 9C: RAM-only clear of one ordinary drive record. Can
+            // never touch the config drive (it has no index in this
+            // array). Request: one uint32_t index. Response: status only.
+            uint32_t drive_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            sidetnfs_config_status_t result = sidetnfs_config_delete_drive((uint8_t)drive_index);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SET_CONFIG_DRIVE:
+        {
+            // Fase 9C: RAM-only change of the config drive letter. No
+            // flash access. Request: one uint32_t ASCII letter. Response:
+            // status only.
+            uint32_t new_letter = GET_PAYLOAD_PARAM32(payloadPtr);
+            sidetnfs_config_status_t result = sidetnfs_config_set_config_drive_letter((uint8_t)new_letter);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SAVE_CONFIG:
+        {
+            // Fase 9C: the only command in this protocol that ever
+            // touches flash. Validates the full RAM drive list, then
+            // erases+programs exactly one 4KB flash sector, reads it back
+            // via XIP, and verifies magic/version/CRC before reporting
+            // success. Does not touch the active TNFS session/hd_folder/
+            // open handles/DTAs -- a reboot is required before any future
+            // runtime code uses the saved list. Request: none. Response:
+            // status only.
+            sidetnfs_config_status_t result = sidetnfs_config_save();
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;

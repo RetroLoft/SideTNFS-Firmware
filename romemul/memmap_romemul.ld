@@ -30,6 +30,13 @@ MEMORY
     CONFIG_FLASH(rwx): ORIGIN = 0x100DE000, LENGTH = 8k
     ROM_FLASH(rwx) : ORIGIN = 0x100E0000, LENGTH = 128k
     ROM_IN_RAM (rwx) : ORIGIN = 0x20020000, LENGTH = 128K
+    /* Fase 9B2: SideTNFS server-list config sector. Immediately follows
+       ROM_FLASH (which ends at exactly this address), matching the same
+       documentation-only reservation style as CONFIG_FLASH/ROM_FLASH above
+       -- none of these three are referenced by any SECTIONS output, they
+       exist here so the address is visible and reserved against accidental
+       reuse. See romemul/include/sidetnfs_config.h. */
+    SIDETNFS_CONFIG_FLASH(rwx) : ORIGIN = 0x10100000, LENGTH = 4k
 }
 
 ENTRY(_entry_point)
