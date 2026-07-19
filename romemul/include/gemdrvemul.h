@@ -108,6 +108,27 @@
 
 #define GEMDRVEMUL_EXEC_PD (GEMDRVEMUL_SHARED_VARIABLES + 256) // shared variables + 256 bytes
 
+// Fase 9B1: start of the SIDETNFS config-protocol response block. Placed
+// right after the PD copy written by GEMDRVEMUL_PEXEC_CALL/SAVE_BASEPAGE
+// (memcpy(pexec_pd, origin, sizeof(PD)) at GEMDRVEMUL_EXEC_PD,
+// sizeof(PD) == 256 bytes -- see struct _pd in this file: p_cmdlin[128] at
+// offset 0x80 is the last member, so the struct ends exactly at 0x100/256).
+// GEMDRVEMUL_EXEC_PD is the last shared-memory offset used anywhere in
+// gemdrvemul.c (verified: no macro or literal offset beyond it is read or
+// written); this is therefore the first provably-free, 4-byte-aligned
+// offset in the 64KB ROM3 shared-memory window (offset 0x4398/17304 of
+// 65536 -- ~48KB of headroom remains after this whole block).
+#define GEMDRVEMUL_SIDETNFS_CONFIG (GEMDRVEMUL_EXEC_PD + 256) // exec pd + sizeof(PD) bytes
+#define GEMDRVEMUL_SIDETNFS_CONFIG_VERSION (GEMDRVEMUL_SIDETNFS_CONFIG + 0)             // uint32_t, protocol version
+#define GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS (GEMDRVEMUL_SIDETNFS_CONFIG_VERSION + 4) // uint32_t, max server slots
+#define GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT (GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS + 4) // uint32_t, current server count
+#define GEMDRVEMUL_SIDETNFS_CONFIG_STATUS (GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT + 4) // uint32_t, status code (0 = OK)
+
+// SIDETNFS config-protocol constants (Fase 9B1)
+#define SIDETNFS_CONFIG_PROTOCOL_VERSION 1
+#define SIDETNFS_CONFIG_MAX_SERVERS 8
+#define SIDETNFS_CONFIG_STATUS_OK 0
+
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00
 #define FATTRIB_SET 0x01

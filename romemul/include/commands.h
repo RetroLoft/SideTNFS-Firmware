@@ -80,6 +80,15 @@
 #define GEMDRVEMUL_REENTRY_XBIOS_LOCK  (APP_GEMDRVEMUL << 8 | 11)     // Enable reentry XBIOS calls
 #define GEMDRVEMUL_REENTRY_XBIOS_UNLOCK (APP_GEMDRVEMUL << 8 | 12)    // Disable reentry XBIOS calls
 
+// Fase 9B1: SIDETNFS config-protocol probe -- subcommand 0x0D, re-verified free
+// in both this file and the Atari-side sidecart-gemdrive-atari/src/gemdrive.s
+// CMD_* table (highest used code there and here is 0x0C/0x8B; 0x0D-0x18 is
+// free on both sides). No request payload, no SD/WiFi/TNFS/flash access, no
+// handle/session changes -- returns only protocol_version/max_servers/
+// server_count/status. See docs/sidetnfs-config-protocol.md for the full
+// contract.
+#define GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x0D) // Get SIDETNFS config-protocol info
+
 #define GEMDRVEMUL_DGETDRV_CALL (APP_GEMDRVEMUL << 8 | 0x19)   // Show the Dgetdrv call
 #define GEMDRVEMUL_FSETDTA_CALL (APP_GEMDRVEMUL << 8 | 0x1A)   // Show the Fsetdta call
 #define GEMDRVEMUL_DFREE_CALL (APP_GEMDRVEMUL << 8 | 0x36)     // Show the Dfree call

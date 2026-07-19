@@ -2405,6 +2405,25 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO:
+        {
+            // Fase 9B1: minimal, read-only probe. No request payload, no
+            // SD/FatFS/WiFi/TNFS/flash access, no handle or session
+            // changes -- just four fixed 32-bit fields. See
+            // docs/sidetnfs-config-protocol.md.
+            // Fase 9B1-fix: longs must go through WRITE_AND_SWAP_LONGWORD
+            // (memfunc.h), same as GEMDRVEMUL_DFREE_STRUCT -- a plain
+            // *(volatile uint32_t*)= leaves the two 16-bit halves in
+            // RP2040-native order, which the 68000's move.l reads as a
+            // word-swapped value (1 read back as 0x00010000).
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_VERSION, SIDETNFS_CONFIG_PROTOCOL_VERSION);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_MAX_SERVERS, SIDETNFS_CONFIG_MAX_SERVERS);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_SERVER_COUNT, 0);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_STATUS, SIDETNFS_CONFIG_STATUS_OK);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
         case GEMDRVEMUL_DFREE_CALL:
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
