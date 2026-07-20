@@ -14,6 +14,7 @@
 #include "firmware_gemdrvemul.h"
 #include "sidetnfs_config.h"
 #include "sidetnfs_netconfig.h"
+#include "sidetnfs_rtcconfig.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -225,6 +226,47 @@ _Static_assert(MAX_PASSWORD_LENGTH % 2 == 0, "MAX_PASSWORD_LENGTH must be even f
 _Static_assert(SIDETNFS_NET_COUNTRY_LEN % 2 == 0, "SIDETNFS_NET_COUNTRY_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(IPV4_ADDRESS_LENGTH % 2 == 0, "IPV4_ADDRESS_LENGTH must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_NETWORK block must fit within the 64KB ROM3 window");
+
+// Fase 12A: GET/SET/SAVE_RTC_CONFIG response/request block ("Set Atari
+// clock using NTP" / NTP server / UTC offset), placed directly after the
+// network block above. GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH
+// (0x4528) is already 4-byte aligned, but this still goes through
+// SIDETNFS_NETWORK_ALIGN4() -- same structural guarantee as the network
+// block, not an assumption. Every field's offset is computed
+// independently, field-by-field -- never a raw struct-cast of
+// sidetnfs_rtc_config_t (see sidetnfs_rtcconfig.h) onto this shared
+// memory. GET writes every field below; SET reads every field except
+// STATUS from payloadPtr in this same order; SAVE reads and writes only
+// STATUS. ENABLED is a plain 16-bit word (WRITE_WORD/GET_PAYLOAD_PARAM16,
+// no swap -- same convention as NETWORK_AUTH_MODE/NETWORK_USE_DHCP); the
+// two string fields use the same byte-copy + CHANGE_ENDIANESS_BLOCK16
+// (Pico->Atari) / COPY_AND_CHANGE_ENDIANESS_BLOCK16 (Atari->Pico)
+// convention the network block already uses.
+#define GEMDRVEMUL_SIDETNFS_RTC SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH)
+#define GEMDRVEMUL_SIDETNFS_RTC_STATUS (GEMDRVEMUL_SIDETNFS_RTC + 0)                          // uint32_t, swapped long
+#define GEMDRVEMUL_SIDETNFS_RTC_ENABLED (GEMDRVEMUL_SIDETNFS_RTC_STATUS + 4)                  // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER (GEMDRVEMUL_SIDETNFS_RTC_ENABLED + 2)              // char[SIDETNFS_RTC_NTP_SERVER_LEN] (64)
+#define GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET (GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER + SIDETNFS_RTC_NTP_SERVER_LEN) // char[SIDETNFS_RTC_UTC_OFFSET_LEN] (4)
+// Block ends at GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET + SIDETNFS_RTC_UTC_OFFSET_LEN (74 bytes total: 4 status + 70 sidetnfs_rtc_config_t).
+
+// Fase 12A: compile-time alignment/bounds guarantees for the RTC block,
+// same shape as the network block's own assertions above. RTC_STATUS
+// must be 4-byte aligned (the only uint32_t WRITE_AND_SWAP_LONGWORD
+// field); RTC_ENABLED must be 2-byte aligned (WRITE_WORD); both string
+// fields' byte lengths must be even, since
+// CHANGE_ENDIANESS_BLOCK16/COPY_AND_CHANGE_ENDIANESS_BLOCK16 process them
+// as whole uint16_t words; the block must fit within the 64KB ROM3
+// window; the SET request payload (everything except STATUS) must be
+// exactly 70 bytes, matching sidetnfs_rtc_config_t exactly (its own
+// _Static_assert in sidetnfs_rtcconfig.h cross-checks the struct side).
+_Static_assert(GEMDRVEMUL_SIDETNFS_RTC_STATUS % 4 == 0, "GEMDRVEMUL_SIDETNFS_RTC_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_SIDETNFS_RTC_ENABLED % 2 == 0, "GEMDRVEMUL_SIDETNFS_RTC_ENABLED must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER % 2 == 0, "GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET % 2 == 0, "GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_RTC_NTP_SERVER_LEN % 2 == 0, "SIDETNFS_RTC_NTP_SERVER_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_RTC_UTC_OFFSET_LEN % 2 == 0, "SIDETNFS_RTC_UTC_OFFSET_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET + SIDETNFS_RTC_UTC_OFFSET_LEN) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_RTC block must fit within the 64KB ROM3 window");
+_Static_assert((2 + SIDETNFS_RTC_NTP_SERVER_LEN + SIDETNFS_RTC_UTC_OFFSET_LEN) == 70, "SET_RTC_CONFIG request payload (enabled + ntp_server + utc_offset) must be exactly 70 bytes");
 
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00

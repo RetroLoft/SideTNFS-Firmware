@@ -2986,6 +2986,75 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_SIDETNFS_GET_RTC_CONFIG:
+        {
+            // Fase 12A: read-only. No request payload, no SD/WiFi/NTP/
+            // flash I/O -- sidetnfs_rtcconfig_get() only ever calls
+            // find_entry(), a pure RAM lookup against the existing
+            // configData. See romemul/include/sidetnfs_rtcconfig.h.
+            sidetnfs_rtc_config_t rtccfg;
+            sidetnfs_rtcconfig_get(&rtccfg);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_RTC_STATUS,
+                                     (uint32_t)SIDETNFS_RTCCONFIG_STATUS_OK);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_RTC_ENABLED, rtccfg.enabled);
+
+            // Pico->Atari string transfer: same hardware-proven byte-copy +
+            // CHANGE_ENDIANESS_BLOCK16 pattern the network block above
+            // uses -- see that block's comment for the full rationale.
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER), rtccfg.ntp_server, SIDETNFS_RTC_NTP_SERVER_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER, SIDETNFS_RTC_NTP_SERVER_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET), rtccfg.utc_offset, SIDETNFS_RTC_UTC_OFFSET_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET, SIDETNFS_RTC_UTC_OFFSET_LEN);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SET_RTC_CONFIG:
+        {
+            // Fase 12A: RAM-only staging write. Request payload mirrors
+            // GET_RTC_CONFIG's response field order (minus STATUS), read
+            // via payloadPtr the same word-by-word/
+            // COPY_AND_CHANGE_ENDIANESS_BLOCK16 convention
+            // SET_NETWORK_CONFIG uses above. Validates first
+            // (sidetnfs_rtcconfig_stage() -> sidetnfs_rtcconfig_validate());
+            // on any failure the previous staging copy is left completely
+            // untouched, and configData/flash/WiFi/NTP are never touched
+            // either way.
+            sidetnfs_rtc_config_t rtccfg;
+            memset(&rtccfg, 0, sizeof(rtccfg));
+
+            rtccfg.enabled = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, rtccfg.ntp_server, SIDETNFS_RTC_NTP_SERVER_LEN);
+            payloadPtr += SIDETNFS_RTC_NTP_SERVER_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, rtccfg.utc_offset, SIDETNFS_RTC_UTC_OFFSET_LEN);
+            payloadPtr += SIDETNFS_RTC_UTC_OFFSET_LEN / 2;
+
+            sidetnfs_rtcconfig_status_t rtcconfig_result = sidetnfs_rtcconfig_stage(&rtccfg);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_RTC_STATUS, (uint32_t)rtcconfig_result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SAVE_RTC_CONFIG:
+        {
+            // Fase 12A: the only command in this block that ever touches
+            // flash. Re-validates the staged copy, updates the three
+            // existing GEMDRIVE_RTC/RTC_NTP_SERVER_HOST/RTC_UTC_OFFSET
+            // configData entries, writes the existing 8KB CONFIG_FLASH
+            // sector (via write_all_entries()), and only reports OK after
+            // an exact three-field XIP readback. Never touches WiFi/NTP
+            // and never reboots -- see sidetnfs_rtcconfig_save(). Request:
+            // none. Response: status only.
+            sidetnfs_rtcconfig_status_t rtcconfig_result = sidetnfs_rtcconfig_save();
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_RTC_STATUS, (uint32_t)rtcconfig_result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
         case GEMDRVEMUL_DFREE_CALL:
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];

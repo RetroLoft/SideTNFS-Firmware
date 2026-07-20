@@ -141,6 +141,19 @@
 #define GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x14)  // Validate + stage a new WiFi/network config (RAM only)
 #define GEMDRVEMUL_SIDETNFS_SAVE_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x15) // Persist the staged WiFi/network config to flash
 
+// Fase 12A: minimal "Set Atari clock using NTP" / NTP server / UTC offset
+// configuration accessible while GEMDRIVE runs. Subcommands 0x16-0x18,
+// re-verified free (highest used low code before this addition was
+// 0x15/SAVE_NETWORK_CONFIG, next used is 0x19/DGETDRV_CALL -- 0x16-0x18
+// free). Reuses the existing GEMDRIVE_RTC/RTC_NTP_SERVER_HOST/
+// RTC_UTC_OFFSET configData entries and the existing 8KB CONFIG_FLASH
+// sector (romemul/config.c) -- no new PARAM_* entry, MAX_ENTRIES
+// unchanged. See romemul/include/sidetnfs_rtcconfig.h for the wire
+// format.
+#define GEMDRVEMUL_SIDETNFS_GET_RTC_CONFIG (APP_GEMDRVEMUL << 8 | 0x16)  // Read the current RTC/NTP config
+#define GEMDRVEMUL_SIDETNFS_SET_RTC_CONFIG (APP_GEMDRVEMUL << 8 | 0x17)  // Validate + stage a new RTC/NTP config (RAM only)
+#define GEMDRVEMUL_SIDETNFS_SAVE_RTC_CONFIG (APP_GEMDRVEMUL << 8 | 0x18) // Persist the staged RTC/NTP config to flash
+
 #define GEMDRVEMUL_DGETDRV_CALL (APP_GEMDRVEMUL << 8 | 0x19)   // Show the Dgetdrv call
 #define GEMDRVEMUL_FSETDTA_CALL (APP_GEMDRVEMUL << 8 | 0x1A)   // Show the Fsetdta call
 #define GEMDRVEMUL_DFREE_CALL (APP_GEMDRVEMUL << 8 | 0x36)     // Show the Dfree call
