@@ -8,6 +8,7 @@
 
 #include "include/gemdrvemul.h"
 #include "include/sidetnfs_probe.h"
+#include "include/sidetnfs_config_drive_backend.h"
 
 // Let's substitute the flags
 static uint16_t active_command_id = 0xFFFF;
@@ -462,6 +463,27 @@ static void __not_in_flash_func(add_tnfs_file)(FileDescriptors **head, FileDescr
     DPRINTF("TNFS file %s added with fd %i, tnfs handle %u, writable %d\n", fpath, new_fd, tnfs_handle, (int)writable);
 }
 
+// Fase 10B: parallel to add_file()/add_tnfs_file() above, for the
+// read-only config-flash drive. Stores a direct pointer into the existing
+// Fase 10A const array -- never a copy -- plus its length; offset starts
+// at 0, exactly like every other backend's freshly opened file.
+static void __not_in_flash_func(add_config_flash_file)(FileDescriptors **head, FileDescriptors *newFDescriptor,
+                                                          const char *fpath, const uint8_t *data, uint32_t size,
+                                                          uint16_t new_fd)
+{
+    memset(newFDescriptor, 0, sizeof(*newFDescriptor));
+    strncpy(newFDescriptor->fpath, fpath, 127);
+    newFDescriptor->fpath[127] = '\0';
+    newFDescriptor->fd = new_fd;
+    newFDescriptor->offset = 0;
+    newFDescriptor->backend = GEMDRIVE_FILE_BACKEND_CONFIG_FLASH;
+    newFDescriptor->config_flash_data = data;
+    newFDescriptor->config_flash_size = size;
+    newFDescriptor->next = *head;
+    *head = newFDescriptor;
+    DPRINTF("Config-flash file %s added with fd %i, size %lu\n", fpath, new_fd, (unsigned long)size);
+}
+
 static void __not_in_flash_func(print_file_descriptors)(FileDescriptors *head)
 {
     FileDescriptors *current = head;
@@ -808,6 +830,15 @@ static void __not_in_flash_func(close_all_files)(FileDescriptors **head)
             sidetnfs_tnfs_file_close(current->fd, current->tnfs_handle);
             DPRINTF("TNFS file %s closed\n", current->fpath);
         }
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+        else if (current->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+        {
+            // Fase 10B: never opened via f_open() -- current->fobject is
+            // never initialized for this backend, so f_close() on it below
+            // would be undefined behavior. Nothing to release.
+            DPRINTF("Config-flash file %s closed (no-op)\n", current->fpath);
+        }
+#endif
         else
 #endif
         {
@@ -994,6 +1025,13 @@ static bool gemdrive_backend_dta_exists(uint32_t ndta)
     sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     bool ndta_exists;
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B2: the config drive has its own, separate search registry
+    // (sidetnfs_config_drive_backend.c) -- never falls through to the TNFS
+    // DTA registry, the fake no-network listing, or the FatFS DTA table,
+    // none of which Fsfirst ever populates in this build.
+    ndta_exists = sidetnfs_config_drive_search_is_active(ndta);
+#else
     // Fase 5Z: DTA_EXIST must recognize TNFS (and fake no-network)
     // search state too -- the 68k side queries this between
     // Fsfirst and Fsnext to decide whether to issue a real Fsnext
@@ -1016,6 +1054,7 @@ static bool gemdrive_backend_dta_exists(uint32_t ndta)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     ndta_exists = lookupDTA(ndta) ? true : false;
     sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_EXIST_FATFS_OK : SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta,
@@ -1033,6 +1072,14 @@ static uint32_t gemdrive_backend_dta_release(uint32_t ndta, uint32_t memory_shar
 {
     uint32_t release_count;
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B2: release only the config drive's own search registry --
+    // never the TNFS DTA registry, the fake no-network listing, or the
+    // FatFS DTA table, none of which Fsfirst ever populates in this build.
+    sidetnfs_config_drive_search_close(ndta);
+    release_count = sidetnfs_config_drive_search_count_active();
+    nullify_dta(memory_shared_address);
+#else
     // Fase 5Z: release whichever backend actually holds ndta's
     // search state -- TNFS DTA registry and/or the fake no-network
     // search table (never the FatFS DTA table, which Fsfirst never
@@ -1052,6 +1099,7 @@ static uint32_t gemdrive_backend_dta_release(uint32_t ndta, uint32_t memory_shar
     }
     release_count = sidetnfs_tnfs_dta_count_active() + sidetnfs_fake_search_count_active();
     nullify_dta(memory_shared_address);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     DTANode *dtaNode = lookupDTA(ndta);
     if (dtaNode != NULL)
@@ -1078,6 +1126,37 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, const char *path_forwardslas
 {
 #if SIDETNFS_USE_TNFS_LISTING
     (void)internal_path; // only used by the SD/FatFS backend below
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    (void)sidetnfs_network_ok; // unused this phase -- always RAM-only
+    // Fase 10B: root-only, read-only drive. Same trailing-slash
+    // normalization as the real-TNFS path below, so "/" and "" both reach
+    // sidetnfs_config_drive_search_start() identically; anything else
+    // (a subdirectory reference) is a clean GEMDOS "not found", never a
+    // fictitious/skipped entry.
+    char config_path[MAX_FOLDER_LENGTH];
+    snprintf(config_path, sizeof(config_path), "%s", path_forwardslash);
+    size_t config_path_len = strlen(config_path);
+    if (config_path_len > 1 && config_path[config_path_len - 1] == '/')
+    {
+        config_path[config_path_len - 1] = '\0';
+    }
+    SidetnfsDirSearchResult config_result = SIDETNFS_DIR_SEARCH_NOT_FOUND;
+    SidetnfsAtariDirEntry config_entry;
+    if (config_path[0] == '\0' || strcmp(config_path, "/") == 0)
+    {
+        config_result = sidetnfs_config_drive_search_start(ndta, pattern, (uint8_t)attribs, &config_entry);
+    }
+    if (config_result == SIDETNFS_DIR_SEARCH_FOUND)
+    {
+        populate_dta_from_sidetnfs_entry(memory_shared_address, &config_entry);
+    }
+    else
+    {
+        nullify_dta(memory_shared_address);
+        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
+    }
+    return;
+#else
     sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_ATTR_PREP, ndta, NULL, NULL, NULL, 0, 0, 0, (uint8_t)attribs);
 
     // Fase 5Q: directory listing is now UNCONDITIONALLY served from
@@ -1137,6 +1216,7 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, const char *path_forwardslas
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_RETURN, ndta, NULL, NULL, NULL, 0, 0,
                        (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_EFILNF), 0);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     (void)path_forwardslash;   // only used by the TNFS backend above
     (void)sidetnfs_network_ok; // only used by the TNFS backend above
@@ -1289,6 +1369,25 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
 #endif
 
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B: root-only, read-only drive -- continue the ndta search
+    // started by gemdrive_backend_fsfirst()'s own SIDETNFS_CONFIG_DRIVE_ONLY
+    // branch. No TNFS DTA registry, no fake no-network listing, no SD.
+    {
+        SidetnfsAtariDirEntry config_entry;
+        SidetnfsDirSearchResult config_result = sidetnfs_config_drive_search_next(ndta, &config_entry);
+        if (config_result == SIDETNFS_DIR_SEARCH_FOUND)
+        {
+            populate_dta_from_sidetnfs_entry(memory_shared_address, &config_entry);
+        }
+        else
+        {
+            nullify_dta(memory_shared_address);
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_ENMFIL;
+        }
+    }
+    return;
+#else
     // Fase 5U: log both events at the absolute top of this case,
     // before any other logic, so there is no ambiguity about
     // whether GEMDRVEMUL_FSNEXT_CALL was ever dispatched to at all
@@ -1360,6 +1459,7 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_RETURN, ndta, NULL, NULL, NULL, 0, 0,
                        (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_ENMFIL), 0);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     FRESULT fr; /* Return value */
     DTANode *dtaNode = lookupDTA(ndta);
@@ -1464,6 +1564,30 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
 #endif
 }
 
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+// Fase 10B: tmp_filepath at this point is the TNFS-relative, forward-slash,
+// root-anchored shape get_tnfs_relative_pathname() always produces (e.g.
+// "/SIDETNFS.PRG"). This drive is root-only, so accept exactly one path
+// component after the leading slash -- reject an empty name and reject
+// any further slash (a subdirectory reference) rather than silently
+// truncating it to something that could accidentally match a real file.
+static bool config_flash_root_name(const char *tmp_filepath, char *out83, size_t out83_size)
+{
+    if (tmp_filepath == NULL || tmp_filepath[0] != '/')
+    {
+        return false;
+    }
+    const char *name = tmp_filepath + 1;
+    if (name[0] == '\0' || strchr(name, '/') != NULL)
+    {
+        return false;
+    }
+    strncpy(out83, name, out83_size - 1);
+    out83[out83_size - 1] = '\0';
+    return true;
+}
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
+
 // Fase 7D: GEMDRVEMUL_FOPEN_CALL backend routing. tmp_filepath is already
 // the correct shape for the active backend (TNFS-relative forward-slash
 // path, or SD-local hd_folder-prefixed path -- built by the caller before
@@ -1472,6 +1596,33 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
 static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath, uint32_t memory_shared_address)
 {
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B: read-only drive -- only mode 0 (read-only) is ever valid.
+    if (fopen_mode != 0)
+    {
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+        return;
+    }
+    char name83[32];
+    const uint8_t *data;
+    uint32_t size;
+    if (!config_flash_root_name(tmp_filepath, name83, sizeof(name83)) ||
+        !sidetnfs_config_drive_lookup(name83, &data, &size))
+    {
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+        return;
+    }
+    uint16_t fd_counter = get_first_available_fd(fdescriptors);
+    FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
+    if (newFDescriptor == NULL)
+    {
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+        return;
+    }
+    add_config_flash_file(&fdescriptors, newFDescriptor, tmp_filepath, data, size, fd_counter);
+    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
+    return;
+#else
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_ENTER, 0, tmp_filepath, NULL, NULL, fopen_mode, 0, 0, 0);
     if (fopen_mode > 2)
     {
@@ -1513,6 +1664,7 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
     DPRINTF("TNFS file opened with file descriptor: %d\n", fd_counter);
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_RETURN, fd_counter, tmp_filepath, NULL, NULL, 0, 0, 0, 0);
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     DPRINTF("Fopen mode: %x\n", fopen_mode);
     BYTE fatfs_open_mode = 0;
@@ -1574,6 +1726,19 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
 #if SIDETNFS_USE_TNFS_LISTING
     sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_ENTER, fclose_fd, NULL, NULL, NULL, 0, 0, 0, 0);
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, fclose_fd);
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B: flash reads need no close call at all -- just release the
+    // local tracking entry, same "always release, never leak/hang" intent
+    // as the TNFS path below.
+    if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+    {
+        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EIHNDL;
+        return;
+    }
+    delete_file_by_fdesc(&fdescriptors, fclose_fd);
+    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
+    return;
+#else
     if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_TNFS)
     {
         DPRINTF("ERROR: File descriptor not found or not TNFS-backed\n");
@@ -1595,6 +1760,7 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
     DPRINTF("TNFS file closed\n");
     sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_RETURN, fclose_fd, NULL, NULL, NULL, 0, 0, (uint8_t)GEMDOS_EOK, 0);
     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, fclose_fd);
     if (file == NULL)
@@ -1636,6 +1802,40 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
                        (uint16_t)(readbuff_pending_bytes_to_read > 0xFFFFu ? 0xFFFFu : readbuff_pending_bytes_to_read), 0, 0);
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_ENTER, readbuff_fd, NULL, NULL, NULL, 0, 0, 0, 0);
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, readbuff_fd);
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+    {
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
+        return;
+    }
+    // Fase 10B: bound every read to the real array length. file->offset can
+    // be anywhere in [0, config_flash_size] -- Fseek, not just linear
+    // growth (Pexec's own PRG loader may not read strictly sequentially) --
+    // so `remaining` is recomputed fresh here every call, never assumed to
+    // only shrink monotonically from a prior read. No interrupts disabled
+    // anywhere in this path (plain memcpy from an already-mapped XIP
+    // array), same as every other backend's Fread.
+    uint32_t remaining = (file->offset < file->config_flash_size) ? (file->config_flash_size - file->offset) : 0;
+    uint16_t buff_size = (uint16_t)(readbuff_pending_bytes_to_read > DEFAULT_FOPEN_READ_BUFFER_SIZE
+                                          ? DEFAULT_FOPEN_READ_BUFFER_SIZE
+                                          : readbuff_pending_bytes_to_read);
+    if (buff_size > remaining)
+    {
+        buff_size = (uint16_t)remaining;
+    }
+    if (buff_size < DEFAULT_FOPEN_READ_BUFFER_SIZE)
+    {
+        memset((void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), 0, DEFAULT_FOPEN_READ_BUFFER_SIZE);
+    }
+    if (buff_size > 0)
+    {
+        memcpy((void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), file->config_flash_data + file->offset, buff_size);
+    }
+    file->offset += buff_size;
+    CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF, buff_size + (buff_size % 2));
+    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)buff_size);
+    return;
+#else
     if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_TNFS)
     {
         DPRINTF("ERROR: File descriptor not found or not TNFS-backed\n");
@@ -1685,6 +1885,7 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_RETURN, readbuff_fd, NULL, NULL, NULL, 0, actual, 0, 0);
     CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF, actual + (actual % 2));
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)actual);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     // Obtain the file descriptor
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, readbuff_fd);
@@ -1746,12 +1947,23 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 // GEMDRIVE without a drive letter to boot with.
 static char select_gemdrive_drive_letter(void)
 {
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B: the config drive is the sole GEMDRIVE backend this build
+    // ever offers -- always the persistent config_drive_letter (default
+    // 'S', see SIDETNFS_DEFAULT_CONFIG_DRIVE_LETTER), never the TNFS/SD
+    // drive-letter selection below. sidetnfs_config_init() runs once at
+    // boot, unconditionally, before command dispatch, so this is always
+    // valid without SD/WiFi/network.
+    uint8_t config_letter = sidetnfs_config_get_config_drive_letter();
+    return config_letter != 0 ? (char)config_letter : 'S';
+#else
     if (sidetnfs_probe_has_active_server())
     {
         return sidetnfs_probe_get_active_drive_letter();
     }
     ConfigEntry *drive_letter_conf = find_entry(PARAM_GEMDRIVE_DRIVE);
     return (drive_letter_conf != NULL) ? drive_letter_conf->value[0] : 'C';
+#endif
 }
 
 void init_gemdrvemul(bool safe_config_reboot)
@@ -1876,6 +2088,28 @@ void init_gemdrvemul(bool safe_config_reboot)
     bool sidetnfs_network_ok = false;
 
     // Only try to get the datetime from the network if the wifi is configured
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+    // Fase 10B: the config drive needs no SD, WiFi, or TNFS access at all --
+    // skip the whole WiFi-connect/NTP/mount-probe block below entirely
+    // (never even calls network_init()) and go straight to the same
+    // teardown its own "not configured" paths already use, so
+    // sidetnfs_network_ok stays false and the drive is reported ready
+    // immediately. This mirrors the "no wifi configured" else-branch
+    // exactly (see the bottom of this same if/else below), just skipped
+    // unconditionally instead of based on PARAM_WIFI_SSID.
+    //
+    // Fase 10B-afronding: only deinit if main() actually confirmed
+    // cyw43_arch_init() succeeded -- checked here instead of assumed, even
+    // though main() currently guarantees it for every path that can reach
+    // GEMDRIVE_EMULATOR mode (a failed cyw43_arch_init() there returns -1
+    // before any emulator mode runs at all).
+    if (sidetnfs_cyw43_arch_is_ready())
+    {
+        cyw43_arch_deinit();
+    }
+    DPRINTF("SIDETNFS_CONFIG_DRIVE_ONLY build -- skipping network initialization.\n");
+    sidetnfs_mark_network_skipped();
+#else
     if (gemdrive_rtc_enabled && strlen(find_entry(PARAM_WIFI_SSID)->value) > 0)
     {
 #if SIDETNFS_ENABLE_SD_SUPPORT
@@ -2145,6 +2379,7 @@ void init_gemdrvemul(bool safe_config_reboot)
         DPRINTF("No wifi configured. Skipping network initialization.\n");
         sidetnfs_mark_network_skipped();
     }
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 
     DPRINTF("Waiting for commands...\n");
 
@@ -2331,6 +2566,12 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // mounted above.
                 close_all_files(&fdescriptors);
                 cleanDTAHashTable();
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+                // Fase 10B2: a config-drive search slot from a previous
+                // Atari session (before a Pico reboot, or a stale ndta
+                // otherwise) must never survive into this fresh boot.
+                sidetnfs_config_drive_search_close_all();
+#endif
                 delete_all_files(&fdescriptors);
                 DPRINTF("DTA table elements: %d\n", countDTA());
                 DPRINTF("File descriptors: %d\n", count_fdesc(fdescriptors));
@@ -2399,6 +2640,12 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // backend, since no TNFS session/handles would exist there.
                 close_all_files(&fdescriptors);
                 cleanDTAHashTable();
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+                // Fase 10B2: same as the first-PING cleanup above -- a
+                // config-drive search slot from before this reinit must
+                // never survive it.
+                sidetnfs_config_drive_search_close_all();
+#endif
                 delete_all_files(&fdescriptors);
                 DPRINTF("Fase 9E reinit -- DTA table elements: %d\n", countDTA());
                 DPRINTF("Fase 9E reinit -- File descriptors: %d\n", count_fdesc(fdescriptors));
@@ -2637,11 +2884,316 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_SIDETNFS_GET_NETWORK_CONFIG:
+        {
+            // --- Fase 11C, real Fase 11A getter restored on aligned offsets ---
+            // Root cause (hardware-confirmed via Test 1/1A/1B/1C, see
+            // report): GEMDRVEMUL_SIDETNFS_NETWORK_STATUS used to be
+            // 0x4472, only 2-byte aligned, because the preceding 198-byte
+            // drive record's own size is not a multiple of 4.
+            // WRITE_AND_SWAP_LONGWORD's raw `*(volatile uint32_t*)` store
+            // there was an unaligned 32-bit access, which Cortex-M0+
+            // cannot perform in hardware -- HardFault. Fixed structurally
+            // in gemdrvemul.h: GEMDRVEMUL_SIDETNFS_NETWORK now rounds up
+            // to the next 4-byte boundary (SIDETNFS_NETWORK_ALIGN4()),
+            // moving STATUS to 0x4474 (4-byte aligned) and every
+            // subsequent field with it; _Static_assert()s there guard the
+            // alignment/bounds guarantees at compile time. Plain
+            // WRITE_AND_SWAP_LONGWORD is safe again.
+            //
+            // Hardware-validated on the new offsets by the aligned Test 2
+            // build (fixed literals, preserved below in #if 0) together
+            // with the user's updated AtariConfig client. This is the
+            // real Fase 11A implementation (verbatim, promoted back to
+            // active from the #if 0 block further below) -- read-only:
+            // sidetnfs_netconfig_get() only ever calls find_entry(), a
+            // pure RAM lookup against the existing configData.
+            sidetnfs_network_config_t netcfg;
+            sidetnfs_netconfig_get(&netcfg);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
+                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, netcfg.auth_mode);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, netcfg.use_dhcp);
+
+            // Pico->Atari string transfer: same hardware-proven byte-copy +
+            // CHANGE_ENDIANESS_BLOCK16 pattern GET_DRIVE uses above -- see
+            // that block's comment for the full rationale. Never remove
+            // this swap based on host-only testing.
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), netcfg.ssid, MAX_SSID_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), netcfg.password, MAX_PASSWORD_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), netcfg.country, SIDETNFS_NET_COUNTRY_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), netcfg.ip_address, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), netcfg.netmask, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), netcfg.gateway, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), netcfg.primary_dns, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#if 0
+            // --- Fase 11C, aligned Test 2 build (superseded by real getter above) ---
+            // Same fixed-literal synthetic response as Test 2 (proves the
+            // response region/offsets/write helpers on the NEW aligned
+            // addresses) -- no sidetnfs_netconfig_get(), no find_entry(),
+            // no other config/network/flash function, no payloadPtr.
+            // Hardware-validated together with the user's updated
+            // AtariConfig client; superseded once the real getter above
+            // was restored.
+            char test2_ssid[MAX_SSID_LENGTH];
+            char test2_password[MAX_PASSWORD_LENGTH];
+            char test2_country[SIDETNFS_NET_COUNTRY_LEN];
+            char test2_ip_address[IPV4_ADDRESS_LENGTH];
+            char test2_netmask[IPV4_ADDRESS_LENGTH];
+            char test2_gateway[IPV4_ADDRESS_LENGTH];
+            char test2_primary_dns[IPV4_ADDRESS_LENGTH];
+
+            memset(test2_ssid, 0, sizeof(test2_ssid));
+            strncpy(test2_ssid, "TEST_WIFI", sizeof(test2_ssid) - 1);
+            memset(test2_password, 0, sizeof(test2_password));
+            strncpy(test2_password, "test_password", sizeof(test2_password) - 1);
+            memset(test2_country, 0, sizeof(test2_country));
+            strncpy(test2_country, "NL", sizeof(test2_country) - 1);
+            memset(test2_ip_address, 0, sizeof(test2_ip_address));
+            strncpy(test2_ip_address, "192.168.1.100", sizeof(test2_ip_address) - 1);
+            memset(test2_netmask, 0, sizeof(test2_netmask));
+            strncpy(test2_netmask, "255.255.255.0", sizeof(test2_netmask) - 1);
+            memset(test2_gateway, 0, sizeof(test2_gateway));
+            strncpy(test2_gateway, "192.168.1.1", sizeof(test2_gateway) - 1);
+            memset(test2_primary_dns, 0, sizeof(test2_primary_dns));
+            strncpy(test2_primary_dns, "1.1.1.1", sizeof(test2_primary_dns) - 1);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
+                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, 4); // WPA2_AES_PSK
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, 1);
+
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), test2_ssid, MAX_SSID_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), test2_password, MAX_PASSWORD_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), test2_country, SIDETNFS_NET_COUNTRY_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), test2_ip_address, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), test2_netmask, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), test2_gateway, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), test2_primary_dns, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#endif
+#if 0
+            // --- Fase 11C, Test 1C isolation build (superseded by aligned Test 2 above) ---
+            uint32_t status = (uint32_t)SIDETNFS_NETCONFIG_STATUS_NOT_STAGED;
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS, (uint16_t)(status >> 16));
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS + 2, (uint16_t)(status & 0xFFFF));
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#endif
+#if 0
+            // --- Fase 11C, Test 1B isolation build (superseded by Test 1C above) ---
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#endif
+#if 0
+            // --- Fase 11C, Test 1A isolation build (superseded by Test 1B above) ---
+            active_command_id = 0xFFFF;
+            break;
+#endif
+#if 0
+            // --- Fase 11C, Test 2 isolation build (superseded by Test 1A above) ---
+            // Full synthetic response: proves the response region,
+            // offsets, write helpers, and Atari-side readback in
+            // isolation. Every field below is a local fixed literal --
+            // never sidetnfs_netconfig_get(), find_entry(), or any other
+            // config/network/flash function, and payloadPtr is never
+            // touched. Same WRITE_WORD/WRITE_AND_SWAP_LONGWORD/memcpy+
+            // CHANGE_ENDIANESS_BLOCK16 primitives the real handler uses
+            // (see the disabled #if 0 block below) -- never a raw struct
+            // copy onto ROM3. Each local buffer is memset(0) across its
+            // FULL declared field length before strncpy() -- guarantees
+            // no leftover bytes from any earlier use of that stack slot
+            // and provable NUL-termination within bounds, independent of
+            // strncpy's own (also-safe) short-source padding behavior.
+            // No dynamic allocation. Test 1's no-op version and the real
+            // Fase 11A implementation are both preserved verbatim below
+            // (#if 0), not deleted.
+            char test2_ssid[MAX_SSID_LENGTH];
+            char test2_password[MAX_PASSWORD_LENGTH];
+            char test2_country[SIDETNFS_NET_COUNTRY_LEN];
+            char test2_ip_address[IPV4_ADDRESS_LENGTH];
+            char test2_netmask[IPV4_ADDRESS_LENGTH];
+            char test2_gateway[IPV4_ADDRESS_LENGTH];
+            char test2_primary_dns[IPV4_ADDRESS_LENGTH];
+
+            memset(test2_ssid, 0, sizeof(test2_ssid));
+            strncpy(test2_ssid, "TEST_WIFI", sizeof(test2_ssid) - 1);
+            memset(test2_password, 0, sizeof(test2_password));
+            strncpy(test2_password, "test_password", sizeof(test2_password) - 1);
+            memset(test2_country, 0, sizeof(test2_country));
+            strncpy(test2_country, "NL", sizeof(test2_country) - 1);
+            memset(test2_ip_address, 0, sizeof(test2_ip_address));
+            strncpy(test2_ip_address, "192.168.1.100", sizeof(test2_ip_address) - 1);
+            memset(test2_netmask, 0, sizeof(test2_netmask));
+            strncpy(test2_netmask, "255.255.255.0", sizeof(test2_netmask) - 1);
+            memset(test2_gateway, 0, sizeof(test2_gateway));
+            strncpy(test2_gateway, "192.168.1.1", sizeof(test2_gateway) - 1);
+            memset(test2_primary_dns, 0, sizeof(test2_primary_dns));
+            strncpy(test2_primary_dns, "1.1.1.1", sizeof(test2_primary_dns) - 1);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
+                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, 4); // WPA2_AES_PSK, see network.c get_auth_pico_code() mapping (3,4,5)
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, 1);
+
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), test2_ssid, MAX_SSID_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), test2_password, MAX_PASSWORD_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), test2_country, SIDETNFS_NET_COUNTRY_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), test2_ip_address, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), test2_netmask, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), test2_gateway, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), test2_primary_dns, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#if 0
+            // --- Fase 11C, Test 1 isolation build (superseded by Test 2 above) ---
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
+                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_NOT_STAGED);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#endif
+#if 0
+            // Fase 11A: read-only. No request payload, no SD/WiFi/flash
+            // I/O -- sidetnfs_netconfig_get() only ever calls find_entry(),
+            // a pure RAM lookup against the existing configData. See
+            // docs/sidetnfs-config-protocol.md.
+            sidetnfs_network_config_t netcfg;
+            sidetnfs_netconfig_get(&netcfg);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
+                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, netcfg.auth_mode);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, netcfg.use_dhcp);
+
+            // Pico->Atari string transfer: same hardware-proven byte-copy +
+            // CHANGE_ENDIANESS_BLOCK16 pattern GET_DRIVE uses above -- see
+            // that block's comment for the full rationale. Never remove
+            // this swap based on host-only testing.
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), netcfg.ssid, MAX_SSID_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), netcfg.password, MAX_PASSWORD_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), netcfg.country, SIDETNFS_NET_COUNTRY_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), netcfg.ip_address, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), netcfg.netmask, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), netcfg.gateway, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), netcfg.primary_dns, IPV4_ADDRESS_LENGTH);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#endif // Fase 11A original implementation
+#endif // Fase 11C Test 2 isolation build wrapper
+        }
+        case GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG:
+        {
+            // Fase 11A: RAM-only staging write. Request payload mirrors
+            // GET_NETWORK_CONFIG's response field order (minus STATUS),
+            // read via payloadPtr the same word-by-word/
+            // COPY_AND_CHANGE_ENDIANESS_BLOCK16 convention SET_DRIVE uses
+            // above. Validates first (sidetnfs_netconfig_stage() ->
+            // sidetnfs_netconfig_validate()); on any failure the previous
+            // staging copy is left completely untouched, and configData/
+            // flash/the active network connection are never touched
+            // either way. See docs/sidetnfs-config-protocol.md.
+            sidetnfs_network_config_t netcfg;
+            memset(&netcfg, 0, sizeof(netcfg));
+
+            netcfg.auth_mode = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            netcfg.use_dhcp = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.ssid, MAX_SSID_LENGTH);
+            payloadPtr += MAX_SSID_LENGTH / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.password, MAX_PASSWORD_LENGTH);
+            payloadPtr += MAX_PASSWORD_LENGTH / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.country, SIDETNFS_NET_COUNTRY_LEN);
+            payloadPtr += SIDETNFS_NET_COUNTRY_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.ip_address, IPV4_ADDRESS_LENGTH);
+            payloadPtr += IPV4_ADDRESS_LENGTH / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.netmask, IPV4_ADDRESS_LENGTH);
+            payloadPtr += IPV4_ADDRESS_LENGTH / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.gateway, IPV4_ADDRESS_LENGTH);
+            payloadPtr += IPV4_ADDRESS_LENGTH / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, netcfg.primary_dns, IPV4_ADDRESS_LENGTH);
+            payloadPtr += IPV4_ADDRESS_LENGTH / 2;
+
+            sidetnfs_netconfig_status_t netconfig_result = sidetnfs_netconfig_stage(&netcfg);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS, (uint32_t)netconfig_result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_SIDETNFS_SAVE_NETWORK_CONFIG:
+        {
+            // Fase 11A: the only command in this block that ever touches
+            // flash. Re-validates the staged copy, updates the nine
+            // existing PARAM_WIFI_* configData entries, writes the
+            // existing 8KB CONFIG_FLASH sector (via write_all_entries(),
+            // fixed this same phase for 256-byte flash_range_program()
+            // alignment -- see config.c), and only reports OK after an
+            // exact nine-field XIP readback. Never touches the active
+            // WiFi connection -- see sidetnfs_netconfig_save(). Request:
+            // none. Response: status only.
+            sidetnfs_netconfig_status_t netconfig_result = sidetnfs_netconfig_save();
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS, (uint32_t)netconfig_result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
         case GEMDRVEMUL_DFREE_CALL:
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             // Check the free space
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: fixed 256 KiB virtual capacity, reported entirely
+            // full (read-only drive -- see sidetnfs_config_drive_get_disk_info()).
+            ScFsDiskInfo disk_info;
+            sidetnfs_config_drive_get_disk_info(&disk_info.total_clusters, &disk_info.free_clusters,
+                                                  &disk_info.bytes_per_sector, &disk_info.sectors_per_cluster);
+            bool disk_info_ok = true;
+#else
             // Fase 7N: tnfsd 24.0522.1 has no TNFS command for free/total
             // disk space -- no SIZE/FREE/SIZEBYTES/FREEBYTES-equivalent
             // opcode, and no statvfs()/statfs() call anywhere in its
@@ -2663,6 +3215,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             disk_info.bytes_per_sector = 512;
             disk_info.sectors_per_cluster = 8;
             bool disk_info_ok = true;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             ScFsDiskInfo disk_info;
             bool disk_info_ok = scfs_get_disk_info(hd_folder, &disk_info);
@@ -2682,6 +3235,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
+            break;
         }
         case GEMDRVEMUL_DGETPATH_CALL:
         {
@@ -2764,6 +3318,19 @@ void init_gemdrvemul(bool safe_config_reboot)
             remove_dup_slashes(dpath_tmp);
 
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: root-only drive -- Dsetpath only succeeds for the
+            // root itself ("" or "/"); any subdirectory reference is a
+            // clean GEMDOS_EPTHNF, since this backend has no directories.
+            char dsetpath_config_path[MAX_FOLDER_LENGTH];
+            snprintf(dsetpath_config_path, sizeof(dsetpath_config_path), "%s", dpath_tmp);
+            size_t dsetpath_config_path_len = strlen(dsetpath_config_path);
+            if (dsetpath_config_path_len > 1 && dsetpath_config_path[dsetpath_config_path_len - 1] == '/')
+            {
+                dsetpath_config_path[dsetpath_config_path_len - 1] = '\0';
+            }
+            bool dsetpath_exists = (dsetpath_config_path[0] == '\0' || strcmp(dsetpath_config_path, "/") == 0);
+#else
             // Fase 8A: the old unconditional scfs_directory_exists(tmp_path)
             // "SD_CHECK" (comparison-only, never affecting dsetpath_exists
             // under this backend) touched the physical SD card via FatFS
@@ -2795,6 +3362,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             bool dsetpath_exists = sidetnfs_tnfs_directory_exists(dsetpath_tnfs_path, &dsetpath_tnfs_rc);
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_EXISTS_RC, 0, dsetpath_tnfs_path, NULL, NULL, 0, 0,
                                dsetpath_tnfs_rc, 0);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             char tmp_path[MAX_FOLDER_LENGTH] = {0};
             // Concatenate the path with the hd_folder
@@ -2812,9 +3380,22 @@ void init_gemdrvemul(bool safe_config_reboot)
                 DPRINTF("Directory does not exist: %s\n", dpath_tmp);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EPTHNF;
             }
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B-afronding: a failed Dsetpath (any non-root reference,
+            // since this drive has no subdirectories) must never mutate
+            // dpath_string -- the existing CWD (always root) stays exactly
+            // as it was. The unconditional strcpy() below is the
+            // TNFS/SD-backend behavior, unchanged and out of scope here.
+            if (dsetpath_exists)
+            {
+                strcpy(dpath_string, dpath_tmp);
+                DPRINTF("The new default path is: %s\n", dpath_string);
+            }
+#else
             // Copy dpath_tmp to dpath_string
             strcpy(dpath_string, dpath_tmp);
             DPRINTF("The new default path is: %s\n", dpath_string);
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #if SIDETNFS_USE_TNFS_LISTING
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string, NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
@@ -2831,6 +3412,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: read-only drive -- Dcreate is always denied, never
+            // even parses the target path (this drive has no subdirectories).
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EACCDN;
+#else
             // Fase 7I: real TNFS mkdir. No pre-check that the directory
             // already exists (no directory listing, no stat) -- the
             // server's own mkdir() rc alone determines the result, so a
@@ -2875,6 +3461,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // for why this differs from the uint32_t+SWAP_LONGWORD pattern
             // used by Fdelete/Frename/Fseek's status fields.
             *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = tnfs_dcreate_status;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
@@ -2912,6 +3499,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             // concatenated with the local harddisk folder and the default path (if any)
             payloadPtr += 6; // Skip six words
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: read-only drive -- Ddelete is always denied, never
+            // even parses the target path (this drive has no subdirectories).
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
+#else
             // Fase 7J: real TNFS rmdir. No pre-check via directory
             // listing/enumeration to see whether the directory is empty --
             // the server must bear that responsibility atomically, and a
@@ -3041,6 +3633,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // uint16_t write for this status field -- same convention as
             // Dcreate's GEMDRVEMUL_DCREATE_STATUS (see Fase 7I report).
             *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = tnfs_ddelete_status;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
@@ -3086,6 +3679,15 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_FSETDTA_CALL:
         {
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B2: the config drive allocates its search slot later,
+            // in Fsfirst (sidetnfs_config_drive_search_start()) -- Fsetdta
+            // itself does nothing here. In particular, never calls
+            // insertDTA(ndta, data, NULL, NULL, 0): that FatFS path
+            // dereferences dj->pat with dj == NULL, which this backend must
+            // never exercise. Still a normal, fully-confirmed command.
+            (void)ndta;
+#else
             bool ndta_exists = lookupDTA(ndta);
             if (ndta_exists)
             {
@@ -3098,6 +3700,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 insertDTA(ndta, data, NULL, NULL, 0);
                 DPRINTF("Added ndta: %x.\n", ndta);
             }
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -3265,6 +3868,15 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_FCREATE_CALL:
         {
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: read-only drive -- Fcreate is always denied, never
+            // even parses the target path (nothing to create/truncate).
+            payloadPtr += 6; // Skip six words (fcreate_mode/path, same shape as below)
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EACCDN;
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#else
             // Fase 7K: real TNFS create+truncate (Fcreate always creates a
             // new file or truncates an existing one -- see
             // sidetnfs_tnfs_file_create()). fcreate_mode is the Atari
@@ -3310,6 +3922,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             fcreate_mode = payloadPtr[0]; // d3 register
             payloadPtr += 6;              // Skip six words
@@ -3364,6 +3977,14 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             payloadPtr += 6; // Skip six words
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: read-only drive -- Fdelete is always denied, never
+            // even parses the target path (nothing to delete).
+            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) = SWAP_LONGWORD(GEMDOS_EACCDN);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+#else
             // Fase 7G: real TNFS file delete. Directories are never
             // deleted here -- see sidetnfs_tnfs_file_delete()'s comment:
             // relies on the server's own unlink() refusing a directory
@@ -3424,6 +4045,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
@@ -3580,6 +4202,45 @@ void init_gemdrvemul(bool safe_config_reboot)
                 }
             }
 #endif
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            {
+                // Fase 10B: pure RAM offset arithmetic -- no I/O, no
+                // interrupts disabled. SEEK_END uses the known flash-array
+                // length instead of f_size() (there is no FIL object for
+                // this backend). Clamped to [0, config_flash_size] so a
+                // later Fread's `remaining` computation can never
+                // underflow -- checked explicitly against the real
+                // 132992-byte SIDETNFS.PRG (see report), since Pexec's own
+                // loader may Fseek non-linearly, not just read forward.
+                int64_t new_offset;
+                switch (fseek_mode)
+                {
+                case 0: // SEEK_SET
+                    new_offset = (int64_t)fseek_offset;
+                    break;
+                case 1: // SEEK_CUR
+                    new_offset = (int64_t)file->offset + (int32_t)fseek_offset;
+                    break;
+                case 2: // SEEK_END
+                    new_offset = (int64_t)file->config_flash_size + (int32_t)fseek_offset;
+                    break;
+                default:
+                    new_offset = (int64_t)file->offset;
+                    break;
+                }
+                if (new_offset < 0)
+                {
+                    new_offset = 0;
+                }
+                if (new_offset > (int64_t)file->config_flash_size)
+                {
+                    new_offset = (int64_t)file->config_flash_size;
+                }
+                file->offset = (uint32_t)new_offset;
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FSEEK_STATUS, file->offset);
+            }
+#endif
             else
             {
                 switch (fseek_mode)
@@ -3627,6 +4288,41 @@ void init_gemdrvemul(bool safe_config_reboot)
             uint16_t fattrib_new = payloadPtr[0]; // d4 register
             payloadPtr += 4;                      // Skip four words
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            // Fase 10B: root-only, read-only drive. Inquire returns the
+            // fixed READONLY|ARCH attribute for the two known files (see
+            // sidetnfs_config_drive_backend.c's SIDETNFS_CONFIG_DRIVE_ATTR);
+            // Fattrib SET is always rejected -- there is nothing to change,
+            // and no flash write ever happens from this backend.
+            char config_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
+            char config_fattrib_path[MAX_FOLDER_LENGTH] = {0};
+            get_tnfs_relative_pathname(config_fattrib_path, config_fattrib_raw_path, NULL);
+            char config_fattrib_name83[14];
+            const uint8_t *config_fattrib_data;
+            uint32_t config_fattrib_size;
+            bool config_fattrib_found = config_flash_root_name(config_fattrib_path, config_fattrib_name83,
+                                                                  sizeof(config_fattrib_name83)) &&
+                                         sidetnfs_config_drive_lookup(config_fattrib_name83, &config_fattrib_data,
+                                                                       &config_fattrib_size);
+            if (fattrib_flag == FATTRIB_INQUIRE)
+            {
+                if (config_fattrib_found)
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             (uint32_t)SIDETNFS_CONFIG_DRIVE_ATTR);
+                }
+                else
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
+                }
+            }
+            else
+            {
+                // FATTRIB_SET -- read-only drive, never permitted.
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                         config_fattrib_found ? GEMDOS_EACCDN : GEMDOS_EFILNF);
+            }
+#else
             // Fase 7L/7Lb: real TNFS Fattrib inquire via STAT (see
             // sidetnfs_tnfs_get_attributes() in sidetnfs_probe.c for the
             // wire-level detail). Fattrib SET is unconditionally reported
@@ -3723,6 +4419,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                     break;
                 }
             }
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
@@ -3797,6 +4494,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) = SWAP_LONGWORD(GEMDOS_EPTHNF);
             }
 #if SIDETNFS_USE_TNFS_LISTING
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            else
+            {
+                // Fase 10B: read-only drive -- Frename is always denied,
+                // never even parses the destination path (nothing to rename).
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
+                    SWAP_LONGWORD(GEMDOS_EACCDN);
+            }
+#else
             else
             {
                 // Fase 7H: real TNFS rename. payloadPtr is still at the src
@@ -3867,6 +4573,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
                     SWAP_LONGWORD(tnfs_rename_status);
             }
+#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             else
             {
@@ -4005,6 +4712,28 @@ void init_gemdrvemul(bool safe_config_reboot)
                     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
                 }
             }
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            else if (fd->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            {
+                // Fase 10B: fixed placeholder date/time for both embedded
+                // files (see SIDETNFS_CONFIG_DRIVE_DATE/TIME) -- inquire
+                // always succeeds, set is always rejected (read-only drive).
+                if (fdatetime_flag == FDATETIME_INQUIRE)
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EOK);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE,
+                                             SIDETNFS_CONFIG_DRIVE_DATE);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME,
+                                             SIDETNFS_CONFIG_DRIVE_TIME);
+                }
+                else
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EACCDN);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_DATE, 0);
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
+                }
+            }
+#endif
 #endif
             else
             {
@@ -4231,6 +4960,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                     }
                 }
             }
+#if SIDETNFS_CONFIG_DRIVE_ONLY
+            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            {
+                // Fase 10B: read-only drive -- never touches file->fobject
+                // (never opened via f_open() for this backend), unlike the
+                // SD/FatFS fallback below which would call f_lseek() on it.
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EACCDN);
+            }
+#endif
 #endif
             else
             {

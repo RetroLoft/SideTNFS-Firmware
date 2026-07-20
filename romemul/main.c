@@ -14,6 +14,19 @@
 #include "include/sidetnfs_config.h"
 #include "include/sidetnfs_probe.h"
 
+// Fase 10B-afronding: tracks whether cyw43_arch_init() below actually
+// succeeded this boot, so any later cyw43_arch_deinit() call site (e.g.
+// gemdrvemul.c's SIDETNFS_CONFIG_DRIVE_ONLY path) can check this instead of
+// assuming init always happened first -- main() does return -1 immediately
+// on failure before any emulator mode can run, but that guarantee lived only
+// in this file's control flow, not at the call site itself.
+static bool g_cyw43_arch_ready = false;
+
+bool sidetnfs_cyw43_arch_is_ready(void)
+{
+    return g_cyw43_arch_ready;
+}
+
 int main()
 {
     // Set the clock frequency. 20% overclocking
@@ -52,6 +65,7 @@ int main()
         DPRINTF("Wi-Fi init failed\n");
         return -1;
     }
+    g_cyw43_arch_ready = true;
 
     // Load the config from FLASH
     load_all_entries();

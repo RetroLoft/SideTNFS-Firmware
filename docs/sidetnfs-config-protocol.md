@@ -380,3 +380,260 @@ omdat `sidetnfs_probe_load_active_server()` alleen bij boot draait.
 `SIDETNFS_ENABLE_SD_SUPPORT` blijft een onafhankelijke compile-time schakelaar
 (SD/FatFS-toegang voor WiFi-wachtwoord/DEBUG.TXT), losstaand van deze
 TNFS-serverkeuze.
+
+# WiFi/netwerkconfiguratie via GEMDRIVE (Fase 11A)
+
+Status: **nieuw, backwards compatible** — geen wijziging aan protocolversie
+2 of aan de bestaande drive-records/commando's hierboven. Maakt WiFi/
+netwerkconfiguratie (SSID, wachtwoord, auth-mode, land, DHCP/statisch IP)
+bereikbaar vanuit `SIDETNFS.PRG` terwijl GEMDRIVE draait, zonder de
+bestaande `APP_CONFIGURATOR`-commando's (`GET_CONFIG`/`PUT_CONFIG_STRING`/
+`PUT_CONFIG_INTEGER`/`PUT_CONFIG_BOOL`/`SAVE_CONFIG`, afgehandeld in
+`romemul/romloader.c`) aan te raken of ermee te routeren — twee volledig
+gescheiden command-ID-namespaces boven dezelfde opslag.
+
+Hergebruikt de bestaande `configData`/`PARAM_WIFI_*`-entries
+(`romemul/config.c`) en de bestaande 8KB `CONFIG_FLASH`-sector — geen
+tweede permanente netwerkconfigsector.
+
+## Command-ID's
+
+Subcommando's `0x13`–`0x15` in de `APP_GEMDRVEMUL`-namespace. Opnieuw
+geverifieerd vrij: hoogste gebruikte lage code vóór deze toevoeging was
+`0x12`/`SAVE_CONFIG`, eerstvolgende gebruikte code is `0x19`/`DGETDRV_CALL`
+— `0x13`–`0x18` was en is vrij, zowel in `romemul/include/commands.h` als in
+de referentie-Atari-driver (`sidecart-gemdrive-atari/src/gemdrive.s`
+CMD_*-tabel, niets gedefinieerd op `0x13`–`0x15`).
+
+| Waarde | Constante | Betekenis |
+|---|---|---|
+| `0x0413` | `GEMDRVEMUL_SIDETNFS_GET_NETWORK_CONFIG` | lees de huidige WiFi/netwerkconfig |
+| `0x0414` | `GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG` | valideer + stage een nieuwe config (RAM only) |
+| `0x0415` | `GEMDRVEMUL_SIDETNFS_SAVE_NETWORK_CONFIG` | valideer de staging-copy opnieuw + schrijf naar flash |
+
+## Wire-record (`sidetnfs_network_config_t`, `romemul/include/sidetnfs_netconfig.h`)
+
+```c
+typedef struct {
+    uint16_t auth_mode;                  // 0-8, zie authenticatiemapping hieronder
+    uint16_t use_dhcp;                   // 0 of 1
+    char ssid[36];                       // MAX_SSID_LENGTH uit network.h, <=32 bytes inhoud
+    char password[68];                   // MAX_PASSWORD_LENGTH uit network.h, <=64 bytes inhoud
+    char country[4];                     // exact 2 letters + NUL + 1 padding, zelfde conventie als ConnectionData.wifi_country
+    char ip_address[16];                 // IPV4_ADDRESS_LENGTH uit network.h
+    char netmask[16];
+    char gateway[16];
+    char primary_dns[16];
+} sidetnfs_network_config_t;             // sizeof == 176 bytes, _Static_assert bewaakt
+```
+
+Alle veldlengtes zijn identiek aan bestaande, al elders in deze codebase
+gebruikte constanten (`MAX_SSID_LENGTH`/`MAX_PASSWORD_LENGTH`/
+`IPV4_ADDRESS_LENGTH`/`wifi_country[4]` in `romemul/include/network.h`) —
+geen nieuwe, losstaande maten verzonnen. Geen enkel veld heeft
+compiler-padding nodig (elk veld is `uint16_t` of een array met even
+lengte); dit struct wordt nooit als geheel op het gedeelde geheugen
+gecastst — elk shared-memory-offset is expliciet gedefinieerd in
+`romemul/include/gemdrvemul.h` (zelfde stijl als het bestaande
+drive-record hierboven).
+
+## Gedeeld netwerk-responseblok
+
+`GEMDRVEMUL_SIDETNFS_NETWORK`, direct na het bestaande 198-byte
+drive-record (`GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN`,
+offset 17522 van het 64KB ROM3-venster — ~46KB blijft over). Gedeeld door
+`GET_NETWORK_CONFIG` (volledig) en door `SET_NETWORK_CONFIG`/
+`SAVE_NETWORK_CONFIG` (alleen `STATUS`).
+
+| Veld | Offset-macro | Grootte | Woordvolgorde |
+|---|---|---|---|
+| status | `GEMDRVEMUL_SIDETNFS_NETWORK_STATUS` | 4 | `uint32_t`, `WRITE_AND_SWAP_LONGWORD` |
+| auth_mode | `GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE` | 2 | `uint16_t`, `WRITE_WORD` (los woord, geen swap) |
+| use_dhcp | `GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP` | 2 | `uint16_t`, `WRITE_WORD` |
+| ssid | `GEMDRVEMUL_SIDETNFS_NETWORK_SSID` | 36 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| password | `GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD` | 68 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| country | `GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY` | 4 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| ip_address | `GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS` | 16 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| netmask | `GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK` | 16 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| gateway | `GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY` | 16 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+| primary_dns | `GEMDRVEMUL_SIDETNFS_NETWORK_DNS` | 16 | byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place |
+
+Totaal: 180 bytes (4 status + 176 `sidetnfs_network_config_t`).
+
+**Endianness — zelfde hardware-bewezen regels als het drive-record
+hierboven, ongewijzigd op basis van hosttests alleen:** Pico→Atari
+stringvelden gebruiken byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place
+(zelfde patroon als `populate_dta()` en `GET_DRIVE`); Atari→Pico
+stringvelden gebruiken `COPY_AND_CHANGE_ENDIANESS_BLOCK16` (zelfde patroon
+als `SET_DRIVE`/`GEMDRVEMUL_FOPEN_CALL`/`DSETPATH_CALL`). `auth_mode`/
+`use_dhcp` zijn gewone 16-bit woorden (`WRITE_WORD`/`GET_PAYLOAD_PARAM16`,
+geen swap) — zelfde conventie als de drive-record-velden `used`/
+`drive_letter`/`type`/`transport`/`port`.
+
+## `GET_NETWORK_CONFIG` (`0x0413`)
+
+Requestpayload: geen. Geen SD/WiFi/flash-I/O — `sidetnfs_netconfig_get()`
+roept uitsluitend `find_entry()` aan (pure RAM-lookup tegen de bestaande
+`configData`). Response: het volledige blok hierboven, status altijd `OK`.
+Een lege opgeslagen `WIFI_COUNTRY`-entry wordt genormaliseerd naar `"XX"`
+voor weergave/bewerking (de flash-entry zelf blijft ongewijzigd). Geeft het
+bestaande `WIFI_PASSWORD` ongewijzigd terug — `SIDETNFS.PRG` moet dit
+kunnen uitlezen en terugschrijven.
+
+## `SET_NETWORK_CONFIG` (`0x0414`)
+
+Requestpayload: exact dezelfde veldvolgorde als `GET_NETWORK_CONFIG`'s
+response (zonder `status`): `auth_mode`, `use_dhcp` (elk één 16-bit woord),
+dan `ssid`/`password`/`country`/`ip_address`/`netmask`/`gateway`/
+`primary_dns` (woord-voor-woord, `COPY_AND_CHANGE_ENDIANESS_BLOCK16`).
+
+Valideert eerst **alles** (zie Validatie hieronder); alleen bij
+`SIDETNFS_NETCONFIG_STATUS_OK` wordt de RAM-only staging-copy
+overschreven. Bij een fout blijft de vorige staging-copy (indien aanwezig)
+volledig intact — `configData`, flash en de actieve netwerkverbinding
+worden hoe dan ook nooit aangeraakt. Response: alleen `status`.
+
+## `SAVE_NETWORK_CONFIG` (`0x0415`)
+
+Request: geen. Het enige commando in dit blok dat ooit flash aanraakt:
+
+1. `NOT_STAGED` als er sinds boot nooit een succesvolle `SET_NETWORK_CONFIG`
+   is geweest;
+2. valideert de staging-copy **opnieuw** volledig (defense in depth);
+3. bouwt een schone lokale kopie (NUL-terminatie afgedwongen, `country`
+   uppercase);
+4. werkt de negen bestaande `PARAM_WIFI_*`-`configData`-entries bij via
+   `put_integer()`/`put_bool()`/`put_string()`;
+5. roept `write_all_entries()` aan (zie de Fase-11A-uitlijningsfix
+   hieronder) — schrijft de bestaande 8KB `CONFIG_FLASH`-sector;
+6. leest de negen entries terug via een echte XIP-herlezing
+   (`XIP_BASE + CONFIG_FLASH_OFFSET`, niet de al-bijgewerkte
+   in-RAM-`configData`) en vergelijkt elk van de negen velden
+   byte-voor-byte;
+7. rapporteert alleen `OK` na een exacte match; anders
+   `FLASH_WRITE_FAILED` (schrijf zelf mislukt) of `FLASH_VERIFY_FAILED`
+   (readback komt niet overeen).
+
+**Wanneer wordt de nieuwe configuratie actief?** Nooit tijdens deze
+sessie — `SAVE_NETWORK_CONFIG` verbreekt of herstart de actieve
+WiFi-verbinding niet terwijl `SIDETNFS.PRG` draait. De nieuwe configuratie
+wordt pas opgepikt via een latere, aparte apply-/herinitialisatiepad (nog
+niet onderdeel van deze fase) — in de praktijk vandaag: een Pico-reboot,
+zelfde moment waarop de bestaande `PARAM_WIFI_*`-config al gelezen wordt
+door `network_wifi_init()`/`main.c`.
+
+## `write_all_entries()`-uitlijningsfix (`romemul/config.c`)
+
+Vóór deze fase riep `write_all_entries()` `flash_range_program()` aan met
+`sizeof(ConfigData)` (4136 bytes op dit target) als lengte — geen
+veelvoud van `FLASH_PAGE_SIZE` (256). De Pico SDK's eigen
+`invalid_params_if(FLASH, count & (FLASH_PAGE_SIZE-1))` documenteert deze
+eis, maar die assertie compileert standaard weg
+(`PARAM_ASSERTIONS_ENABLE_FLASH` staat nergens aan), dus dit bleef tot nu
+toe onopgemerkt. Opgelost naar exact hetzelfde patroon dat
+`sidetnfs_config.c`'s `sidetnfs_config_save()` al gebruikt voor zijn eigen,
+aparte sector: een statische, op een 256-byte-pagina afgeronde, met nullen
+opgevulde bufer (`4136` → `4352` bytes, ruim binnen de 8KB
+`CONFIG_FLASH_SIZE`) — geen buffer van meerdere kilobytes op de 4KB stack.
+Dit is een generieke fix in gedeelde code: ze geldt voor zowel de
+bestaande `APP_CONFIGURATOR`/`SAVE_CONFIG`-route als voor
+`SAVE_NETWORK_CONFIG` hierboven.
+
+## Authenticatiemapping (`auth_mode`, bevestigd, niet aangenomen)
+
+Onderzocht in `romemul/network.c`'s `get_auth_pico_code()` (de enige
+bestaande, functionerende definitie van wat deze negen waarden betekenen)
+én in de Atari-zijde (`AtariConfig`/`sidecart-configurator-atari`,
+read-only geraadpleegd). **Bevinding: de Atari-zijde heeft momenteel geen
+auth-mode-concept** — `AtariConfig/include/netconfig.h`'s `NetConfig`
+(Fase AC-5, lokale UI zonder wire-protocol) heeft geen `auth_mode`-veld en
+`AtariConfig/src/dialog.c`'s WiFi-dialoog heeft geen auth-keuze-widget; er
+is dus geen bestaande Atari-zijdige waarde om tegen te bevestigen. De
+onderstaande mapping is daarom uitsluitend gebaseerd op de Pico-zijdige,
+functionerende code:
+
+| Opgeslagen waarde (`WIFI_AUTH`/`auth_mode`) | CYW43-constante |
+|---|---|
+| 0 | `CYW43_AUTH_OPEN` |
+| 1, 2 | `CYW43_AUTH_WPA_TKIP_PSK` |
+| 3, 4, 5 | `CYW43_AUTH_WPA2_AES_PSK` |
+| 6, 7, 8 | `CYW43_AUTH_WPA2_MIXED_PSK` |
+| overig | `CYW43_AUTH_OPEN` (bestaande `default`-tak in `get_auth_pico_code()`) |
+
+`sidetnfs_netconfig_validate()` wijst elke waarde `> 8` af
+(`INVALID_AUTH_MODE`) — strenger dan `get_auth_pico_code()`'s eigen
+lenient-fallback-naar-OPEN, om te voorkomen dat de configdrive stilzwijgend
+een niet-bestaande auth-mode accepteert. **Aanbeveling voor
+AtariConfig-Claude:** voeg een auth-mode-keuze toe aan de WiFi-dialoog met
+exact deze vijf groepen/negen waarden, aangezien dit de enige
+geverifieerde betekenis is.
+
+## Validatie (details)
+
+- `ssid`: max. 32 bytes inhoud, leeg toegestaan (schakelt WiFi uit).
+- `password`: max. 64 bytes inhoud. Bestaande firmwaresemantiek
+  (`network.c`'s `network_init()`) koppelt wachtwoordlengte niet hard aan
+  `auth_mode` — een leeg wachtwoord wordt als `NULL` doorgegeven aan
+  `cyw43_arch_wifi_connect_*()`, en pas de daadwerkelijke verbindingspoging
+  bepaalt of dat werkt. Deze validatielaag legt dezelfde, niet-strengere
+  regel op: alleen de lengte wordt gecontroleerd, geen koppeling met
+  `auth_mode`.
+- `auth_mode`: `0`–`8`, zie mapping hierboven; anders `INVALID_AUTH_MODE`.
+- `country`: exact twee letters, hoofdletterongevoelig ingevoerd, ná
+  validatie uppercase opgeslagen; geaccepteerd via `get_country_code()`
+  zelf (geen losse kopie van de lijst) — een niet-herkende code valt bij
+  die functie stil terug op `"XX"` zonder dat te melden, dus
+  `sidetnfs_netconfig_validate()` vergelijkt expliciet de
+  hoofdlettergemaakte invoer met wat `get_country_code()` teruggeeft:
+  ongelijk → `INVALID_COUNTRY`. Nooit leeg in een request (alleen
+  `GET_NETWORK_CONFIG` normaliseert een lege opgeslagen waarde naar
+  `"XX"` voor weergave).
+- `use_dhcp`: uitsluitend `0` of `1`, anders `INVALID_DHCP`.
+- Bij `use_dhcp == 1`: `ip_address`/`netmask`/`gateway`/`primary_dns` worden
+  niet gevalideerd (mogen leeg zijn of iets anders bevatten — ze worden
+  toch niet gebruikt).
+- Bij `use_dhcp == 0`: elk van de vier moet een geldig IPv4-dotted-quad
+  zijn volgens `ipaddr_aton()` (dezelfde lwIP-functie die
+  `sidetnfs_probe.c` al overal gebruikt) — anders respectievelijk
+  `INVALID_IP`/`INVALID_NETMASK`/`INVALID_GATEWAY`/`INVALID_DNS`.
+- `WIFI_DNS` bevat in deze eerste implementatie uitsluitend het primaire
+  DNS-adres — geen komma-gescheiden tweede server.
+- Alle stringvelden worden gecontroleerd op aantoonbare NUL-terminatie
+  (`strnlen(...) < buffergrootte`) vóórdat enige andere validatie op de
+  inhoud plaatsvindt.
+
+## Statuscodes (`sidetnfs_netconfig_status_t`)
+
+32-bit swapped statusveld, zelfde conventie als het bestaande
+SideTNFS-driveprotocol (`WRITE_AND_SWAP_LONGWORD`).
+
+| Waarde | Constante |
+|---|---|
+| 0 | `SIDETNFS_NETCONFIG_STATUS_OK` |
+| 1 | `SIDETNFS_NETCONFIG_STATUS_INVALID_SSID` |
+| 2 | `SIDETNFS_NETCONFIG_STATUS_INVALID_PASSWORD` |
+| 3 | `SIDETNFS_NETCONFIG_STATUS_INVALID_AUTH_MODE` |
+| 4 | `SIDETNFS_NETCONFIG_STATUS_INVALID_COUNTRY` |
+| 5 | `SIDETNFS_NETCONFIG_STATUS_INVALID_DHCP` |
+| 6 | `SIDETNFS_NETCONFIG_STATUS_INVALID_IP` |
+| 7 | `SIDETNFS_NETCONFIG_STATUS_INVALID_NETMASK` |
+| 8 | `SIDETNFS_NETCONFIG_STATUS_INVALID_GATEWAY` |
+| 9 | `SIDETNFS_NETCONFIG_STATUS_INVALID_DNS` |
+| 10 | `SIDETNFS_NETCONFIG_STATUS_NOT_STAGED` |
+| 11 | `SIDETNFS_NETCONFIG_STATUS_FLASH_WRITE_FAILED` |
+| 12 | `SIDETNFS_NETCONFIG_STATUS_FLASH_VERIFY_FAILED` |
+
+## Hosttests
+
+`tests/host_netconfig/` (zelfde opzet als `tests/host_configdrive/` uit
+Fase 10B2: een sandbox-directory met symlinks naar de echte
+`sidetnfs_netconfig.c`/`.h`, plus stub-headers voor `network.h`/`config.h`/
+`lwip/ip_addr.h` omdat de echte headers Pico-SDK/lwIP/cyw43-afhankelijkheden
+meenemen die niet host-compileerbaar zijn). Dekt: GET met bestaande
+defaults, SET→SAVE→GET-roundtrip, maximale SSID/wachtwoordlengtes, NL/XX/
+kleine-letters/ongeldige landcodes, DHCP aan met lege statische adressen,
+DHCP uit met geldige en ongeldige IPv4-velden, string-endianness met
+oneven tekstlengtes (rechtstreeks tegen `CHANGE_ENDIANESS_BLOCK16`), een
+mislukte `SET` die de staging-copy intact laat, de 256-byte-uitlijning van
+de programmalengte, en een negen-velden-readbackvergelijking. 51/51
+checks slagen.

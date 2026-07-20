@@ -125,6 +125,22 @@
 // status only.
 #define GEMDRVEMUL_SIDETNFS_SAVE_CONFIG (APP_GEMDRVEMUL << 8 | 0x12) // Persist the RAM drive list to flash
 
+// Fase 11A: WiFi/network configuration accessible while GEMDRIVE runs.
+// Subcommands 0x13-0x15, re-verified free in both this file (highest used
+// low code before this addition was 0x12/SAVE_CONFIG, next used is
+// 0x19/DGETDRV_CALL -- 0x13-0x18 free) and the reference Atari driver
+// (sidecart-gemdrive-atari/src/gemdrive.s CMD_* table, highest used code
+// there is 0x0C/0x8B; nothing defined at 0x13-0x15). Reuses the existing
+// PARAM_WIFI_* configData entries and the existing 8KB CONFIG_FLASH sector
+// (romemul/config.c) -- no second permanent network config sector, and
+// never routed to/from the APP_CONFIGURATOR GET_CONFIG/PUT_CONFIG_*/
+// SAVE_CONFIG command IDs in romloader.c (separate command-ID namespace,
+// separate dispatcher). See romemul/include/sidetnfs_netconfig.h and
+// docs/sidetnfs-config-protocol.md for the wire format.
+#define GEMDRVEMUL_SIDETNFS_GET_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x13)  // Read the current WiFi/network config
+#define GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x14)  // Validate + stage a new WiFi/network config (RAM only)
+#define GEMDRVEMUL_SIDETNFS_SAVE_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x15) // Persist the staged WiFi/network config to flash
+
 #define GEMDRVEMUL_DGETDRV_CALL (APP_GEMDRVEMUL << 8 | 0x19)   // Show the Dgetdrv call
 #define GEMDRVEMUL_FSETDTA_CALL (APP_GEMDRVEMUL << 8 | 0x1A)   // Show the Fsetdta call
 #define GEMDRVEMUL_DFREE_CALL (APP_GEMDRVEMUL << 8 | 0x36)     // Show the Dfree call

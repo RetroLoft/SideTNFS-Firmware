@@ -164,6 +164,12 @@ int network_init(bool force, bool async, char **pass);
 u_int32_t get_ip_address();
 u_int32_t get_netmask();
 u_int32_t get_gateway();
+// Fase 11B: was previously only ever called from within network.c itself
+// (before its own definition needed no prototype) -- now also called from
+// sidetnfs_netconfig.c's country validation, which needs a real
+// declaration here instead of triggering an implicit-declaration warning.
+uint32_t get_country_code(char *c, char **valid_country_str);
+u_int32_t get_auth_pico_code(u_int16_t connect_code);
 u_int8_t *get_mac_address();
 char *print_ipv4(uint32_t ip);
 char *print_mac(uint8_t *mac_address);

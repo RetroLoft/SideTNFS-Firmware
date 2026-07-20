@@ -98,6 +98,18 @@ SECTIONS
     } > FLASH
 
     .rodata : {
+        /* Fase 10A: sidetnfs_config_drive.c's embedded SIDETNFS.PRG/
+           README.TXT arrays have no reader yet this phase (no configdrive
+           backend) -- __attribute__((used)) alone was not enough to
+           survive this toolchain's --gc-sections (verified: still absent
+           from the linked ELF with only that attribute), so KEEP() them
+           explicitly by their -fdata-sections section names, same
+           technique already used for .mutex_array/.preinit_array/
+           .init_array below. */
+        KEEP(*(.rodata.sidetnfs_config_prg))
+        KEEP(*(.rodata.sidetnfs_config_prg_length))
+        KEEP(*(.rodata.sidetnfs_config_readme))
+        KEEP(*(.rodata.sidetnfs_config_readme_length))
         *(EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:) .rodata*)
         . = ALIGN(4);
         *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.flashdata*)))
@@ -266,5 +278,16 @@ SECTIONS
 
     ASSERT( __binary_info_header_end - __logical_binary_start <= 256, "Binary info must be in first 256 bytes of the binary")
     /* todo assert on extra code */
+
+    /* Fase 10A: __flash_binary_end (.text/.rodata/.data, including the
+       embedded sidetnfs_config_drive.c arrays) must stay below
+       CONFIG_FLASH's fixed origin (0x100DE000, see CONFIG_FLASH above and
+       CONFIG_FLASH_OFFSET in romemul/constants.c) -- CONFIG_FLASH is
+       accessed directly via XIP_BASE + CONFIG_FLASH_OFFSET at runtime
+       (romemul/config.c), not through a SECTIONS placement the linker
+       would otherwise catch, so nothing else stops ordinary code/rodata
+       growth from silently overrunning it. This turns that into a build
+       failure instead of runtime flash corruption. */
+    ASSERT( __flash_binary_end <= ORIGIN(CONFIG_FLASH), "flash_end has grown into CONFIG_FLASH (0x100DE000) -- reduce embedded content or move CONFIG_FLASH")
 }
 

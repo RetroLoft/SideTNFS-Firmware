@@ -299,14 +299,34 @@ int write_all_entries()
     DPRINTF("Size of ConfigEntry: %d\n", sizeof(ConfigEntry));
     DPRINTF("Size of entries: %d\n", configData.count * sizeof(ConfigEntry));
 
+    // Fase 11A: flash_range_program() requires a length that's a multiple
+    // of FLASH_PAGE_SIZE (256) -- sizeof(ConfigData) (4136 bytes on this
+    // target) is not. The Pico SDK's own flash.c documents this
+    // requirement (invalid_params_if(FLASH, count & (FLASH_PAGE_SIZE-1))),
+    // but that check compiles out by default here (PARAM_ASSERTIONS_ENABLE_FLASH
+    // is never set), so this previously went uncaught. Round up to a whole
+    // number of pages in a static, page-aligned, zero-padded buffer --
+    // same pattern sidetnfs_config.c's sidetnfs_config_save() already uses
+    // for its own, separate flash sector -- rather than a multi-KB buffer
+    // on the 4KB stack.
+    static uint8_t program_buf[((sizeof(ConfigData) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE];
+    if (sizeof(program_buf) > CONFIG_FLASH_SIZE)
+    {
+        return -1; // Error: page-aligned program size exceeds reserved space
+    }
+    memset(program_buf, 0, sizeof(program_buf));
+    memcpy(program_buf, &configData, sizeof(configData));
+
     uint32_t ints = save_and_disable_interrupts();
 
     // Erase the content before writing the configuration
     // overwriting it's not enough
     flash_range_erase(CONFIG_FLASH_OFFSET, CONFIG_FLASH_SIZE); // 4 Kbytes
 
-    // Transfer config to FLASH
-    flash_range_program(CONFIG_FLASH_OFFSET, (uint8_t *)&configData, sizeof(configData));
+    // Transfer config to FLASH -- program_buf's size is always a multiple
+    // of FLASH_PAGE_SIZE (see its declaration above), unlike sizeof(configData)
+    // directly.
+    flash_range_program(CONFIG_FLASH_OFFSET, program_buf, sizeof(program_buf));
 
     restore_interrupts(ints);
 

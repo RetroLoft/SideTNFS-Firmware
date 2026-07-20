@@ -67,6 +67,17 @@
 #define SIDETNFS_ENABLE_DEBUG 1
 #endif
 
+// Fase 10B: temporary test-build switch. When 1, GEMDRIVE offers ONLY the
+// read-only configuration drive (GEMDRIVE_FILE_BACKEND_CONFIG_FLASH,
+// romemul/sidetnfs_config_drive_backend.c) serving the Fase 10A
+// flash-embedded SIDETNFS.PRG/README.TXT -- no SD, WiFi or TNFS access is
+// attempted or needed for GEMDRIVE to become ready. Existing SD/TNFS code
+// is not removed or rewritten; it is simply not reached while this is 1.
+// Default 0 (normal behavior, unchanged).
+#ifndef SIDETNFS_CONFIG_DRIVE_ONLY
+#define SIDETNFS_CONFIG_DRIVE_ONLY 0
+#endif
+
 // Fase 5N (stability investigation): compile-time switch for all DEBUG.TXT
 // writes. Independent of the backend/listing routing above -- this
 // lets Testbuild A disable the debug file while keeping the TNFS

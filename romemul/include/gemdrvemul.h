@@ -13,6 +13,7 @@
 #include "constants.h"
 #include "firmware_gemdrvemul.h"
 #include "sidetnfs_config.h"
+#include "sidetnfs_netconfig.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -163,6 +164,69 @@
 #define GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH (GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH + SIDETNFS_MOUNTPATH_LEN) // char[SIDETNFS_SDPATH_LEN]
 // Block ends at GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN (198 bytes total).
 
+// Fase 11C: round a shared-memory offset up to the next 4-byte boundary.
+// Scoped name (not a generic ALIGN4) to avoid any collision with unrelated
+// same-named macros elsewhere in the tree (e.g. pico-sdk's btstack ASF
+// ports, never included by this build, but not worth risking).
+#define SIDETNFS_NETWORK_ALIGN4(value) (((value) + 3u) & ~3u)
+
+// Fase 11A/11C: GET/SET/SAVE_NETWORK_CONFIG response/request block, placed
+// after the 198-byte drive record above, rounded up to the next 4-byte
+// boundary (offset 17524/0x4474 of the 64KB ROM3 shared-memory window --
+// ~46KB of headroom remains). Every field's offset is computed
+// independently, field-by-field, exactly like the drive record above --
+// never a raw struct-cast of sidetnfs_network_config_t (see
+// sidetnfs_netconfig.h) onto this shared memory. GET writes every field
+// below; SET reads every field except STATUS from payloadPtr in this same
+// order (mirrors the GET_DRIVE/SET_DRIVE relationship); SAVE reads and
+// writes only STATUS, like SAVE_CONFIG above. AUTH_MODE/USE_DHCP are plain
+// 16-bit words (WRITE_WORD/GET_PAYLOAD_PARAM16, no swap -- same convention
+// as the drive record's USED/LETTER/TYPE/TRANSPORT/PORT fields); the seven
+// string fields use the same byte-copy + CHANGE_ENDIANESS_BLOCK16
+// (Pico->Atari) / COPY_AND_CHANGE_ENDIANESS_BLOCK16 (Atari->Pico)
+// convention GET_DRIVE/SET_DRIVE already use -- see that block's own
+// comment for the hardware-proven rationale. Never change this swap based
+// on host-only testing. See docs/sidetnfs-config-protocol.md.
+//
+// Fase 11C alignment fix: the 198-byte drive record's own size is not a
+// multiple of 4, so the network block's unrounded base (0x4472) was only
+// 2-byte aligned -- STATUS's WRITE_AND_SWAP_LONGWORD then performed an
+// unaligned 32-bit store, which Cortex-M0+ cannot do in hardware
+// (HardFault, hardware-confirmed via Test 1/1A/1B/1C isolation builds --
+// see report). SIDETNFS_NETWORK_ALIGN4() inserts up to 3 padding bytes
+// (2, in practice) so every field below -- and everything SET/DELETE/etc.
+// derive from it -- is automatically safe.
+#define GEMDRVEMUL_SIDETNFS_NETWORK SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_STATUS (GEMDRVEMUL_SIDETNFS_NETWORK + 0)                                  // uint32_t, swapped long
+#define GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE (GEMDRVEMUL_SIDETNFS_NETWORK_STATUS + 4)                        // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP (GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE + 2)                      // uint16_t, plain word
+#define GEMDRVEMUL_SIDETNFS_NETWORK_SSID (GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP + 2)                           // char[MAX_SSID_LENGTH] (36)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD (GEMDRVEMUL_SIDETNFS_NETWORK_SSID + MAX_SSID_LENGTH)             // char[MAX_PASSWORD_LENGTH] (68)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY (GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD + MAX_PASSWORD_LENGTH)      // char[SIDETNFS_NET_COUNTRY_LEN] (4)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS (GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY + SIDETNFS_NET_COUNTRY_LEN)   // char[IPV4_ADDRESS_LENGTH] (16)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK (GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS + IPV4_ADDRESS_LENGTH)        // char[IPV4_ADDRESS_LENGTH] (16)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY (GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK + IPV4_ADDRESS_LENGTH)           // char[IPV4_ADDRESS_LENGTH] (16)
+#define GEMDRVEMUL_SIDETNFS_NETWORK_DNS (GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY + IPV4_ADDRESS_LENGTH)               // char[IPV4_ADDRESS_LENGTH] (16)
+// Block ends at GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH (182 bytes total incl. 2 bytes of leading padding: 4 status + 176 sidetnfs_network_config_t + 2 padding).
+
+// Fase 11C: compile-time alignment/bounds guarantees for the network
+// block. NETWORK_STATUS must be 4-byte aligned (the only uint32_t
+// WRITE_AND_SWAP_LONGWORD field); AUTH_MODE/USE_DHCP must be 2-byte
+// aligned (WRITE_WORD); every string field's byte length must be even,
+// since CHANGE_ENDIANESS_BLOCK16/COPY_AND_CHANGE_ENDIANESS_BLOCK16 process
+// them as whole uint16_t words; the block must fit within the 64KB ROM3
+// window (ROM_SIZE_BYTES is a runtime `const uint32_t`, not usable in a
+// _Static_assert, so the literal 0x10000 is asserted directly and cross-
+// checked against ROM_SIZE_BYTES wherever it's read at runtime instead).
+_Static_assert(GEMDRVEMUL_SIDETNFS_NETWORK_STATUS % 4 == 0, "GEMDRVEMUL_SIDETNFS_NETWORK_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE % 2 == 0, "GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP % 2 == 0, "GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP must be 2-byte aligned for WRITE_WORD");
+_Static_assert(MAX_SSID_LENGTH % 2 == 0, "MAX_SSID_LENGTH must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(MAX_PASSWORD_LENGTH % 2 == 0, "MAX_PASSWORD_LENGTH must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_NET_COUNTRY_LEN % 2 == 0, "SIDETNFS_NET_COUNTRY_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(IPV4_ADDRESS_LENGTH % 2 == 0, "IPV4_ADDRESS_LENGTH must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_NETWORK block must fit within the 64KB ROM3 window");
+
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00
 #define FATTRIB_SET 0x01
@@ -258,7 +322,13 @@ typedef struct DTANode
 typedef enum
 {
     GEMDRIVE_FILE_BACKEND_SD = 0,
-    GEMDRIVE_FILE_BACKEND_TNFS
+    GEMDRIVE_FILE_BACKEND_TNFS,
+    // Fase 10B: read-only, root-only virtual drive serving the Fase 10A
+    // flash-embedded SIDETNFS.PRG/README.TXT directly from their const
+    // arrays -- see romemul/sidetnfs_config_drive_backend.c. Only reached
+    // when SIDETNFS_CONFIG_DRIVE_ONLY (compile-time, default 0) selects it
+    // as the sole GEMDRIVE backend for a temporary test build.
+    GEMDRIVE_FILE_BACKEND_CONFIG_FLASH
 } GemdriveFileBackend;
 
 typedef struct FileDescriptors
@@ -277,6 +347,11 @@ typedef struct FileDescriptors
     // there. Lets GEMDRVEMUL_WRITE_BUFF_CALL deny a write to a read-only
     // TNFS handle locally, before ever contacting the server.
     bool tnfs_writable;
+    // Fase 10B: direct pointer into the existing Fase 10A const flash
+    // array (sidetnfs_config_prg/sidetnfs_config_readme) -- never a copy.
+    // Valid only when backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH.
+    const uint8_t *config_flash_data;
+    uint32_t config_flash_size;
 } FileDescriptors;
 
 typedef struct _pd PD;
@@ -346,5 +421,11 @@ void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void);
 
 // Function Prototypes
 void init_gemdrvemul(bool safe_config_reboot);
+
+// Fase 10B-afronding: true once main()'s cyw43_arch_init() has actually
+// succeeded this boot (see main.c) -- defined there, not here. Any
+// cyw43_arch_deinit() call site should check this instead of assuming init
+// always ran first.
+bool sidetnfs_cyw43_arch_is_ready(void);
 
 #endif // GEMDRVEMUL_H

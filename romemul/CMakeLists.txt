@@ -79,6 +79,9 @@ target_sources(${PROJECT_NAME} PRIVATE filesys.c)
 target_sources(${PROJECT_NAME} PRIVATE scfs.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_probe.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config.c)
+target_sources(${PROJECT_NAME} PRIVATE sidetnfs_netconfig.c)
+target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive.c)
+target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive_backend.c)
 target_sources(${PROJECT_NAME} PRIVATE rtcemul.c)
 target_sources(${PROJECT_NAME} PRIVATE gemdrvemul.c)
 target_sources(${PROJECT_NAME} PRIVATE usb_descriptors.c)
@@ -176,6 +179,15 @@ else()
         set(_SIDETNFS_ENABLE_DEBUG $ENV{SIDETNFS_ENABLE_DEBUG})
 endif()
 
+# Fase 10B: SIDETNFS_CONFIG_DRIVE_ONLY -- same passthrough pattern, default
+# 0 (unchanged behavior) unless explicitly overridden, e.g.:
+#   SIDETNFS_CONFIG_DRIVE_ONLY=1 SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+if("$ENV{SIDETNFS_CONFIG_DRIVE_ONLY}" STREQUAL "")
+        set(_SIDETNFS_CONFIG_DRIVE_ONLY 0)
+else()
+        set(_SIDETNFS_CONFIG_DRIVE_ONLY $ENV{SIDETNFS_CONFIG_DRIVE_ONLY})
+endif()
+
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
@@ -206,8 +218,10 @@ add_definitions(-D_DEBUG=${_DEBUG})
 # compiler, same as _DEBUG above.
 message("SIDETNFS_ENABLE_SD_SUPPORT: " ${_SIDETNFS_ENABLE_SD_SUPPORT})
 message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
+message("SIDETNFS_CONFIG_DRIVE_ONLY: " ${_SIDETNFS_CONFIG_DRIVE_ONLY})
 add_definitions(-DSIDETNFS_ENABLE_SD_SUPPORT=${_SIDETNFS_ENABLE_SD_SUPPORT})
 add_definitions(-DSIDETNFS_ENABLE_DEBUG=${_SIDETNFS_ENABLE_DEBUG})
+add_definitions(-DSIDETNFS_CONFIG_DRIVE_ONLY=${_SIDETNFS_CONFIG_DRIVE_ONLY})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")
