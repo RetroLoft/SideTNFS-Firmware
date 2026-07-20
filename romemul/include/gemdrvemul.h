@@ -189,13 +189,12 @@
 // on host-only testing. See docs/sidetnfs-config-protocol.md.
 //
 // Fase 11C alignment fix: the 198-byte drive record's own size is not a
-// multiple of 4, so the network block's unrounded base (0x4472) was only
-// 2-byte aligned -- STATUS's WRITE_AND_SWAP_LONGWORD then performed an
-// unaligned 32-bit store, which Cortex-M0+ cannot do in hardware
-// (HardFault, hardware-confirmed via Test 1/1A/1B/1C isolation builds --
-// see report). SIDETNFS_NETWORK_ALIGN4() inserts up to 3 padding bytes
-// (2, in practice) so every field below -- and everything SET/DELETE/etc.
-// derive from it -- is automatically safe.
+// multiple of 4, so the network block's unrounded base was only 2-byte
+// aligned -- STATUS's WRITE_AND_SWAP_LONGWORD then performed an unaligned
+// 32-bit store, which Cortex-M0+ cannot do in hardware (HardFault,
+// hardware-confirmed root cause). SIDETNFS_NETWORK_ALIGN4() inserts up to
+// 3 padding bytes (2, in practice) so every field below -- and everything
+// SET/DELETE/etc. derive from it -- is automatically safe.
 #define GEMDRVEMUL_SIDETNFS_NETWORK SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN)
 #define GEMDRVEMUL_SIDETNFS_NETWORK_STATUS (GEMDRVEMUL_SIDETNFS_NETWORK + 0)                                  // uint32_t, swapped long
 #define GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE (GEMDRVEMUL_SIDETNFS_NETWORK_STATUS + 4)                        // uint16_t, plain word

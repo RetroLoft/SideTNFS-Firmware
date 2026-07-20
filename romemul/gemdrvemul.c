@@ -2886,211 +2886,18 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_SIDETNFS_GET_NETWORK_CONFIG:
         {
-            // --- Fase 11C, real Fase 11A getter restored on aligned offsets ---
-            // Root cause (hardware-confirmed via Test 1/1A/1B/1C, see
-            // report): GEMDRVEMUL_SIDETNFS_NETWORK_STATUS used to be
-            // 0x4472, only 2-byte aligned, because the preceding 198-byte
-            // drive record's own size is not a multiple of 4.
-            // WRITE_AND_SWAP_LONGWORD's raw `*(volatile uint32_t*)` store
-            // there was an unaligned 32-bit access, which Cortex-M0+
-            // cannot perform in hardware -- HardFault. Fixed structurally
-            // in gemdrvemul.h: GEMDRVEMUL_SIDETNFS_NETWORK now rounds up
-            // to the next 4-byte boundary (SIDETNFS_NETWORK_ALIGN4()),
-            // moving STATUS to 0x4474 (4-byte aligned) and every
-            // subsequent field with it; _Static_assert()s there guard the
-            // alignment/bounds guarantees at compile time. Plain
-            // WRITE_AND_SWAP_LONGWORD is safe again.
-            //
-            // Hardware-validated on the new offsets by the aligned Test 2
-            // build (fixed literals, preserved below in #if 0) together
-            // with the user's updated AtariConfig client. This is the
-            // real Fase 11A implementation (verbatim, promoted back to
-            // active from the #if 0 block further below) -- read-only:
-            // sidetnfs_netconfig_get() only ever calls find_entry(), a
-            // pure RAM lookup against the existing configData.
-            sidetnfs_network_config_t netcfg;
-            sidetnfs_netconfig_get(&netcfg);
-
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
-                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, netcfg.auth_mode);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, netcfg.use_dhcp);
-
-            // Pico->Atari string transfer: same hardware-proven byte-copy +
-            // CHANGE_ENDIANESS_BLOCK16 pattern GET_DRIVE uses above -- see
-            // that block's comment for the full rationale. Never remove
-            // this swap based on host-only testing.
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), netcfg.ssid, MAX_SSID_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), netcfg.password, MAX_PASSWORD_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), netcfg.country, SIDETNFS_NET_COUNTRY_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), netcfg.ip_address, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), netcfg.netmask, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), netcfg.gateway, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), netcfg.primary_dns, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
-
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#if 0
-            // --- Fase 11C, aligned Test 2 build (superseded by real getter above) ---
-            // Same fixed-literal synthetic response as Test 2 (proves the
-            // response region/offsets/write helpers on the NEW aligned
-            // addresses) -- no sidetnfs_netconfig_get(), no find_entry(),
-            // no other config/network/flash function, no payloadPtr.
-            // Hardware-validated together with the user's updated
-            // AtariConfig client; superseded once the real getter above
-            // was restored.
-            char test2_ssid[MAX_SSID_LENGTH];
-            char test2_password[MAX_PASSWORD_LENGTH];
-            char test2_country[SIDETNFS_NET_COUNTRY_LEN];
-            char test2_ip_address[IPV4_ADDRESS_LENGTH];
-            char test2_netmask[IPV4_ADDRESS_LENGTH];
-            char test2_gateway[IPV4_ADDRESS_LENGTH];
-            char test2_primary_dns[IPV4_ADDRESS_LENGTH];
-
-            memset(test2_ssid, 0, sizeof(test2_ssid));
-            strncpy(test2_ssid, "TEST_WIFI", sizeof(test2_ssid) - 1);
-            memset(test2_password, 0, sizeof(test2_password));
-            strncpy(test2_password, "test_password", sizeof(test2_password) - 1);
-            memset(test2_country, 0, sizeof(test2_country));
-            strncpy(test2_country, "NL", sizeof(test2_country) - 1);
-            memset(test2_ip_address, 0, sizeof(test2_ip_address));
-            strncpy(test2_ip_address, "192.168.1.100", sizeof(test2_ip_address) - 1);
-            memset(test2_netmask, 0, sizeof(test2_netmask));
-            strncpy(test2_netmask, "255.255.255.0", sizeof(test2_netmask) - 1);
-            memset(test2_gateway, 0, sizeof(test2_gateway));
-            strncpy(test2_gateway, "192.168.1.1", sizeof(test2_gateway) - 1);
-            memset(test2_primary_dns, 0, sizeof(test2_primary_dns));
-            strncpy(test2_primary_dns, "1.1.1.1", sizeof(test2_primary_dns) - 1);
-
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
-                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, 4); // WPA2_AES_PSK
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, 1);
-
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), test2_ssid, MAX_SSID_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), test2_password, MAX_PASSWORD_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), test2_country, SIDETNFS_NET_COUNTRY_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), test2_ip_address, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), test2_netmask, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), test2_gateway, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), test2_primary_dns, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
-
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
-#if 0
-            // --- Fase 11C, Test 1C isolation build (superseded by aligned Test 2 above) ---
-            uint32_t status = (uint32_t)SIDETNFS_NETCONFIG_STATUS_NOT_STAGED;
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS, (uint16_t)(status >> 16));
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS + 2, (uint16_t)(status & 0xFFFF));
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
-#if 0
-            // --- Fase 11C, Test 1B isolation build (superseded by Test 1C above) ---
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
-#if 0
-            // --- Fase 11C, Test 1A isolation build (superseded by Test 1B above) ---
-            active_command_id = 0xFFFF;
-            break;
-#endif
-#if 0
-            // --- Fase 11C, Test 2 isolation build (superseded by Test 1A above) ---
-            // Full synthetic response: proves the response region,
-            // offsets, write helpers, and Atari-side readback in
-            // isolation. Every field below is a local fixed literal --
-            // never sidetnfs_netconfig_get(), find_entry(), or any other
-            // config/network/flash function, and payloadPtr is never
-            // touched. Same WRITE_WORD/WRITE_AND_SWAP_LONGWORD/memcpy+
-            // CHANGE_ENDIANESS_BLOCK16 primitives the real handler uses
-            // (see the disabled #if 0 block below) -- never a raw struct
-            // copy onto ROM3. Each local buffer is memset(0) across its
-            // FULL declared field length before strncpy() -- guarantees
-            // no leftover bytes from any earlier use of that stack slot
-            // and provable NUL-termination within bounds, independent of
-            // strncpy's own (also-safe) short-source padding behavior.
-            // No dynamic allocation. Test 1's no-op version and the real
-            // Fase 11A implementation are both preserved verbatim below
-            // (#if 0), not deleted.
-            char test2_ssid[MAX_SSID_LENGTH];
-            char test2_password[MAX_PASSWORD_LENGTH];
-            char test2_country[SIDETNFS_NET_COUNTRY_LEN];
-            char test2_ip_address[IPV4_ADDRESS_LENGTH];
-            char test2_netmask[IPV4_ADDRESS_LENGTH];
-            char test2_gateway[IPV4_ADDRESS_LENGTH];
-            char test2_primary_dns[IPV4_ADDRESS_LENGTH];
-
-            memset(test2_ssid, 0, sizeof(test2_ssid));
-            strncpy(test2_ssid, "TEST_WIFI", sizeof(test2_ssid) - 1);
-            memset(test2_password, 0, sizeof(test2_password));
-            strncpy(test2_password, "test_password", sizeof(test2_password) - 1);
-            memset(test2_country, 0, sizeof(test2_country));
-            strncpy(test2_country, "NL", sizeof(test2_country) - 1);
-            memset(test2_ip_address, 0, sizeof(test2_ip_address));
-            strncpy(test2_ip_address, "192.168.1.100", sizeof(test2_ip_address) - 1);
-            memset(test2_netmask, 0, sizeof(test2_netmask));
-            strncpy(test2_netmask, "255.255.255.0", sizeof(test2_netmask) - 1);
-            memset(test2_gateway, 0, sizeof(test2_gateway));
-            strncpy(test2_gateway, "192.168.1.1", sizeof(test2_gateway) - 1);
-            memset(test2_primary_dns, 0, sizeof(test2_primary_dns));
-            strncpy(test2_primary_dns, "1.1.1.1", sizeof(test2_primary_dns) - 1);
-
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
-                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_OK);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_AUTH_MODE, 4); // WPA2_AES_PSK, see network.c get_auth_pico_code() mapping (3,4,5)
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_USE_DHCP, 1);
-
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID), test2_ssid, MAX_SSID_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_SSID, MAX_SSID_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD), test2_password, MAX_PASSWORD_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_PASSWORD, MAX_PASSWORD_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY), test2_country, SIDETNFS_NET_COUNTRY_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_COUNTRY, SIDETNFS_NET_COUNTRY_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS), test2_ip_address, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_IP_ADDRESS, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK), test2_netmask, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_NETMASK, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY), test2_gateway, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY, IPV4_ADDRESS_LENGTH);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS), test2_primary_dns, IPV4_ADDRESS_LENGTH);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_NETWORK_DNS, IPV4_ADDRESS_LENGTH);
-
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#if 0
-            // --- Fase 11C, Test 1 isolation build (superseded by Test 2 above) ---
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_NETWORK_STATUS,
-                                     (uint32_t)SIDETNFS_NETCONFIG_STATUS_NOT_STAGED);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#endif
-#if 0
             // Fase 11A: read-only. No request payload, no SD/WiFi/flash
             // I/O -- sidetnfs_netconfig_get() only ever calls find_entry(),
             // a pure RAM lookup against the existing configData. See
             // docs/sidetnfs-config-protocol.md.
+            //
+            // GEMDRVEMUL_SIDETNFS_NETWORK_STATUS and every subsequent
+            // field are rounded up to a 4-byte boundary via
+            // SIDETNFS_NETWORK_ALIGN4() in gemdrvemul.h (STATUS at
+            // 0x4474) -- required because WRITE_AND_SWAP_LONGWORD's raw
+            // 32-bit store cannot target an unaligned address on
+            // Cortex-M0+; _Static_assert()s there guard the
+            // alignment/bounds guarantees at compile time.
             sidetnfs_network_config_t netcfg;
             sidetnfs_netconfig_get(&netcfg);
 
@@ -3121,8 +2928,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
-#endif // Fase 11A original implementation
-#endif // Fase 11C Test 2 isolation build wrapper
         }
         case GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG:
         {
