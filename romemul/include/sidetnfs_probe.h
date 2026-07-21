@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "sidetnfs_config.h" // sidetnfs_drive_config_t -- see sidetnfs_slot_tnfs_context_t below
+
 // Fase 6A/6E: central backend choice for GEMDRIVE directory listing.
 // Replaced the old on/off SIDETNFS_EXPERIMENTAL_FS_LISTING switch (removed
 // in Fase 6E) with an explicit backend identifier, so future backends (e.g.
@@ -267,6 +269,56 @@ bool sidetnfs_probe_has_active_server(void);
 // sidetnfs_probe_load_active_server(). Only meaningful when
 // sidetnfs_probe_has_active_server() is true; returns '\0' otherwise.
 char sidetnfs_probe_get_active_drive_letter(void);
+
+// Fase 1 (multi-drive slot routing, TNFS runtime context): mirrors
+// gemdrvemul.c's GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (9), duplicated
+// as a literal rather than included -- sidetnfs_probe.h must not depend
+// on gemdrvemul.h (the dependency already goes the other way). See
+// report for the cross-check this relies on.
+#define SIDETNFS_PROBE_MAX_RUNTIME_SLOTS 9
+
+// Fase 1 (multi-drive slot routing): per-slot TNFS/backend identity --
+// host/port/mount_path/sd_path/backend/transport, structurally mirrored
+// from a slot's persisted sidetnfs_drive_config_t (see
+// sidetnfs_probe_set_slot_context()). session_id/session_established are
+// the one piece of state this struct does NOT get from the config record
+// -- they only ever reflect a real, already-established TNFS session.
+// The current TNFS client (s_mount_pcb/s_fslisting_pcb, the blocking
+// cmd+seq-only response correlation in SidetnfsFsListingResponse, and
+// the single global s_state.sid) supports exactly one concurrent
+// session, so only slot 0 (the same drive the existing single-drive code
+// already mounts) ever reports session_established == true in this
+// phase -- see sidetnfs_probe_get_slot_context() and the report for why
+// a second, real, concurrent session is not implemented yet.
+typedef struct
+{
+    bool valid;                                    // true once sidetnfs_probe_set_slot_context() has populated this slot
+    uint8_t backend_type;                           // sidetnfs_drive_type_t
+    uint8_t transport;                               // sidetnfs_transport_t (TNFS only)
+    char host[SIDETNFS_HOST_LEN];                    // TNFS only
+    uint16_t port;                                   // TNFS only
+    char mount_path[SIDETNFS_MOUNTPATH_LEN];         // TNFS only, e.g. "/Atari.ST" or "/DOS"
+    char sd_path[SIDETNFS_SDPATH_LEN];               // SD only
+    uint16_t session_id;                             // meaningful only when session_established
+    bool session_established;                        // true only for the one slot with a real, live TNFS session (slot 0 in this phase)
+} sidetnfs_slot_tnfs_context_t;
+
+// Populates slot `slot`'s host/port/mount_path/sd_path/backend/transport
+// from *cfg (a full copy, not a reference -- *cfg may be a stack-local
+// the caller reuses/frees right after this call). No network/TNFS
+// activity of any kind -- pure data copy. Does not touch
+// session_id/session_established (see sidetnfs_probe_get_slot_context()).
+// No-op if slot is out of range or cfg is NULL.
+void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cfg);
+
+// Fills *out with slot `slot`'s context; returns false (out untouched) if
+// the slot is out of range or was never populated via
+// sidetnfs_probe_set_slot_context(). For slot 0 only, session_id/
+// session_established are overlaid read-only from the existing
+// single-session TNFS client state (s_state.sid/mount_response_received/
+// mount_rc) at call time -- always the live value, never stale. Every
+// other slot always reports session_established == false.
+bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out);
 
 // Fase 9E: re-activate the SideTNFS drive-list config at the proven
 // Atari-reset boundary (GEMDRVEMUL_PING in gemdrvemul.c, guarded by

@@ -63,6 +63,14 @@ typedef struct
 
 static sidetnfs_runtime_drive_t g_runtime_drives[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES];
 
+// Fase 1 (multi-drive slot routing, TNFS runtime context): sidetnfs_probe.h
+// cannot include gemdrvemul.h (the dependency already goes the other way),
+// so SIDETNFS_PROBE_MAX_RUNTIME_SLOTS is a separately maintained literal --
+// this is the one place both constants are visible together to catch any
+// future drift at compile time.
+_Static_assert(GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES == SIDETNFS_PROBE_MAX_RUNTIME_SLOTS,
+               "GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES and SIDETNFS_PROBE_MAX_RUNTIME_SLOTS must match");
+
 // Fase 1 (multi-drive slot routing): derived from g_runtime_drives --
 // never set independently anywhere else. g_drive_number_table[slot] is
 // g_runtime_drives[slot].drive_number for every valid slot (0xFFFFFFFF
@@ -2111,6 +2119,23 @@ static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t acti
     }
     DPRINTF("Runtime drive table: slot 0 valid=%d drive=%d, slot 1 (O:) valid=%d\n",
             g_runtime_drives[0].valid, (int)g_runtime_drives[0].drive_number, o_valid);
+
+    // Fase 1 (multi-drive slot routing, TNFS runtime context): mirrors
+    // each valid slot's persisted host/port/mount_path/sd_path/backend/
+    // transport into sidetnfs_probe.c's own per-slot context table (see
+    // sidetnfs_probe_set_slot_context()'s doc comment) -- pure data copy,
+    // no network/TNFS activity. Slot 0's context is exactly the same
+    // record the existing single-drive TNFS client already uses (this
+    // does not replace or touch s_active_host/s_active_port/
+    // s_active_mount_path/s_state.sid -- those remain the authoritative
+    // state driving the real, single active session in this phase).
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (g_runtime_drives[i].valid)
+        {
+            sidetnfs_probe_set_slot_context(i, &g_runtime_drives[i].config);
+        }
+    }
 
     // Derive g_drive_number_table/g_drive_count from g_runtime_drives --
     // relies on validity being contiguous from slot 0 (guaranteed by

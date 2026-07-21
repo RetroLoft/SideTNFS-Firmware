@@ -536,6 +536,61 @@ typedef struct
 static SidetnfsDebugState s_state = {0};
 static uint8_t s_readdirx_seq = 2; // MOUNT uses 0, OPENDIRX uses 1
 
+// Fase 1 (multi-drive slot routing): the per-slot TNFS/backend identity
+// table -- see sidetnfs_slot_tnfs_context_t's own comment in
+// sidetnfs_probe.h. Populated exclusively by sidetnfs_probe_set_slot_context()
+// below; nothing else in this file writes to it.
+static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_SLOTS];
+
+void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cfg)
+{
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS || cfg == NULL)
+    {
+        return;
+    }
+
+    sidetnfs_slot_tnfs_context_t *ctx = &s_slot_contexts[slot];
+    memset(ctx, 0, sizeof(*ctx));
+
+    ctx->backend_type = cfg->type;
+    ctx->transport = cfg->transport;
+    strncpy(ctx->host, cfg->host, sizeof(ctx->host) - 1);
+    ctx->port = cfg->port;
+    strncpy(ctx->mount_path, cfg->mount_path, sizeof(ctx->mount_path) - 1);
+    strncpy(ctx->sd_path, cfg->sd_path, sizeof(ctx->sd_path) - 1);
+    // session_id/session_established stay 0/false here -- see
+    // sidetnfs_probe_get_slot_context() for the one place slot 0's real
+    // session state is ever reflected.
+    ctx->valid = true;
+}
+
+bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out)
+{
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS || out == NULL)
+    {
+        return false;
+    }
+    if (!s_slot_contexts[slot].valid)
+    {
+        return false;
+    }
+
+    *out = s_slot_contexts[slot];
+
+    if (slot == 0)
+    {
+        // Fase 1: slot 0 is the only slot the current single-session TNFS
+        // client (s_mount_pcb/s_state.sid) can ever actually have mounted
+        // -- read live, never mutating s_slot_contexts itself. Same
+        // "mounted successfully" condition already used elsewhere in this
+        // file (e.g. send_readdirx_probe()'s own guard).
+        out->session_id = s_state.sid;
+        out->session_established = s_state.mount_response_received && (s_state.mount_rc == TNFS_OK);
+    }
+
+    return true;
+}
+
 // Fase 7D4: suppress back-to-back TNFS_READDIRX_EOF events for the same
 // ndta -- repeated fresh directory scans (Desktop refresh, repeated
 // Fsfirst) each end in one EOF event, and these were crowding out the
