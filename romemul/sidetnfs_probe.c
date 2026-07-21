@@ -542,6 +542,18 @@ static uint8_t s_readdirx_seq = 2; // MOUNT uses 0, OPENDIRX uses 1
 // below; nothing else in this file writes to it.
 static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_SLOTS];
 
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): slot 1's own
+// MOUNT response state, the direct analogue of
+// s_state.sid/mount_rc/mount_response_received for slot 0 -- kept
+// separate from s_state (which remains exclusively slot 0's, unchanged)
+// so a failed/slow slot 1 mount can never perturb slot 0's own state.
+// Written only by tnfs_recv_callback()'s seq==TNFS_MOUNT_SEQ_SLOT1
+// branch and send_slot1_mount_request() (both further down in this
+// file); read by sidetnfs_probe_get_slot_context() below.
+static uint16_t s_slot1_mount_sid = 0;
+static uint8_t s_slot1_mount_rc = 0xFF; // 0xFF: no response yet (not a real TNFS rc)
+static bool s_slot1_mount_response_received = false;
+
 void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cfg)
 {
     if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS || cfg == NULL)
@@ -579,14 +591,26 @@ bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out
 
     if (slot == 0)
     {
-        // Fase 1: slot 0 is the only slot the current single-session TNFS
-        // client (s_mount_pcb/s_state.sid) can ever actually have mounted
-        // -- read live, never mutating s_slot_contexts itself. Same
-        // "mounted successfully" condition already used elsewhere in this
-        // file (e.g. send_readdirx_probe()'s own guard).
+        // Fase 1: slot 0's real session state -- read live from the
+        // existing single-session TNFS client fields, never mutating
+        // s_slot_contexts itself. Same "mounted successfully" condition
+        // already used elsewhere in this file (e.g. sidetnfs_tnfs_listing_ready()).
         out->session_id = s_state.sid;
         out->session_established = s_state.mount_response_received && (s_state.mount_rc == TNFS_OK);
     }
+    else if (slot == 1)
+    {
+        // Fase 1 (multi-drive slot routing, TNFS mount sequencing):
+        // slot 1's own real session state, set by
+        // sidetnfs_probe_mount_runtime_slots()'s sequential MOUNT of
+        // slot 1 -- read live, same shape as slot 0 above. No longer
+        // forced false.
+        out->session_id = s_slot1_mount_sid;
+        out->session_established = s_slot1_mount_response_received && (s_slot1_mount_rc == TNFS_OK);
+    }
+    // Every other slot: session_id/session_established stay at
+    // s_slot_contexts[slot]'s own values (0/false) -- never populated by
+    // anything in this phase.
 
     return true;
 }
@@ -1509,6 +1533,23 @@ static SidetnfsFsListingResponse s_fslisting_resp = {0};
 // from under an in-flight callback.
 static struct udp_pcb *s_mount_pcb = NULL;
 
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): slot 1's
+// (O:) own MOUNT sequence number, distinct from slot 0's (0), OPENDIRX's
+// (1, legacy/dead under SIDETNFS_USE_TNFS_LISTING -- see
+// sidetnfs_probe_service()) and READDIRX's (2.., same legacy path) --
+// picked well clear of that range (bounded by SIDETNFS_READDIRX_MAX_ROUNDS,
+// max ~34) so a future revival of that legacy probe still could never
+// collide with this value.
+#define TNFS_MOUNT_SEQ_SLOT1 0x40u
+
+// Fase 1: the server address each in-flight MOUNT request was actually
+// sent to, captured at send time (not re-parsed from a hostname string
+// on every incoming packet) -- tnfs_recv_callback() checks the response
+// sender against these, so a spoofed/unexpected-source packet is never
+// attributed to either slot regardless of its sequence number.
+static ip_addr_t s_mount_expected_addr_slot0;
+static ip_addr_t s_mount_expected_addr_slot1;
+
 bool sidetnfs_udp_connect_test(void)
 {
     ip_addr_t server_ip;
@@ -1877,8 +1918,6 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     (void)arg;
     (void)pcb;
-    (void)addr;
-    (void)port;
     if (!p)
     {
         return;
@@ -1907,10 +1946,33 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     uint8_t cmd = buf[3];
     if (cmd == TNFS_CMD_MOUNT)
     {
-        s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-        s_state.mount_rc = n > 4 ? buf[4] : 0;
-        s_state.mount_response_received = true;
-        s_state.debug_dirty = true;
+        // Fase 1 (multi-drive slot routing, TNFS mount sequencing): two
+        // sequential MOUNT requests can now be outstanding, one at a
+        // time, against this same PCB (slot 0 with seq 0, slot 1 with
+        // seq TNFS_MOUNT_SEQ_SLOT1) -- route strictly on the echoed
+        // sequence number (offset 2) and, defensively, on the actual UDP
+        // sender matching the slot's own configured server, so a late
+        // response for one slot can never be attributed to the other
+        // (or to neither, if the sender doesn't match at all -- silently
+        // ignored). Slot 0's own matching/state-write below is otherwise
+        // byte-for-byte unchanged from before this phase.
+        uint8_t seq = buf[2];
+        if (seq == 0 && addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot0) && port == s_active_port)
+        {
+            s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            s_state.mount_rc = n > 4 ? buf[4] : 0;
+            s_state.mount_response_received = true;
+            s_state.debug_dirty = true;
+        }
+        else if (seq == TNFS_MOUNT_SEQ_SLOT1 && addr != NULL &&
+                 ip_addr_cmp(addr, &s_mount_expected_addr_slot1) && port == s_slot_contexts[1].port)
+        {
+            s_slot1_mount_sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+            s_slot1_mount_rc = n > 4 ? buf[4] : 0;
+            s_slot1_mount_response_received = true;
+        }
+        // else: unexpected seq or sender -- stray/late/spoofed packet,
+        // ignored, never attributed to either slot.
     }
     else if (cmd == TNFS_CMD_OPENDIRX)
     {
@@ -2048,7 +2110,130 @@ void sidetnfs_send_mount_probe(void)
     // registered above can still fire for a reply that arrives later.
     s_mount_pcb = pcb;
 
+    // Fase 1 (multi-drive slot routing, TNFS mount sequencing): record
+    // the actual server this request went to, so tnfs_recv_callback()
+    // can validate the response's sender -- see that function's own
+    // comment. Purely additive: does not change any byte sent or any
+    // existing state written by this function.
+    s_mount_expected_addr_slot0 = server_ip;
+
     cyw43_arch_lwip_end();
+}
+
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): sends slot
+// 1's (O:) MOUNT request over the SAME s_mount_pcb slot 0's own mount
+// already created above -- never a second/parallel socket. Uses
+// s_slot_contexts[1]'s host/mount_path (populated by
+// sidetnfs_probe_set_slot_context() before this can ever be called) and
+// the distinct TNFS_MOUNT_SEQ_SLOT1 sequence number, so
+// tnfs_recv_callback() can tell its response apart from slot 0's. A
+// no-op (s_slot1_mount_response_received stays false) if s_mount_pcb
+// doesn't exist yet or the host doesn't parse -- never touches s_state
+// (slot 0) either way.
+static void send_slot1_mount_request(void)
+{
+    s_slot1_mount_response_received = false;
+    s_slot1_mount_rc = 0xFF;
+
+    if (s_mount_pcb == NULL)
+    {
+        return;
+    }
+
+    ip_addr_t server_ip;
+    if (!ipaddr_aton(s_slot_contexts[1].host, &server_ip))
+    {
+        return;
+    }
+
+    cyw43_arch_lwip_begin();
+
+    // Same wire shape as slot 0's own MOUNT above (session=0x0000 --
+    // slot 1 is its own, brand-new TNFS session, never a continuation of
+    // slot 0's), only the sequence number and mount path differ.
+    char canonical_mount_path[SIDETNFS_MOUNTPATH_LEN + 1];
+    build_canonical_mount_path(s_slot_contexts[1].mount_path, canonical_mount_path, sizeof(canonical_mount_path));
+    size_t mount_path_len = strlen(canonical_mount_path) + 1;
+    uint8_t buf[6 + SIDETNFS_MOUNTPATH_LEN + 1 + 2];
+    buf[0] = 0x00;
+    buf[1] = 0x00;
+    buf[2] = TNFS_MOUNT_SEQ_SLOT1;
+    buf[3] = TNFS_CMD_MOUNT;
+    buf[4] = TNFS_PROTO_VER_MINOR;
+    buf[5] = TNFS_PROTO_VER_MAJOR;
+    memcpy(&buf[6], canonical_mount_path, mount_path_len);
+    size_t offset = 6 + mount_path_len;
+    buf[offset++] = '\0'; // user: anonymous
+    buf[offset++] = '\0'; // password: none
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)offset, PBUF_RAM);
+    if (!p)
+    {
+        cyw43_arch_lwip_end();
+        return;
+    }
+
+    memcpy(p->payload, buf, offset);
+    udp_sendto(s_mount_pcb, p, &server_ip, s_slot_contexts[1].port);
+    pbuf_free(p);
+
+    s_mount_expected_addr_slot1 = server_ip;
+
+    cyw43_arch_lwip_end();
+}
+
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): bounded poll
+// wait for a single MOUNT response flag -- same shape/timeout as
+// fslisting_wait_for() (SIDETNFS_FS_WAIT_MAX_ITER * SIDETNFS_FS_WAIT_STEP_US
+// = 200ms), the already-proven bound for one UDP round trip to the
+// configured TNFS server on a LAN.
+static bool wait_for_mount_response(const bool *response_flag)
+{
+    for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
+    {
+        cyw43_arch_poll();
+        if (*response_flag)
+        {
+            return true;
+        }
+        sleep_us(SIDETNFS_FS_WAIT_STEP_US);
+    }
+    return false; // bounded-wait timeout
+}
+
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): mounts every
+// valid TNFS/UDP runtime slot strictly one at a time -- slot 0 (N:, via
+// the existing, unchanged sidetnfs_send_mount_probe()) first, then,
+// only once its response has arrived or its wait has timed out, slot 1
+// (O:, if sidetnfs_probe_set_slot_context() marked it valid and
+// TNFS/UDP) over the SAME s_mount_pcb -- never in parallel, never a
+// second socket. A failed or timed-out slot 1 mount never touches slot
+// 0's own state (s_state is only ever written by the seq==0 branch of
+// tnfs_recv_callback()); a failed or timed-out slot 0 mount does not
+// skip the slot 1 attempt either -- each slot's outcome is independent.
+//
+// Call this instead of sidetnfs_send_mount_probe() directly at the one
+// call site in gemdrvemul.c that starts network-dependent setup;
+// sidetnfs_send_mount_probe() itself is unchanged and still used as-is
+// by sidetnfs_probe_reinit_active_server() (single-slot reinit, out of
+// scope for this phase).
+void sidetnfs_probe_mount_runtime_slots(void)
+{
+    sidetnfs_send_mount_probe();
+    bool slot0_ok = wait_for_mount_response(&s_state.mount_response_received);
+    DPRINTF("TNFS mount slot 0 (N:) path=%s: %s rc=%u sid=0x%04X\n",
+            s_active_mount_path, slot0_ok ? "responded" : "TIMED OUT",
+            s_state.mount_rc, s_state.sid);
+
+    if (s_slot_contexts[1].valid && s_slot_contexts[1].backend_type == SIDETNFS_DRIVE_TNFS &&
+        s_slot_contexts[1].transport == SIDETNFS_TRANSPORT_UDP)
+    {
+        send_slot1_mount_request();
+        bool slot1_ok = wait_for_mount_response(&s_slot1_mount_response_received);
+        DPRINTF("TNFS mount slot 1 (O:) path=%s: %s rc=%u sid=0x%04X\n",
+                s_slot_contexts[1].mount_path, slot1_ok ? "responded" : "TIMED OUT",
+                s_slot1_mount_rc, s_slot1_mount_sid);
+    }
 }
 
 // Fase 5I: send a single OPENDIRX "/" request over the existing MOUNT PCB,

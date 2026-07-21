@@ -2609,13 +2609,21 @@ void init_gemdrvemul(bool safe_config_reboot)
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RTC_STATUS)) = 0xFFFFFFFF;
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0xFFFFFFFF;
 
-                // Fase 5C: lazy, non-blocking TNFS MOUNT probe. This is the
-                // last point in network setup where WiFi is still known to
-                // be up (every other path below this falls back to
-                // cyw43_arch_deinit()), and it runs before the main command
-                // loop below ever sees a real Atari/GEMDRIVE handshake.
+                // Fase 5C: TNFS MOUNT probe. This is the last point in
+                // network setup where WiFi is still known to be up (every
+                // other path below this falls back to cyw43_arch_deinit()),
+                // and it runs before the main command loop below ever sees
+                // a real Atari/GEMDRIVE handshake.
+                //
+                // Fase 1 (multi-drive slot routing, TNFS mount sequencing):
+                // now mounts slot 0 (N:) exactly as sidetnfs_send_mount_probe()
+                // always did, then, strictly afterward, slot 1 (O:) if
+                // valid -- see sidetnfs_probe_mount_runtime_slots(). Bounded
+                // (~200ms per slot actually attempted) rather than the old
+                // pure fire-and-forget call; slot 0's own request/response
+                // handling is unchanged.
                 sidetnfs_network_ok = true;
-                sidetnfs_send_mount_probe();
+                sidetnfs_probe_mount_runtime_slots();
             }
             else
             {

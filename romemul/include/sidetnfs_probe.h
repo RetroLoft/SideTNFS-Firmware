@@ -282,14 +282,15 @@ char sidetnfs_probe_get_active_drive_letter(void);
 // from a slot's persisted sidetnfs_drive_config_t (see
 // sidetnfs_probe_set_slot_context()). session_id/session_established are
 // the one piece of state this struct does NOT get from the config record
-// -- they only ever reflect a real, already-established TNFS session.
-// The current TNFS client (s_mount_pcb/s_fslisting_pcb, the blocking
-// cmd+seq-only response correlation in SidetnfsFsListingResponse, and
-// the single global s_state.sid) supports exactly one concurrent
-// session, so only slot 0 (the same drive the existing single-drive code
-// already mounts) ever reports session_established == true in this
-// phase -- see sidetnfs_probe_get_slot_context() and the report for why
-// a second, real, concurrent session is not implemented yet.
+// -- they only ever reflect a real, already-established TNFS session, set
+// by sidetnfs_probe_mount_runtime_slots() sequentially mounting each
+// valid slot (slot 0 via the existing single-session client state,
+// slot 1 via its own, separate MOUNT request/response over the same
+// PCB -- see that function). The underlying client still supports only
+// one *concurrent* session (see sidetnfs_probe_mount_runtime_slots()'s
+// own comment) -- slots 0 and 1 are mounted one after another, not at
+// the same time, but each keeps its own resulting session id afterward.
+// Slots 2.. are never populated in this phase.
 typedef struct
 {
     bool valid;                                    // true once sidetnfs_probe_set_slot_context() has populated this slot
@@ -300,7 +301,7 @@ typedef struct
     char mount_path[SIDETNFS_MOUNTPATH_LEN];         // TNFS only, e.g. "/Atari.ST" or "/DOS"
     char sd_path[SIDETNFS_SDPATH_LEN];               // SD only
     uint16_t session_id;                             // meaningful only when session_established
-    bool session_established;                        // true only for the one slot with a real, live TNFS session (slot 0 in this phase)
+    bool session_established;                        // true once that slot's own MOUNT has actually succeeded
 } sidetnfs_slot_tnfs_context_t;
 
 // Populates slot `slot`'s host/port/mount_path/sd_path/backend/transport
@@ -313,11 +314,13 @@ void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cf
 
 // Fills *out with slot `slot`'s context; returns false (out untouched) if
 // the slot is out of range or was never populated via
-// sidetnfs_probe_set_slot_context(). For slot 0 only, session_id/
-// session_established are overlaid read-only from the existing
+// sidetnfs_probe_set_slot_context(). session_id/session_established are
+// overlaid read-only at call time -- for slot 0, from the existing
 // single-session TNFS client state (s_state.sid/mount_response_received/
-// mount_rc) at call time -- always the live value, never stale. Every
-// other slot always reports session_established == false.
+// mount_rc); for slot 1, from its own MOUNT response state, set by
+// sidetnfs_probe_mount_runtime_slots(). Both are always the live value,
+// never stale. Every slot 2.. always reports session_established ==
+// false (never populated in this phase).
 bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out);
 
 // Fase 9E: re-activate the SideTNFS drive-list config at the proven
@@ -359,6 +362,21 @@ void sidetnfs_send_udp_probe(void);
 // confirmed connected. Marks the debug state dirty so
 // sidetnfs_debug_file_service() will pick this up on its next call.
 void sidetnfs_send_mount_probe(void);
+
+// Fase 1 (multi-drive slot routing, TNFS mount sequencing): mounts every
+// valid TNFS/UDP runtime slot strictly sequentially -- slot 0 (N:, via
+// sidetnfs_send_mount_probe() above, unchanged) first, then, only after
+// its response/timeout, slot 1 (O:, if valid) over the same PCB. Bounded
+// (~200ms per slot, same proven timeout as the existing fs-listing wait)
+// -- blocks the caller for at most ~400ms total, unlike
+// sidetnfs_send_mount_probe()'s own fire-and-forget contract. Must only
+// be called after WiFi is confirmed connected, and only once slot
+// contexts have been populated via sidetnfs_probe_set_slot_context().
+// Use this instead of sidetnfs_send_mount_probe() at Pico boot; reinit
+// (sidetnfs_probe_reinit_active_server()) still uses
+// sidetnfs_send_mount_probe() directly (slot 0 only, out of scope for
+// this phase).
+void sidetnfs_probe_mount_runtime_slots(void);
 
 // Fase 5G: check whether the MOUNT response is in and successful, and if so
 // (and OPENDIR "/" was not already sent this boot) send a single OPENDIR
