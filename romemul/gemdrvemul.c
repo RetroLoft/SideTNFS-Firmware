@@ -2074,6 +2074,32 @@ void init_gemdrvemul(bool safe_config_reboot)
     set_shared_var(SHARED_VARIABLE_BUFFER_TYPE, buffer_type, memory_shared_address);
     set_shared_var(SHARED_VARIABLE_FAKE_FLOPPY, virtual_fake_floppy, memory_shared_address);
 
+    // Fase 1 (multi-drive, ROM side only): publish the new
+    // protocol-version/drive-count/drive-number table the 68k ROM
+    // validates right after PING succeeds (gemdrive.s's
+    // validate_drive_table, called from _ping_ready before save_vectors
+    // installs the GEMDOS trap) -- must be set before this function's
+    // main command loop can ever answer a PING with
+    // GEMDRVEMUL_PING_STATUS=1 (ready), which this call sequence
+    // guarantees since it runs before that loop starts. Drive count is
+    // pinned to 1 in this phase (see report) -- slot 0 mirrors the same
+    // drive_number already published above via SHARED_VARIABLE_DRIVE_NUMBER
+    // (never a second, independent source of truth); the old scalar
+    // SHARED_VARIABLE_DRIVE_LETTER/_DRIVE_NUMBER writes above are left in
+    // place -- other Pico-side code still reads them, and this new table
+    // is additive, not a replacement, in this phase.
+    set_shared_var(SHARED_VARIABLE_PROTOCOL_VERSION, SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION, memory_shared_address);
+    set_shared_var(SHARED_VARIABLE_DRIVE_COUNT, 1, memory_shared_address);
+    set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, drive_number, memory_shared_address);
+    for (int slot = 1; slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; slot++)
+    {
+        // Unread by the 68k side while drive count stays at 1 (see
+        // comment on the constants in gemdrvemul.h) -- initialized to -1
+        // (fails validate_drive_table's 0..25 range check) rather than
+        // left undefined.
+        set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + slot, 0xFFFFFFFF, memory_shared_address);
+    }
+
     for (int i = 0; i < SHARED_VARIABLES_SIZE; i++)
     {
         uint32_t value = *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_SHARED_VARIABLES + (i * 4)));
@@ -2669,6 +2695,13 @@ void init_gemdrvemul(bool safe_config_reboot)
                 uint32_t reinit_drive_number = reinit_drive_letter_num - 65;
                 set_shared_var(SHARED_VARIABLE_DRIVE_LETTER, reinit_drive_letter_num, memory_shared_address);
                 set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER, reinit_drive_number, memory_shared_address);
+                // Fase 1 (multi-drive, ROM side only): keep the new
+                // table's slot 0 in sync with the scalar
+                // SHARED_VARIABLE_DRIVE_NUMBER above -- validate_drive_table
+                // runs again on every Atari reset, right after this same
+                // PING. Protocol version/drive count never change here
+                // (still 1/1, set once at Pico boot above).
+                set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, reinit_drive_number, memory_shared_address);
 
                 // Only now, after the new config/drive/server have all
                 // been adopted, clear the pending flag -- a later

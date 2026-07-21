@@ -58,6 +58,30 @@
 #define SHARED_VARIABLE_PEXEC_RESTORE SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 3
 #define SHARED_VARIABLE_FAKE_FLOPPY SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 4
 
+// Fase 1 (multi-drive, ROM side only in this phase): mirrors
+// sidecart-gemdrive-atari/src/gemdrive.s exactly --
+// SHARED_VARIABLE_PROTOCOL_VERSION/_DRIVE_COUNT/_DRIVE_NUMBER_TABLE (same
+// names, same SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE-relative indices 21/22/23).
+// The 68k ROM reads and validates this table right after PING succeeds,
+// before it installs its GEMDOS trap -- refuses to boot (no silent
+// single-drive fallback) if SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION doesn't
+// match exactly. GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES mirrors the 68k's
+// SIDETNFS_MAX_RUNTIME_DRIVES (SIDETNFS_MAX_DRIVES ordinary drives + 1
+// CONFIG drive) -- the number of 4-byte slots in the table, indices
+// SHARED_VARIABLE_DRIVE_NUMBER_TABLE..+8. In this phase drive count is
+// always 1, so only slot 0 is ever read by the 68k side (see
+// validate_drive_table/create_virtual_hard_disk in gemdrive.s, both of
+// which loop exactly SHARED_VARIABLE_DRIVE_COUNT times) -- the remaining
+// eight slots are unread filler, still initialized to a value that fails
+// validate_drive_table's own 0..25 range check (-1) rather than left
+// undefined, so a future drive-count increase can never silently pick up
+// a stale/garbage slot as a real drive.
+#define SHARED_VARIABLE_PROTOCOL_VERSION SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 5
+#define SHARED_VARIABLE_DRIVE_COUNT SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 6
+#define SHARED_VARIABLE_DRIVE_NUMBER_TABLE SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 7
+#define GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (SIDETNFS_MAX_DRIVES + 1)
+#define SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION 1
+
 #define GEMDRVEMUL_RANDOM_TOKEN (0x0)                                   // Offset from 0x0000
 #define GEMDRVEMUL_RANDOM_TOKEN_SEED (GEMDRVEMUL_RANDOM_TOKEN + 4)      // random_token + 4 bytes
 #define GEMDRVEMUL_TIMEOUT_SEC (GEMDRVEMUL_RANDOM_TOKEN_SEED + 4)       // random_token_seed + 4 bytes
