@@ -44,14 +44,34 @@ static uint16_t fcreate_mode = 0xFFFF;
 // a later phase to route other functions to their own slot too.
 static char dpath_string_table[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES][MAX_FOLDER_LENGTH];
 
-// Fase 1 (multi-drive slot routing): RAM-side mirror of the
-// GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-slot drive_number table already
-// published to shared memory (SHARED_VARIABLE_DRIVE_NUMBER_TABLE) -- same
-// values, updated at exactly the same two sites in init_gemdrvemul()
-// (the boot sequence and the PING reinit branch), so
-// gemdos_drive_number_to_slot() below always matches whatever the 68k
-// ROM would see if it re-read the table right now. g_drive_count mirrors
-// SHARED_VARIABLE_DRIVE_COUNT (pinned to 1 in this phase).
+// Fase 1 (multi-drive slot routing): one central runtime record per
+// slot -- the single source of truth for runtime drive data. Combines a
+// resolved GEMDOS drive number with the slot's full persisted SIDETNFS
+// drive-config record (letter/type/transport/host/port/mount_path/
+// sd_path/nickname/used) and a validity flag. Built once at boot and
+// again on every PING reinit by sidetnfs_runtime_drives_init() (the only
+// place that ever writes it) -- see that function for how each slot is
+// populated and validated. Actual backend/mount handling still only
+// ever looks at slot 0 (see report); this table exists to centralize
+// the *data* first, before Fopen/Fsfirst/etc. are routed per slot.
+typedef struct
+{
+    bool valid;
+    uint32_t drive_number;          // GEMDOS 0-based drive number (0=A .. 25=Z), meaningful only if valid
+    sidetnfs_drive_config_t config; // full persisted config record, meaningful only if valid
+} sidetnfs_runtime_drive_t;
+
+static sidetnfs_runtime_drive_t g_runtime_drives[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES];
+
+// Fase 1 (multi-drive slot routing): derived from g_runtime_drives --
+// never set independently anywhere else. g_drive_number_table[slot] is
+// g_runtime_drives[slot].drive_number for every valid slot (0xFFFFFFFF
+// otherwise, same sentinel already published to shared memory); this is
+// exactly the same table already published to shared memory
+// (SHARED_VARIABLE_DRIVE_NUMBER_TABLE) by sidetnfs_runtime_drives_init(),
+// so gemdos_drive_number_to_slot() below always matches whatever the 68k
+// ROM would see if it re-read shared memory right now. g_drive_count
+// mirrors SHARED_VARIABLE_DRIVE_COUNT.
 static uint32_t g_drive_number_table[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES];
 static uint32_t g_drive_count = 0;
 
@@ -1982,6 +2002,143 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 // PARAM_GEMDRIVE_DRIVE config-store entry (default 'C') when no usable
 // TNFS/UDP drive is configured -- missing/invalid config must never leave
 // GEMDRIVE without a drive letter to boot with.
+// ***************************************************************************
+// Fase 1 (multi-drive slot routing): looks up the full persisted SIDETNFS
+// drive-config record whose drive_letter matches `letter`, structurally
+// via sidetnfs_config_get_drive() over every fixed slot
+// 0..SIDETNFS_MAX_DRIVES-1 (never assumed compact/ordered by
+// sidetnfs_config_get_drive_count()) -- never a hardcoded slot index.
+// Returns false (*out untouched) if no used drive with that letter
+// exists. The one and only drive-config lookup in this file -- both
+// slot 0 and slot 1 of g_runtime_drives are populated through this same
+// function (sidetnfs_runtime_drives_init() below), never a second,
+// parallel lookup.
+static bool sidetnfs_config_find_drive_by_letter(char letter, sidetnfs_drive_config_t *out)
+{
+    for (uint8_t i = 0; i < SIDETNFS_MAX_DRIVES; i++)
+    {
+        sidetnfs_drive_config_t cfg;
+        if (sidetnfs_config_get_drive(i, &cfg) != SIDETNFS_CONFIG_STATUS_OK)
+        {
+            continue; // INVALID_INDEX/EMPTY_SLOT -- not a used drive
+        }
+        if (cfg.drive_letter == (uint8_t)letter)
+        {
+            *out = cfg;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Fase 1 (multi-drive slot routing): slot -> runtime-config helper.
+// Returns NULL for an out-of-range or not-currently-valid slot -- callers
+// must never index g_runtime_drives directly.
+static const sidetnfs_runtime_drive_t *sidetnfs_runtime_drive_get(int slot)
+{
+    if (slot < 0 || slot >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
+    {
+        return NULL;
+    }
+    if (!g_runtime_drives[slot].valid)
+    {
+        return NULL;
+    }
+    return &g_runtime_drives[slot];
+}
+
+// Fase 1 (multi-drive slot routing): the single place g_runtime_drives
+// (and, derived from it, g_drive_number_table/g_drive_count and the
+// shared-memory drive table) is ever built. Called once at Pico boot and
+// again on every GEMDRVEMUL_PING reinit (see both call sites), each time
+// with whatever select_gemdrive_drive_letter() just resolved -- never a
+// second, independent drive-0 resolution.
+//
+// Slot 0 always mirrors the already-active N: drive: `active_drive_letter`/
+// `active_drive_number` are trusted as-is (the same values already
+// published via the existing scalar SHARED_VARIABLE_DRIVE_LETTER/
+// _DRIVE_NUMBER), but its full config record is looked up fresh via
+// sidetnfs_config_find_drive_by_letter() so slot 0 carries real
+// type/transport/host/mount_path/sd_path data, not just a bare number.
+// SIDETNFS_CONFIG_DRIVE_ONLY builds (or any other backend whose active
+// drive has no drives[] record, e.g. the config drive itself) get a
+// minimal synthesized record instead (used=1, correct letter, everything
+// else zeroed -- those fields are unused for that backend anyway).
+//
+// Slot 1 is the persisted 'O' config record -- this phase's fixed
+// two-drive publish/proof target (see report), not a general "find any
+// second drive" search. Validated before being published: letter must be
+// A-Z (sidetnfs_config_find_drive_by_letter() only ever returns records
+// whose stored letter came from SET_DRIVE's own A-Z validation, but
+// re-checked here too, defensively, since this function's own invariants
+// must hold regardless of caller), and its drive number must differ from
+// slot 0's (no duplicates, mirroring the 68k ROM's own
+// validate_drive_table check). A failed O: lookup, an invalid letter, or
+// a collision with slot 0 all safely fall back to publishing exactly one
+// drive (slot 0 only) -- never a malformed table.
+//
+// Slots 2..GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-1 are always cleared/
+// invalid in this phase.
+static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t active_drive_number, uint32_t memory_shared_address)
+{
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        g_runtime_drives[i].valid = false;
+        g_runtime_drives[i].drive_number = 0xFFFFFFFF;
+        memset(&g_runtime_drives[i].config, 0, sizeof(g_runtime_drives[i].config));
+    }
+
+    if (active_drive_letter >= 'A' && active_drive_letter <= 'Z')
+    {
+        g_runtime_drives[0].valid = true;
+        g_runtime_drives[0].drive_number = active_drive_number;
+        if (!sidetnfs_config_find_drive_by_letter(active_drive_letter, &g_runtime_drives[0].config))
+        {
+            g_runtime_drives[0].config.used = 1;
+            g_runtime_drives[0].config.drive_letter = (uint8_t)active_drive_letter;
+        }
+    }
+
+    sidetnfs_drive_config_t o_config;
+    bool o_found = g_runtime_drives[0].valid && sidetnfs_config_find_drive_by_letter('O', &o_config);
+    uint32_t o_drive_number = (uint32_t)('O' - 'A');
+    bool o_valid = o_found && (o_drive_number != g_runtime_drives[0].drive_number);
+    if (o_valid)
+    {
+        g_runtime_drives[1].valid = true;
+        g_runtime_drives[1].drive_number = o_drive_number;
+        g_runtime_drives[1].config = o_config;
+    }
+    DPRINTF("Runtime drive table: slot 0 valid=%d drive=%d, slot 1 (O:) valid=%d\n",
+            g_runtime_drives[0].valid, (int)g_runtime_drives[0].drive_number, o_valid);
+
+    // Derive g_drive_number_table/g_drive_count from g_runtime_drives --
+    // relies on validity being contiguous from slot 0 (guaranteed by
+    // construction above: slot 1 can only be valid if slot 0 is).
+    g_drive_count = 0;
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (g_runtime_drives[i].valid)
+        {
+            g_drive_number_table[i] = g_runtime_drives[i].drive_number;
+            g_drive_count = (uint32_t)(i + 1);
+        }
+        else
+        {
+            g_drive_number_table[i] = 0xFFFFFFFF;
+        }
+    }
+
+    // Publish to shared memory -- the exact same table the 68k ROM's
+    // validate_drive_table/create_virtual_hard_disk (gemdrive.s) reads
+    // right after PING succeeds.
+    set_shared_var(SHARED_VARIABLE_DRIVE_COUNT, g_drive_count, memory_shared_address);
+    for (int slot = 0; slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; slot++)
+    {
+        set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + slot, g_drive_number_table[slot], memory_shared_address);
+    }
+}
+
 static char select_gemdrive_drive_letter(void)
 {
 #if SIDETNFS_CONFIG_DRIVE_ONLY
@@ -2121,37 +2278,30 @@ void init_gemdrvemul(bool safe_config_reboot)
     set_shared_var(SHARED_VARIABLE_BUFFER_TYPE, buffer_type, memory_shared_address);
     set_shared_var(SHARED_VARIABLE_FAKE_FLOPPY, virtual_fake_floppy, memory_shared_address);
 
-    // Fase 1 (multi-drive, ROM side only): publish the new
+    // Fase 1 (multi-drive, ROM side only): publish the
     // protocol-version/drive-count/drive-number table the 68k ROM
     // validates right after PING succeeds (gemdrive.s's
     // validate_drive_table, called from _ping_ready before save_vectors
     // installs the GEMDOS trap) -- must be set before this function's
     // main command loop can ever answer a PING with
     // GEMDRVEMUL_PING_STATUS=1 (ready), which this call sequence
-    // guarantees since it runs before that loop starts. Drive count is
-    // pinned to 1 in this phase (see report) -- slot 0 mirrors the same
-    // drive_number already published above via SHARED_VARIABLE_DRIVE_NUMBER
-    // (never a second, independent source of truth); the old scalar
+    // guarantees since it runs before that loop starts. The old scalar
     // SHARED_VARIABLE_DRIVE_LETTER/_DRIVE_NUMBER writes above are left in
-    // place -- other Pico-side code still reads them, and this new table
-    // is additive, not a replacement, in this phase.
+    // place -- other Pico-side code still reads them, and this table is
+    // additive, not a replacement, in this phase.
     set_shared_var(SHARED_VARIABLE_PROTOCOL_VERSION, SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION, memory_shared_address);
-    set_shared_var(SHARED_VARIABLE_DRIVE_COUNT, 1, memory_shared_address);
-    set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, drive_number, memory_shared_address);
-    g_drive_number_table[0] = drive_number;
-    g_drive_count = 1;
-    for (int slot = 1; slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; slot++)
-    {
-        // Unread by the 68k side while drive count stays at 1 (see
-        // comment on the constants in gemdrvemul.h) -- initialized to -1
-        // (fails validate_drive_table's 0..25 range check) rather than
-        // left undefined. Mirrored into g_drive_number_table too, purely
-        // so the RAM and shared-memory tables always stay byte-for-byte
-        // identical -- gemdos_drive_number_to_slot() itself never scans
-        // past g_drive_count (1).
-        set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + slot, 0xFFFFFFFF, memory_shared_address);
-        g_drive_number_table[slot] = 0xFFFFFFFF;
-    }
+
+    // Fase 1 (multi-drive slot routing): builds g_runtime_drives (slot 0
+    // = the already-active N: drive, slot 1 = the persisted O: config if
+    // one exists and doesn't collide) and derives/publishes
+    // g_drive_number_table/g_drive_count/the shared-memory table from
+    // it -- see sidetnfs_runtime_drives_init()'s own comment for the
+    // full validation/fallback rules. Slot 1/O: is published purely so
+    // the 68k ROM sets its _drvbits bit and shows the icon (see report)
+    // -- no Pico-side backend/mount/GEMDOS handling routes real traffic
+    // to it yet; everything below this call still operates on slot 0/N:
+    // exactly as before.
+    sidetnfs_runtime_drives_init((char)drive_letter_num, drive_number, memory_shared_address);
 
     for (int i = 0; i < SHARED_VARIABLES_SIZE; i++)
     {
@@ -2748,18 +2898,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 uint32_t reinit_drive_number = reinit_drive_letter_num - 65;
                 set_shared_var(SHARED_VARIABLE_DRIVE_LETTER, reinit_drive_letter_num, memory_shared_address);
                 set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER, reinit_drive_number, memory_shared_address);
-                // Fase 1 (multi-drive, ROM side only): keep the new
-                // table's slot 0 in sync with the scalar
-                // SHARED_VARIABLE_DRIVE_NUMBER above -- validate_drive_table
-                // runs again on every Atari reset, right after this same
-                // PING. Protocol version/drive count never change here
-                // (still 1/1, set once at Pico boot above).
-                set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, reinit_drive_number, memory_shared_address);
-                // Fase 1 (multi-drive slot routing): g_drive_number_table
-                // mirrors the shared-memory table exactly -- must be kept
-                // in sync here too, or gemdos_drive_number_to_slot() would
-                // keep matching the drive number from before this reinit.
-                g_drive_number_table[0] = reinit_drive_number;
+                // Fase 1 (multi-drive slot routing): rebuilds
+                // g_runtime_drives (and derives/republishes
+                // g_drive_number_table/g_drive_count/the shared-memory
+                // table from it) with the freshly reloaded active
+                // server/config -- validate_drive_table runs again on
+                // every Atari reset, right after this same PING. Same
+                // single build-and-publish function the boot sequence
+                // above uses -- never a second, independent update path.
+                sidetnfs_runtime_drives_init((char)reinit_drive_letter_num, reinit_drive_number, memory_shared_address);
 
                 // Only now, after the new config/drive/server have all
                 // been adopted, clear the pending flag -- a later
