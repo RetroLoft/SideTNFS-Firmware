@@ -36,8 +36,13 @@ static uint16_t dgetdrive_value = 0xFFFF;
 static bool fcreate_call = false;
 static uint16_t fcreate_mode = 0xFFFF;
 
-// Save Dsetpath variables
-static char dpath_string[MAX_FOLDER_LENGTH] = {0};
+// Save Dsetpath variables. Fase 1 (multi-drive slot routing): one
+// current-path buffer per runtime slot (GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES
+// == 9), indexed the same way as g_drive_number_table. Every path function
+// except DGETPATH_CALL still uses slot 0 explicitly in this phase --
+// single-drive behavior is unchanged, only the storage shape is ready for
+// a later phase to route other functions to their own slot too.
+static char dpath_string_table[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES][MAX_FOLDER_LENGTH];
 
 // Fase 1 (multi-drive slot routing): RAM-side mirror of the
 // GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-slot drive_number table already
@@ -642,7 +647,7 @@ static uint16_t __not_in_flash_func(get_first_available_fd)(FileDescriptors *hea
     return val;
 }
 
-// payloadPtr, dpath_string, hd_folder are global variables
+// payloadPtr, dpath_string_table[0], hd_folder are global variables
 static void __not_in_flash_func(get_local_full_pathname)(char *tmp_filepath)
 {
     // Obtain the fname string and keep it in memory
@@ -651,19 +656,19 @@ static void __not_in_flash_func(get_local_full_pathname)(char *tmp_filepath)
     char tmp_path[MAX_FOLDER_LENGTH] = {0};
 
     COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, path_filename, MAX_FOLDER_LENGTH);
-    DPRINTF("dpath_string: %s\n", dpath_string);
+    DPRINTF("dpath_string_table[0]: %s\n", dpath_string_table[0]);
     DPRINTF("path_filename: %s\n", path_filename);
     if (path_filename[1] == ':')
     {
         // If the path has the drive letter, jump two positions
-        // and ignore the dpath_string
+        // and ignore the dpath_string_table[0]
         snprintf(path_filename, MAX_FOLDER_LENGTH, "%s", path_filename + 2);
         DPRINTF("New path_filename: %s\n", path_filename);
         snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/", hd_folder);
     }
     else if (path_filename[0] == '\\')
     {
-        // If the path filename has a backslash, ignore the dpath_string
+        // If the path filename has a backslash, ignore the dpath_string_table[0]
         DPRINTF("New path_filename: %s\n", path_filename);
         snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/", hd_folder);
     }
@@ -672,13 +677,13 @@ static void __not_in_flash_func(get_local_full_pathname)(char *tmp_filepath)
         // If the path filename does not have a drive letter,
         // concatenate the path with the hd_folder and the filename
         // If the path has the drive letter, jump two positions
-        if (dpath_string[1] == ':')
+        if (dpath_string_table[0][1] == ':')
         {
-            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/%s", hd_folder, dpath_string + 2);
+            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/%s", hd_folder, dpath_string_table[0] + 2);
         }
         else
         {
-            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/%s", hd_folder, dpath_string);
+            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s/%s", hd_folder, dpath_string_table[0]);
         }
     }
     snprintf(tmp_filepath, MAX_FOLDER_LENGTH, "%s/%s", tmp_path, path_filename);
@@ -690,8 +695,8 @@ static void __not_in_flash_func(get_local_full_pathname)(char *tmp_filepath)
 }
 
 // Fase 7D: TNFS-relative counterpart of get_local_full_pathname() above --
-// same drive-letter/backslash/dpath_string mapping logic (reads the same
-// payloadPtr/dpath_string globals), but never prefixes hd_folder. Produces
+// same drive-letter/backslash/dpath_string_table[0] mapping logic (reads the same
+// payloadPtr/dpath_string_table[0] globals), but never prefixes hd_folder. Produces
 // the same forward-slash, GEMDOS-drive-stripped shape that Fsfirst/Fsnext
 // already use for TNFS directory paths (path_forwardslash, see
 // gemdrive_backend_fsfirst()), e.g. N:\CONFIG\SIDETNFS.PRG -> /CONFIG/SIDETNFS.PRG.
@@ -711,7 +716,7 @@ static void __not_in_flash_func(get_tnfs_relative_pathname)(char *tnfs_path, cha
     {
         snprintf(out_raw, MAX_FOLDER_LENGTH, "%s", path_filename);
     }
-    DPRINTF("dpath_string: %s\n", dpath_string);
+    DPRINTF("dpath_string_table[0]: %s\n", dpath_string_table[0]);
     DPRINTF("path_filename: %s\n", path_filename);
     if (path_filename[1] == ':')
     {
@@ -724,19 +729,19 @@ static void __not_in_flash_func(get_tnfs_relative_pathname)(char *tnfs_path, cha
     }
     else
     {
-        if (dpath_string[1] == ':')
+        if (dpath_string_table[0][1] == ':')
         {
-            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s", dpath_string + 2);
+            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s", dpath_string_table[0] + 2);
         }
         else
         {
-            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s", dpath_string);
+            snprintf(tmp_path, MAX_FOLDER_LENGTH, "%s", dpath_string_table[0]);
         }
         // Fase 7E: this is the one new piece of information not already
         // covered by FOPEN_RAW_PATH/FOPEN_TNFS_PATH (see the FOPEN_CALL
         // case body) -- which current-directory value a relative Fopen
         // path was actually resolved against.
-        sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, 0, dpath_string, NULL, NULL, 0, 0, 0, 0);
+        sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, 0, dpath_string_table[0], NULL, NULL, 0, 0, 0, 0);
     }
     snprintf(tnfs_path, MAX_FOLDER_LENGTH, "%s/%s", tmp_path, path_filename);
     if (out_internal)
@@ -750,10 +755,10 @@ static void __not_in_flash_func(get_tnfs_relative_pathname)(char *tnfs_path, cha
 
 // Fase 7J-correctie2: compute the parent of an already-canonical (forward-
 // slash, get_tnfs_relative_pathname()'d) absolute TNFS path -- "/HALLO" ->
-// "/", "/A/B" -> "/A", "/A/B/C" -> "/A/B". Used only to update dpath_string
+// "/", "/A/B" -> "/A", "/A/B/C" -> "/A/B". Used only to update dpath_string_table[0]
 // (the TNFS CWD) after a successful RMDIR of the directory that was the
 // current directory itself -- path is expected to already be the exact
-// dpath_string value being replaced, so no further normalization beyond a
+// dpath_string_table[0] value being replaced, so no further normalization beyond a
 // defensive trailing-slash strip is needed.
 static void __not_in_flash_func(tnfs_ddelete_parent_path)(const char *path, char *out, size_t out_size)
 {
@@ -781,7 +786,7 @@ static void __not_in_flash_func(tnfs_ddelete_parent_path)(const char *path, char
 
 // Thin naming wrapper around get_local_full_pathname(). Kept local to this file
 // because the wrapped function reads its input implicitly from the file-scope
-// globals payloadPtr/dpath_string/hd_folder, not from a parameter.
+// globals payloadPtr/dpath_string_table[0]/hd_folder, not from a parameter.
 static void __not_in_flash_func(scfs_get_local_full_pathname)(char *tmp_filepath)
 {
     get_local_full_pathname(tmp_filepath);
@@ -995,19 +1000,6 @@ static int gemdos_drive_number_to_slot(uint32_t drive_number)
     return -1;
 }
 
-// Fase 1 (multi-drive slot routing): current-path lookup for a resolved
-// slot. Only slot 0 has real storage in this phase (dpath_string, same
-// variable Dsetpath already maintains, unchanged) -- shaped as a
-// per-slot accessor now so a later phase can grow this into a real
-// per-slot array without changing any caller.
-static const char *dpath_string_for_slot(int slot)
-{
-    if (slot == 0)
-    {
-        return dpath_string;
-    }
-    return "";
-}
 
 inline const char *__not_in_flash_func(get_command_name)(unsigned int value)
 {
@@ -2019,7 +2011,7 @@ void init_gemdrvemul(bool safe_config_reboot)
     // narrower than its name suggests, and does NOT imply SD, WiFi, or
     // TNFS are available. It only means "the one-time GEMDRVEMUL_PING
     // first-call initialization has run" -- resetting fdescriptors/the DTA
-    // table/dpath_string, and (only for the SD backend) a successful SD
+    // table/dpath_string_table[0], and (only for the SD backend) a successful SD
     // mount. For the TNFS backend it becomes true on the very first PING
     // regardless of whether SD, WiFi, or TNFS actually ended up available
     // (see GEMDRVEMUL_PING below) -- it exists purely so that one-time
@@ -2041,8 +2033,18 @@ void init_gemdrvemul(bool safe_config_reboot)
     srand(time(0));
     printf("Initializing GEMDRIVE...\n"); // Print alwayse
 
-    dpath_string[0] = '\\'; // Set the root folder as default
-    dpath_string[1] = '\0';
+    // Fase 1 (multi-drive slot routing): initialize every runtime slot's
+    // current-path buffer to root "\" -- not just slot 0, which every
+    // other path function still uses explicitly in this phase. Slots
+    // 1-8 have no other writer yet (no second drive is active), so root
+    // is the only sane, always-valid content for them. This loop's
+    // slot-0 iteration is exactly the old "Set the root folder as
+    // default" reset.
+    for (int dpath_slot_init = 0; dpath_slot_init < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; dpath_slot_init++)
+    {
+        dpath_string_table[dpath_slot_init][0] = '\\';
+        dpath_string_table[dpath_slot_init][1] = '\0';
+    }
 
     bool write_config_only_once = true;
     active_command_id = 0xFFFF;
@@ -2652,8 +2654,8 @@ void init_gemdrvemul(bool safe_config_reboot)
                 delete_all_files(&fdescriptors);
                 DPRINTF("DTA table elements: %d\n", countDTA());
                 DPRINTF("File descriptors: %d\n", count_fdesc(fdescriptors));
-                dpath_string[0] = '\\'; // Set the root folder as default
-                dpath_string[1] = '\0';
+                dpath_string_table[0][0] = '\\'; // Set the root folder as default
+                dpath_string_table[0][1] = '\0';
                 hd_folder_ready = true;
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_PING_STATUS)) = 0x1;
 #else
@@ -2685,8 +2687,8 @@ void init_gemdrvemul(bool safe_config_reboot)
                         delete_all_files(&fdescriptors);
                         DPRINTF("DTA table elements: %d\n", countDTA());
                         DPRINTF("File descriptors: %d\n", count_fdesc(fdescriptors));
-                        dpath_string[0] = '\\'; // Set the root folder as default
-                        dpath_string[1] = '\0';
+                        dpath_string_table[0][0] = '\\'; // Set the root folder as default
+                        dpath_string_table[0][1] = '\0';
                         hd_folder_ready = true;
 
                         // Fase 5F/6F: the automatic dirty-flag-driven
@@ -2726,8 +2728,8 @@ void init_gemdrvemul(bool safe_config_reboot)
                 delete_all_files(&fdescriptors);
                 DPRINTF("Fase 9E reinit -- DTA table elements: %d\n", countDTA());
                 DPRINTF("Fase 9E reinit -- File descriptors: %d\n", count_fdesc(fdescriptors));
-                dpath_string[0] = '\\'; // Set the root folder as default
-                dpath_string[1] = '\0';
+                dpath_string_table[0][0] = '\\'; // Set the root folder as default
+                dpath_string_table[0][1] = '\0';
 
                 // Closes old TNFS directory handles/fake-search state,
                 // resets mount/session identity, reloads the persistent
@@ -3227,7 +3229,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             uint16_t dpath_drive = payloadPtr[0]; // d3 register
 
             DPRINTF("Dpath drive: %x\n", dpath_drive);
-            DPRINTF("Dpath string: %s\n", dpath_string);
+            DPRINTF("Dpath string: %s\n", dpath_string_table[0]);
 
             // Fase 1 (multi-drive slot routing): dpath_drive is either 0
             // (GEMDOS's "current/default drive" sentinel --
@@ -3257,7 +3259,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
 
             char tmp_path[MAX_FOLDER_LENGTH] = {0};
-            memccpy(tmp_path, dpath_string_for_slot(dpath_slot), 0, MAX_FOLDER_LENGTH);
+            memccpy(tmp_path, dpath_string_table[dpath_slot], 0, MAX_FOLDER_LENGTH);
             forward_2_backslash(tmp_path);
 
             // Remove the backslash at the end
@@ -3271,11 +3273,11 @@ void init_gemdrvemul(bool safe_config_reboot)
 
 #if SIDETNFS_USE_TNFS_LISTING
             // Fase 7E: informational only -- Dgetpath's logic itself is
-            // unchanged (dpath_string was already forward-slash-form
+            // unchanged (dpath_string_table[0] was already forward-slash-form
             // internally, and this conversion back to backslash for GEMDOS
             // already existed); this just makes what's actually returned
             // visible in DEBUG.TXT now that Dsetpath can correctly update
-            // dpath_string for a real TNFS subdirectory.
+            // dpath_string_table[0] for a real TNFS subdirectory.
             sidetnfs_diag_log(SIDETNFS_DIAG_DGETPATH_RETURN, 0, tmp_path, NULL, NULL, 0, 0, 0, 0);
 #endif
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(tmp_path, memory_shared_address + GEMDRVEMUL_DEFAULT_PATH, MAX_FOLDER_LENGTH);
@@ -3308,15 +3310,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 memmove(dpath_tmp, dpath_tmp + 2, strlen(dpath_tmp));
             }
 
-            DPRINTF("Dpath string: %s\n", dpath_string);
+            DPRINTF("Dpath string: %s\n", dpath_string_table[0]);
             DPRINTF("Dpath tmp: %s\n", dpath_tmp);
 
             // Check if the path is relative or absolute
             if ((dpath_tmp[0] != '\\') && (dpath_tmp[0] != '/'))
             {
-                // Concatenate the path with the existing dpath_string
+                // Concatenate the path with the existing dpath_string_table[0]
                 char tmp_path_concat[MAX_FOLDER_LENGTH] = {0};
-                snprintf(tmp_path_concat, sizeof(tmp_path_concat), "%s/%s", dpath_string, dpath_tmp);
+                snprintf(tmp_path_concat, sizeof(tmp_path_concat), "%s/%s", dpath_string_table[0], dpath_tmp);
                 DPRINTF("Concatenated path: %s\n", tmp_path_concat);
                 strcpy(dpath_tmp, tmp_path_concat);
                 DPRINTF("Dpath tmp: %s\n", dpath_tmp);
@@ -3356,10 +3358,10 @@ void init_gemdrvemul(bool safe_config_reboot)
             // dpath_tmp is already the fully-resolved,
             // forward-slash, drive-letter-stripped, cwd-relative path (e.g.
             // "/CONFIG") -- the exact same shape Fsfirst/Fopen already read
-            // out of dpath_string (see get_tnfs_relative_pathname() and
+            // out of dpath_string_table[0] (see get_tnfs_relative_pathname() and
             // FSFIRST_CALL's own relative-path concatenation below). A
             // trailing slash is stripped only for this existence check (a
-            // local copy -- dpath_tmp/dpath_string themselves are left
+            // local copy -- dpath_tmp/dpath_string_table[0] themselves are left
             // untouched, exactly as before) to match how
             // gemdrive_backend_fsfirst() already normalizes tnfs_path.
             char dsetpath_tnfs_path[MAX_FOLDER_LENGTH];
@@ -3395,23 +3397,23 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_CONFIG_DRIVE_ONLY
             // Fase 10B-afronding: a failed Dsetpath (any non-root reference,
             // since this drive has no subdirectories) must never mutate
-            // dpath_string -- the existing CWD (always root) stays exactly
+            // dpath_string_table[0] -- the existing CWD (always root) stays exactly
             // as it was. The unconditional strcpy() below is the
             // TNFS/SD-backend behavior, unchanged and out of scope here.
             if (dsetpath_exists)
             {
-                strcpy(dpath_string, dpath_tmp);
-                DPRINTF("The new default path is: %s\n", dpath_string);
+                strcpy(dpath_string_table[0], dpath_tmp);
+                DPRINTF("The new default path is: %s\n", dpath_string_table[0]);
             }
 #else
-            // Copy dpath_tmp to dpath_string
-            strcpy(dpath_string, dpath_tmp);
-            DPRINTF("The new default path is: %s\n", dpath_string);
+            // Copy dpath_tmp to dpath_string_table[0]
+            strcpy(dpath_string_table[0], dpath_tmp);
+            DPRINTF("The new default path is: %s\n", dpath_string_table[0]);
 #endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #if SIDETNFS_USE_TNFS_LISTING
-            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string, NULL, NULL, 0, 0,
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string_table[0], NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
-            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_RETURN, 0, dpath_string, NULL, NULL, 0, 0,
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_RETURN, 0, dpath_string_table[0], NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
 #endif
             write_random_token(memory_shared_address);
@@ -3541,7 +3543,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // perfectly normal, expected sequence. It must be let through to
             // TNFS RMDIR exactly like the SD/FatFS route always has (that
             // route never denied this case at all).
-            bool tnfs_ddelete_is_cwd = strcmp(tnfs_ddelete_path, dpath_string) == 0;
+            bool tnfs_ddelete_is_cwd = strcmp(tnfs_ddelete_path, dpath_string_table[0]) == 0;
             bool tnfs_ddelete_is_root = strcmp(tnfs_ddelete_path, "/") == 0;
             if (tnfs_ddelete_is_root)
             {
@@ -3558,7 +3560,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 {
                     sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_MATCH_ALLOWED, 0, tnfs_ddelete_path, NULL, NULL, 0,
                                        0, 0, 0);
-                    sidetnfs_note_tnfs_ddelete_cwd(true, false, dpath_string, NULL);
+                    sidetnfs_note_tnfs_ddelete_cwd(true, false, dpath_string_table[0], NULL);
                 }
 
                 // Fase 7J-correctie: close every active TNFS DTA-registry
@@ -3617,9 +3619,9 @@ void init_gemdrvemul(bool safe_config_reboot)
                             char tnfs_ddelete_new_cwd[MAX_FOLDER_LENGTH];
                             tnfs_ddelete_parent_path(tnfs_ddelete_path, tnfs_ddelete_new_cwd,
                                                       sizeof(tnfs_ddelete_new_cwd));
-                            strcpy(dpath_string, tnfs_ddelete_new_cwd);
-                            sidetnfs_note_tnfs_ddelete_cwd(false, true, NULL, dpath_string);
-                            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_PARENT_UPDATE, 0, dpath_string, NULL, NULL,
+                            strcpy(dpath_string_table[0], tnfs_ddelete_new_cwd);
+                            sidetnfs_note_tnfs_ddelete_cwd(false, true, NULL, dpath_string_table[0]);
+                            sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_CWD_PARENT_UPDATE, 0, dpath_string_table[0], NULL, NULL,
                                                0, 0, 0, 0);
                         }
                         break;
@@ -3763,7 +3765,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             if (tmp_string[1] == ':')
             {
                 // If the path has the drive letter, jump two positions
-                // and ignore the dpath_string
+                // and ignore the dpath_string_table[0]
                 snprintf(tmp_string, MAX_FOLDER_LENGTH, "%s", tmp_string + 2);
                 DPRINTF("New path_filename: %s\n", tmp_string);
             }
@@ -3775,7 +3777,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             else
             {
-                DPRINTF("Need to concatenate the default path: %s\n", dpath_string);
+                DPRINTF("Need to concatenate the default path: %s\n", dpath_string_table[0]);
 #if SIDETNFS_USE_TNFS_LISTING
                 // Fase 7E: Fsfirst had no dedicated path-resolve
                 // diagnostics of its own before this phase (unlike Fopen's
@@ -3784,9 +3786,9 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // relative-fspec case.
                 fsfirst_path_was_relative = true;
                 sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_INPUT, ndta, tmp_string, NULL, NULL, 0, 0, 0, 0);
-                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, ndta, dpath_string, NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, ndta, dpath_string_table[0], NULL, NULL, 0, 0, 0, 0);
 #endif
-                snprintf(fspec_string, sizeof(fspec_string), "%s/%s", dpath_string, tmp_string);
+                snprintf(fspec_string, sizeof(fspec_string), "%s/%s", dpath_string_table[0], tmp_string);
                 DPRINTF("Full fspec string: %s\n", fspec_string);
             }
 
@@ -3804,8 +3806,8 @@ void init_gemdrvemul(bool safe_config_reboot)
 #endif
 
             // Testing if the FSfirst changes the default path or not
-            // DPRINTF("Old dpath string: %s, new dpath string: %s\n", dpath_string, path_forwardslash);
-            // strcpy(dpath_string, path_forwardslash);
+            // DPRINTF("Old dpath string: %s, new dpath string: %s\n", dpath_string_table[0], path_forwardslash);
+            // strcpy(dpath_string_table[0], path_forwardslash);
 
             // Remove all the trailing spaces in the pattern
             remove_trailing_spaces(pattern);
