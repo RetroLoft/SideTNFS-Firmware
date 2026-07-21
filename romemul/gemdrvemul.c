@@ -3294,6 +3294,29 @@ void init_gemdrvemul(bool safe_config_reboot)
             // scfs_directory_exists()/touches hd_folder under this backend.
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
 #endif
+            // Fase 1 (multi-drive slot routing): the new GEMDRIVE.BIN's
+            // .Dsetpath (sidecart-gemdrive-atari) now sends the resolved
+            // slot index in d3.w -- the first word of the existing
+            // 12-byte d3/d4/d5 register header this handler already
+            // skips below (payloadPtr += 6). Same low-word-of-a-32-bit-
+            // register convention DFREE_CALL already uses (payloadPtr[0]
+            // = low word); d3's high word (payloadPtr[1]) is unused/
+            // unreliable -- the ROM only does a 16-bit move.w into d3,
+            // its upper half is whatever d3 held before. Read before the
+            // skip below, so it never depends on payloadPtr's post-skip
+            // position.
+            int16_t dsetpath_slot_raw = (int16_t)payloadPtr[0];
+            int dsetpath_slot = (int)dsetpath_slot_raw;
+            if (dsetpath_slot < 0 || (uint32_t)dsetpath_slot >= g_drive_count || dsetpath_slot >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
+            {
+                // Invalid/unmanaged slot: appropriate GEMDOS error, no
+                // slot's current path is touched.
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EDRIVE;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
             payloadPtr += 6; // Skip six words
             // Obtain the fname string and keep it in memory
             char dpath_tmp[MAX_FOLDER_LENGTH] = {};
@@ -3310,15 +3333,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 memmove(dpath_tmp, dpath_tmp + 2, strlen(dpath_tmp));
             }
 
-            DPRINTF("Dpath string: %s\n", dpath_string_table[0]);
+            DPRINTF("Dpath string: %s\n", dpath_string_table[dsetpath_slot]);
             DPRINTF("Dpath tmp: %s\n", dpath_tmp);
 
             // Check if the path is relative or absolute
             if ((dpath_tmp[0] != '\\') && (dpath_tmp[0] != '/'))
             {
-                // Concatenate the path with the existing dpath_string_table[0]
+                // Concatenate the path with the existing dpath_string_table[dsetpath_slot]
                 char tmp_path_concat[MAX_FOLDER_LENGTH] = {0};
-                snprintf(tmp_path_concat, sizeof(tmp_path_concat), "%s/%s", dpath_string_table[0], dpath_tmp);
+                snprintf(tmp_path_concat, sizeof(tmp_path_concat), "%s/%s", dpath_string_table[dsetpath_slot], dpath_tmp);
                 DPRINTF("Concatenated path: %s\n", tmp_path_concat);
                 strcpy(dpath_tmp, tmp_path_concat);
                 DPRINTF("Dpath tmp: %s\n", dpath_tmp);
@@ -3359,9 +3382,10 @@ void init_gemdrvemul(bool safe_config_reboot)
             // forward-slash, drive-letter-stripped, cwd-relative path (e.g.
             // "/CONFIG") -- the exact same shape Fsfirst/Fopen already read
             // out of dpath_string_table[0] (see get_tnfs_relative_pathname() and
-            // FSFIRST_CALL's own relative-path concatenation below). A
-            // trailing slash is stripped only for this existence check (a
-            // local copy -- dpath_tmp/dpath_string_table[0] themselves are left
+            // FSFIRST_CALL's own relative-path concatenation below, both
+            // still slot-0-only). A trailing slash is stripped only for
+            // this existence check (a local copy -- dpath_tmp/
+            // dpath_string_table[dsetpath_slot] themselves are left
             // untouched, exactly as before) to match how
             // gemdrive_backend_fsfirst() already normalizes tnfs_path.
             char dsetpath_tnfs_path[MAX_FOLDER_LENGTH];
@@ -3397,23 +3421,24 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_CONFIG_DRIVE_ONLY
             // Fase 10B-afronding: a failed Dsetpath (any non-root reference,
             // since this drive has no subdirectories) must never mutate
-            // dpath_string_table[0] -- the existing CWD (always root) stays exactly
-            // as it was. The unconditional strcpy() below is the
-            // TNFS/SD-backend behavior, unchanged and out of scope here.
+            // dpath_string_table[dsetpath_slot] -- the existing CWD (always
+            // root) stays exactly as it was. The unconditional strcpy()
+            // below is the TNFS/SD-backend behavior, unchanged and out of
+            // scope here.
             if (dsetpath_exists)
             {
-                strcpy(dpath_string_table[0], dpath_tmp);
-                DPRINTF("The new default path is: %s\n", dpath_string_table[0]);
+                strcpy(dpath_string_table[dsetpath_slot], dpath_tmp);
+                DPRINTF("The new default path is: %s\n", dpath_string_table[dsetpath_slot]);
             }
 #else
-            // Copy dpath_tmp to dpath_string_table[0]
-            strcpy(dpath_string_table[0], dpath_tmp);
-            DPRINTF("The new default path is: %s\n", dpath_string_table[0]);
+            // Copy dpath_tmp to dpath_string_table[dsetpath_slot]
+            strcpy(dpath_string_table[dsetpath_slot], dpath_tmp);
+            DPRINTF("The new default path is: %s\n", dpath_string_table[dsetpath_slot]);
 #endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #if SIDETNFS_USE_TNFS_LISTING
-            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string_table[0], NULL, NULL, 0, 0,
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string_table[dsetpath_slot], NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
-            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_RETURN, 0, dpath_string_table[0], NULL, NULL, 0, 0,
+            sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_RETURN, 0, dpath_string_table[dsetpath_slot], NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
 #endif
             write_random_token(memory_shared_address);
