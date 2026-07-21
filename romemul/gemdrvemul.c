@@ -39,6 +39,17 @@ static uint16_t fcreate_mode = 0xFFFF;
 // Save Dsetpath variables
 static char dpath_string[MAX_FOLDER_LENGTH] = {0};
 
+// Fase 1 (multi-drive slot routing): RAM-side mirror of the
+// GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-slot drive_number table already
+// published to shared memory (SHARED_VARIABLE_DRIVE_NUMBER_TABLE) -- same
+// values, updated at exactly the same two sites in init_gemdrvemul()
+// (the boot sequence and the PING reinit branch), so
+// gemdos_drive_number_to_slot() below always matches whatever the 68k
+// ROM would see if it re-read the table right now. g_drive_count mirrors
+// SHARED_VARIABLE_DRIVE_COUNT (pinned to 1 in this phase).
+static uint32_t g_drive_number_table[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES];
+static uint32_t g_drive_count = 0;
+
 // Save Fsetdta variables
 static DTANode *dtaTbl[DTA_HASH_TABLE_SIZE];
 
@@ -962,6 +973,40 @@ static void get_shared_var(uint32_t p_shared_variable_index, uint32_t *p_shared_
     *p_shared_variable_value = *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SHARED_VARIABLES + (p_shared_variable_index * 4))) << 16;
     *p_shared_variable_value |= *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SHARED_VARIABLES + (p_shared_variable_index * 4) + 2));
     DPRINTF("Getting shared variable %d with value %x\n", p_shared_variable_index, *p_shared_variable_value);
+}
+
+// Fase 1 (multi-drive slot routing): converts a GEMDOS drive number
+// (0-based: A=0, B=1, ...) to its runtime slot index in
+// g_drive_number_table, or -1 if it isn't one of the drives currently
+// published to the Atari. Linear scan over the same table set_shared_var()
+// writes to shared memory -- never recomputed from drive_letter/
+// drive_number directly, so this always agrees with what the 68k ROM's
+// own find_drive_slot_by_number() (gemdrive.s) would find. g_drive_count
+// is pinned to 1 in this phase, so this only ever returns 0 or -1.
+static int gemdos_drive_number_to_slot(uint32_t drive_number)
+{
+    for (uint32_t slot = 0; slot < g_drive_count; slot++)
+    {
+        if (g_drive_number_table[slot] == drive_number)
+        {
+            return (int)slot;
+        }
+    }
+    return -1;
+}
+
+// Fase 1 (multi-drive slot routing): current-path lookup for a resolved
+// slot. Only slot 0 has real storage in this phase (dpath_string, same
+// variable Dsetpath already maintains, unchanged) -- shaped as a
+// per-slot accessor now so a later phase can grow this into a real
+// per-slot array without changing any caller.
+static const char *dpath_string_for_slot(int slot)
+{
+    if (slot == 0)
+    {
+        return dpath_string;
+    }
+    return "";
 }
 
 inline const char *__not_in_flash_func(get_command_name)(unsigned int value)
@@ -2091,13 +2136,19 @@ void init_gemdrvemul(bool safe_config_reboot)
     set_shared_var(SHARED_VARIABLE_PROTOCOL_VERSION, SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION, memory_shared_address);
     set_shared_var(SHARED_VARIABLE_DRIVE_COUNT, 1, memory_shared_address);
     set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, drive_number, memory_shared_address);
+    g_drive_number_table[0] = drive_number;
+    g_drive_count = 1;
     for (int slot = 1; slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; slot++)
     {
         // Unread by the 68k side while drive count stays at 1 (see
         // comment on the constants in gemdrvemul.h) -- initialized to -1
         // (fails validate_drive_table's 0..25 range check) rather than
-        // left undefined.
+        // left undefined. Mirrored into g_drive_number_table too, purely
+        // so the RAM and shared-memory tables always stay byte-for-byte
+        // identical -- gemdos_drive_number_to_slot() itself never scans
+        // past g_drive_count (1).
         set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + slot, 0xFFFFFFFF, memory_shared_address);
+        g_drive_number_table[slot] = 0xFFFFFFFF;
     }
 
     for (int i = 0; i < SHARED_VARIABLES_SIZE; i++)
@@ -2702,6 +2753,11 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // PING. Protocol version/drive count never change here
                 // (still 1/1, set once at Pico boot above).
                 set_shared_var(SHARED_VARIABLE_DRIVE_NUMBER_TABLE + 0, reinit_drive_number, memory_shared_address);
+                // Fase 1 (multi-drive slot routing): g_drive_number_table
+                // mirrors the shared-memory table exactly -- must be kept
+                // in sync here too, or gemdos_drive_number_to_slot() would
+                // keep matching the drive number from before this reinit.
+                g_drive_number_table[0] = reinit_drive_number;
 
                 // Only now, after the new config/drive/server have all
                 // been adopted, clear the pending flag -- a later
@@ -3091,6 +3147,28 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_DFREE_CALL:
         {
             uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
+
+            // Fase 1 (multi-drive slot routing): dfree_unit already
+            // arrives as a real, 0-based GEMDOS drive number -- the 68k
+            // ROM's own find_drive_slot_by_number() (gemdrive.s's .Dfree)
+            // already validated it and falls back to the original TOS
+            // handler itself if it isn't one of our managed drives, so
+            // this call never sees GEMDOS's "0 = default drive"
+            // convention. Re-validated here too, defensively: an
+            // unmanaged drive number gets GEMDOS_EDRIVE instead of
+            // silently returning the (only) backend's disk info. Only
+            // slot 0 exists in this phase, so dfree_slot gates entry into
+            // the existing single-backend logic below unchanged -- no
+            // per-slot backend dispatch yet.
+            int dfree_slot = gemdos_drive_number_to_slot(dfree_unit);
+            if (dfree_slot < 0)
+            {
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STATUS, (uint32_t)GEMDOS_EDRIVE);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
             // Check the free space
 #if SIDETNFS_USE_TNFS_LISTING
 #if SIDETNFS_CONFIG_DRIVE_ONLY
@@ -3151,8 +3229,35 @@ void init_gemdrvemul(bool safe_config_reboot)
             DPRINTF("Dpath drive: %x\n", dpath_drive);
             DPRINTF("Dpath string: %s\n", dpath_string);
 
+            // Fase 1 (multi-drive slot routing): dpath_drive is either 0
+            // (GEMDOS's "current/default drive" sentinel --
+            // gemdrive.s's .Dgetpath_current_drive, never decremented) or
+            // a real, already-validated 0-based drive number (gemdrive.s
+            // decrements and checks find_drive_slot_by_number itself
+            // before ever sending CMD_DGETPATH_CALL for a non-zero
+            // value). 0 always resolves to slot 0 here too -- there is
+            // only one "current" drive in this phase, so this is exactly
+            // today's behavior for every call this ROM actually sends.
+            int dpath_slot = (dpath_drive == 0) ? 0 : gemdos_drive_number_to_slot(dpath_drive);
+            if (dpath_slot < 0)
+            {
+                // Fase 1: Dgetpath has no dedicated status/error field in
+                // the current wire protocol (unchanged this phase --
+                // gemdrive.s always returns d0=0/success after copying
+                // whatever's here). An empty path is the closest
+                // available "not one of our drives" signal without
+                // changing the protocol -- written directly, bypassing
+                // the trailing-backslash-strip logic below, which assumes
+                // a non-empty string.
+                char empty_path[MAX_FOLDER_LENGTH] = {0};
+                COPY_AND_CHANGE_ENDIANESS_BLOCK16(empty_path, memory_shared_address + GEMDRVEMUL_DEFAULT_PATH, MAX_FOLDER_LENGTH);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
             char tmp_path[MAX_FOLDER_LENGTH] = {0};
-            memccpy(tmp_path, dpath_string, 0, MAX_FOLDER_LENGTH);
+            memccpy(tmp_path, dpath_string_for_slot(dpath_slot), 0, MAX_FOLDER_LENGTH);
             forward_2_backslash(tmp_path);
 
             // Remove the backslash at the end
