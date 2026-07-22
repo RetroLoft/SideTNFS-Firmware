@@ -544,13 +544,26 @@ SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *pa
 // unlike the removed cache path, there is no RAM copy to serve a hit from.
 // On a terminal result (NOT_FOUND/ERROR) the ndta's registry entry is
 // released before returning (see sidetnfs_tnfs_dta_release()).
-SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
+//
+// Fase 1 (multi-drive slot routing): `slot` is the caller's
+// already-validated runtime slot (range/g_drive_count/runtime-config/
+// session_established all checked by the caller -- see
+// GEMDRVEMUL_FSFIRST_CALL in gemdrvemul.c). Resolves that slot's own
+// host/port/session id via sidetnfs_probe_get_slot_context() and stores
+// it in the new registry entry (SidetnfsTnfsDtaSearch.runtime_slot) so
+// every subsequent READDIRX/CLOSEDIR for this ndta (sidetnfs_tnfs_dta_next(),
+// releaseTnfsDTA()) automatically uses the same slot -- no wire-protocol
+// change for those.
+SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const char *path,
                                                   const char *pattern, uint8_t attribs,
                                                   SidetnfsAtariDirEntry *out_entry);
 
 // Fase 5Y: look up ndta's registry entry (lookupTnfsDTA()) and continue the
 // search -- same bounded network behavior as sidetnfs_tnfs_dta_start(). On a
 // terminal result the entry is released before returning, same as above.
+// Fase 1 (multi-drive slot routing): no slot parameter -- reads the slot
+// stored in the registry entry by sidetnfs_tnfs_dta_start() itself
+// (SidetnfsTnfsDtaSearch.runtime_slot). No wire-protocol change.
 SidetnfsDirSearchResult sidetnfs_tnfs_dta_next(uint32_t ndta, SidetnfsAtariDirEntry *out_entry);
 bool sidetnfs_tnfs_dta_is_active(uint32_t ndta);
 
@@ -1300,5 +1313,141 @@ void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *p
 // Fsfirst/Fsnext, never from a network callback). Silently does nothing if
 // hd_folder is NULL or the SD write fails -- never crashes.
 void sidetnfs_diag_dump_on_select(const char *hd_folder);
+
+// Temporary diagnostic build: enable/disable everything below (the
+// SidetnfsUartDiagSnapshot struct updates, and the UART dump itself) with a
+// single compile-time switch, same pattern as SIDETNFS_DEBUG_DUMP_ON_SELECT
+// above. Defaults to SIDETNFS_ENABLE_DIAG_UART (passed from CMakeLists.txt,
+// itself defaulting to 0) so an ordinary build is entirely unaffected --
+// every update site below compiles to nothing and this is not linked in.
+#ifndef SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+#define SIDETNFS_UART_DIAG_DUMP_ON_SELECT SIDETNFS_ENABLE_DIAG_UART
+#endif
+
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+#include "filesys.h" // MAX_FOLDER_LENGTH
+
+// Temporary diagnostic build only (see report): a compact, fixed-size RAM
+// snapshot of runtime state, deliberately separate from
+// SidetnfsDiagEvent/sidetnfs_diag_log() above (a detailed 256-entry event
+// history dumped to DEBUG.TXT via FatFS). This is a handful of
+// counters/last-values, updated in RAM only during normal GEMDOS/bus
+// handling -- no I/O, no printf, no dynamic allocation anywhere except in
+// sidetnfs_uart_diag_dump() itself, which is only ever called from the
+// physical SELECT-button edge-handler in gemdrvemul.c.
+//
+// Fsfirst validation-phase codes (fsfirst_last_validation_phase):
+//   1 = invalid slot (out of [0, GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES) range)
+//   2 = slot outside g_drive_count (in range, but not a currently active drive)
+//   3 = no runtime config for the slot (sidetnfs_runtime_drive_get()==NULL,
+//       or sidetnfs_probe_get_slot_context() reports the slot not valid)
+//   4 = TNFS session not established for the slot
+//   5 = backend called (gemdrive_backend_fsfirst() about to run)
+//   6 = backend result received (gemdrive_backend_fsfirst() returned)
+//
+// MOUNT reject reasons (mount_last_reject_reason): a received MOUNT
+// response packet that could not be attributed to either slot -- see
+// tnfs_recv_callback()'s pending-slot correlation.
+//   0 = none (default/no reject recorded yet)
+//   1 = no pending slot (s_mount_pending_slot == -1 -- nothing was
+//       outstanding, e.g. a stray/duplicate/very-late packet)
+//   2 = sender address mismatch (pending slot's own expected server IP
+//       didn't match the packet's actual sender)
+//   3 = sender port mismatch (address matched, port didn't)
+typedef enum
+{
+    SIDETNFS_MOUNT_REJECT_NONE = 0,
+    SIDETNFS_MOUNT_REJECT_NO_PENDING_SLOT = 1,
+    SIDETNFS_MOUNT_REJECT_ADDR_MISMATCH = 2,
+    SIDETNFS_MOUNT_REJECT_PORT_MISMATCH = 3,
+} SidetnfsMountRejectReason;
+
+typedef struct
+{
+    uint32_t drive_count;
+    uint32_t drive_number_table[SIDETNFS_MAX_DRIVES + 1];
+
+    bool slot0_mount_sent;
+    bool slot0_mount_response_received;
+    uint8_t slot0_mount_rc;
+    uint16_t slot0_sid;
+    char slot0_host[SIDETNFS_HOST_LEN];
+    char slot0_mount_path[SIDETNFS_MOUNTPATH_LEN];
+    uint16_t slot0_port;
+    uint8_t slot0_last_recv_seq;
+
+    bool slot1_mount_sent;
+    bool slot1_mount_response_received;
+    uint8_t slot1_mount_rc;
+    uint16_t slot1_sid;
+    char slot1_host[SIDETNFS_HOST_LEN];
+    char slot1_mount_path[SIDETNFS_MOUNTPATH_LEN];
+    uint16_t slot1_port;
+    uint8_t slot1_last_recv_seq;
+
+    // Mirrors the internal s_mount_pending_slot correlation state (see
+    // sidetnfs_probe.c): -1 = no MOUNT outstanding, 0/1 = waiting for that
+    // slot's response. mount_rejected_count/mount_last_reject_reason cover
+    // every MOUNT response packet that arrived but did NOT get attributed
+    // to a slot (see SidetnfsMountRejectReason below).
+    int32_t mount_pending_slot;
+    uint32_t mount_rejected_count;
+    uint8_t mount_last_reject_reason;
+
+    // Temporary (path-normalization fix diagnosis): Dsetpath call
+    // tracking -- see normalize_gemdos_path() in gemdrvemul.c.
+    uint32_t dsetpath_calls;
+    int32_t dsetpath_last_slot;
+    char dsetpath_last_input_path[MAX_FOLDER_LENGTH];
+    char dsetpath_last_normalized_path[MAX_FOLDER_LENGTH];
+    uint16_t dsetpath_last_result;
+
+    uint32_t dfree_calls;
+    uint32_t dfree_last_drive_number;
+    int32_t dfree_last_slot;
+    uint32_t dfree_last_status;
+
+    uint32_t dgetpath_calls;
+    uint32_t dgetpath_last_drive_number;
+    int32_t dgetpath_last_slot;
+    char dgetpath_last_path[MAX_FOLDER_LENGTH];
+
+    uint32_t fsfirst_calls;
+    int32_t fsfirst_last_slot;
+    uint8_t fsfirst_last_attribs;
+    char fsfirst_last_searchpath[MAX_FOLDER_LENGTH];
+    uint8_t fsfirst_last_validation_phase;
+    uint16_t fsfirst_last_result;
+
+    uint32_t fsnext_calls;
+    int32_t fsnext_last_dta_slot;
+    uint16_t fsnext_last_result;
+} SidetnfsUartDiagSnapshot;
+
+// Returns a pointer to the single static instance -- callers in
+// gemdrvemul.c write individual fields directly (plain scalar/array
+// stores, no function-call overhead beyond this one deref).
+SidetnfsUartDiagSnapshot *sidetnfs_uart_diag(void);
+
+// Find the s_tnfs_dta_searches[] slot index actually holding ndta's active
+// TNFS DTA search (read-only, for the Fsnext "gevonden DTA-slot" field), or
+// -1 if none. Purely informational -- does not affect DTA-registry
+// behavior.
+int sidetnfs_uart_diag_find_dta_slot(uint32_t ndta);
+
+// Print the current snapshot over UART (stdio/printf -- see CMakeLists.txt,
+// SIDETNFS_ENABLE_DIAG_UART also forces pico_enable_stdio_uart on for this
+// build regardless of the DPRINTF/_DEBUG level, so DPRINTF itself can stay
+// off). Call only from the SELECT-button edge-handler.
+void sidetnfs_uart_diag_dump(void);
+
+// Same snapshot, same content/format, written to <hd_folder>/DEBUG.TXT via
+// FatFS instead of UART -- fallback for hardware where the physical UART
+// isn't usable. Call only from the SELECT-button edge-handler. Silently
+// does nothing if hd_folder is NULL or the SD write fails -- never
+// crashes, same contract as sidetnfs_diag_dump_on_select() above.
+void sidetnfs_uart_diag_dump_to_file(const char *hd_folder);
+
+#endif // SIDETNFS_UART_DIAG_DUMP_ON_SELECT
 
 #endif // SIDETNFS_PROBE_H

@@ -180,6 +180,21 @@ else()
         set(_SIDETNFS_ENABLE_DEBUG $ENV{SIDETNFS_ENABLE_DEBUG})
 endif()
 
+# Temporary diagnostic build: SIDETNFS_ENABLE_DIAG_UART -- same passthrough
+# pattern, default 0 (unchanged behavior/no code compiled in) unless
+# explicitly overridden, e.g.:
+#   SIDETNFS_ENABLE_DIAG_UART=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+# Deliberately independent of _DEBUG/SIDETNFS_ENABLE_DEBUG: this build keeps
+# DPRINTF (and the DEBUG.TXT dump-on-select) exactly as they'd otherwise be,
+# but still needs the physical UART wired up for the new, separate
+# SELECT-triggered snapshot dump -- see the pico_enable_stdio_uart() call
+# below.
+if("$ENV{SIDETNFS_ENABLE_DIAG_UART}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_DIAG_UART 0)
+else()
+        set(_SIDETNFS_ENABLE_DIAG_UART $ENV{SIDETNFS_ENABLE_DIAG_UART})
+endif()
+
 # Fase 10B: SIDETNFS_CONFIG_DRIVE_ONLY -- same passthrough pattern, default
 # 0 (unchanged behavior) unless explicitly overridden, e.g.:
 #   SIDETNFS_CONFIG_DRIVE_ONLY=1 SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
@@ -192,8 +207,13 @@ endif()
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
-# Workaround to disable USB output in release builds
-if(${_DEBUG} STREQUAL "0")
+# Workaround to disable USB output in release builds. SIDETNFS_ENABLE_DIAG_UART
+# additionally forces the physical UART on even at _DEBUG=0, for the
+# temporary diagnostic build's SELECT-triggered snapshot dump -- DPRINTF
+# itself stays gated on _DEBUG alone (unchanged), so a diag-UART build with
+# _DEBUG=0 gets a live UART port but zero DPRINTF chatter during GEMDOS/bus
+# handling.
+if(${_DEBUG} STREQUAL "0" AND ${_SIDETNFS_ENABLE_DIAG_UART} STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()
     pico_enable_stdio_uart(${PROJECT_NAME} 1)
@@ -220,9 +240,11 @@ add_definitions(-D_DEBUG=${_DEBUG})
 message("SIDETNFS_ENABLE_SD_SUPPORT: " ${_SIDETNFS_ENABLE_SD_SUPPORT})
 message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
 message("SIDETNFS_CONFIG_DRIVE_ONLY: " ${_SIDETNFS_CONFIG_DRIVE_ONLY})
+message("SIDETNFS_ENABLE_DIAG_UART: " ${_SIDETNFS_ENABLE_DIAG_UART})
 add_definitions(-DSIDETNFS_ENABLE_SD_SUPPORT=${_SIDETNFS_ENABLE_SD_SUPPORT})
 add_definitions(-DSIDETNFS_ENABLE_DEBUG=${_SIDETNFS_ENABLE_DEBUG})
 add_definitions(-DSIDETNFS_CONFIG_DRIVE_ONLY=${_SIDETNFS_CONFIG_DRIVE_ONLY})
+add_definitions(-DSIDETNFS_ENABLE_DIAG_UART=${_SIDETNFS_ENABLE_DIAG_UART})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")

@@ -290,6 +290,123 @@ static void __not_in_flash_func(cleanDTAHashTable)()
     }
 }
 
+// Fase 3 (path-normalization fix): bounded GEMDOS/TNFS path normalizer.
+// Root cause this fixes (see report): Dsetpath's relative-path handling
+// concatenated an incoming "." or ".." component onto
+// dpath_string_table[slot] literally (via snprintf("%s/%s", ...)) instead
+// of ever collapsing it -- repeated Dsetpath("..") calls during "Show
+// Information" grew the stored path by one literal "/.." per call,
+// eventually producing a ~126-character path (of the 128-byte
+// MAX_FOLDER_LENGTH budget) that, combined with a subsequent Fsfirst's own
+// unguarded concatenation, corrupted the shared-memory path fields well
+// enough to crash the Atari with a bus error. Neither back_2_forwardslash()
+// nor remove_dup_slashes() (filesys.c) nor seach_path_2_st() below ever
+// touched "."/".." at all -- this function is the single place that now
+// does, and both call sites below (Dsetpath, Fsfirst) route every path
+// through it before it can reach dpath_string_table[slot] or a backend
+// search.
+//
+// - Accepts both '/' and '\' as separators (both treated identically).
+// - "." components are dropped.
+// - ".." pops the previous real component; at root, ".." is a no-op --
+//   normalization never produces anything above root.
+// - Always produces a '/'-rooted, forward-slash, NUL-terminated result
+//   (matching the shape already stored in dpath_string_table[slot]).
+// - Fixed-size local working buffers only -- no dynamic allocation, no
+//   recursion, bounded strictly by MAX_FOLDER_LENGTH.
+// - If the input or the normalized result would not fit, returns false
+//   and leaves *out completely untouched -- the caller must then report a
+//   GEMDOS path error (GEMDOS_EPTHNF) and must NOT write anything into
+//   dpath_string_table[slot], so an existing valid CWD is never
+//   clobbered by a failed normalization.
+//
+// Slot independence: this function is purely a string transform with no
+// slot/global state of its own -- every call operates only on the buffers
+// its caller passes in, so slot 0 and slot 1 (or any two calls) can never
+// influence each other through it.
+static bool __not_in_flash_func(normalize_gemdos_path)(const char *in, char *out, size_t out_size)
+{
+    if (in == NULL || out == NULL || out_size < 2)
+    {
+        return false;
+    }
+
+    char work[MAX_FOLDER_LENGTH];
+    size_t in_len = strlen(in);
+    if (in_len >= sizeof(work))
+    {
+        return false; // input itself already too long to even process
+    }
+    memcpy(work, in, in_len + 1);
+
+    // Normalize separators in the local working copy only -- never
+    // touches the caller's own *in* buffer.
+    for (size_t i = 0; work[i] != '\0'; i++)
+    {
+        if (work[i] == '\\')
+        {
+            work[i] = '/';
+        }
+    }
+
+    // Shortest possible component is one character plus one separator,
+    // so MAX_FOLDER_LENGTH/2 pointers is always enough for any path that
+    // fit in `work` above -- no dynamic allocation needed.
+    const char *components[MAX_FOLDER_LENGTH / 2];
+    size_t component_count = 0;
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(work, "/", &saveptr);
+    while (tok != NULL)
+    {
+        if (strcmp(tok, ".") == 0)
+        {
+            // dropped
+        }
+        else if (strcmp(tok, "..") == 0)
+        {
+            if (component_count > 0)
+            {
+                component_count--;
+            }
+            // else: already at root -- no-op, never above root
+        }
+        else if (component_count < (sizeof(components) / sizeof(components[0])))
+        {
+            components[component_count++] = tok;
+        }
+        tok = strtok_r(NULL, "/", &saveptr);
+    }
+
+    char result[MAX_FOLDER_LENGTH];
+    size_t pos = 0;
+    result[pos++] = '/';
+    for (size_t i = 0; i < component_count; i++)
+    {
+        size_t clen = strlen(components[i]);
+        size_t needed = clen + (i > 0 ? 1 : 0); // separator before all but the first
+        if (pos + needed >= sizeof(result))
+        {
+            return false; // would not fit even in the local working buffer
+        }
+        if (i > 0)
+        {
+            result[pos++] = '/';
+        }
+        memcpy(result + pos, components[i], clen);
+        pos += clen;
+    }
+    result[pos] = '\0';
+
+    size_t result_len = pos;
+    if (result_len + 1 > out_size)
+    {
+        return false; // does not fit in the caller's buffer -- out left untouched
+    }
+    memcpy(out, result, result_len + 1);
+    return true;
+}
+
 static void __not_in_flash_func(seach_path_2_st)(const char *fspec_str, char *internal_path, char *path_forwardslash, char *name_pattern)
 {
     char drive[2] = {0};
@@ -1185,14 +1302,15 @@ static uint32_t gemdrive_backend_dta_release(uint32_t ndta, uint32_t memory_shar
 // DTA transfer area and GEMDRVEMUL_DTA_F_FOUND directly (same as before
 // extraction); the caller only does the generic write_random_token/
 // active_command_id reset afterwards.
-static void gemdrive_backend_fsfirst(uint32_t ndta, const char *path_forwardslash, const char *internal_path,
-                                       char *pattern, uint32_t attribs, uint32_t memory_shared_address,
-                                       bool sidetnfs_network_ok)
+static void gemdrive_backend_fsfirst(uint32_t ndta, int fsfirst_slot, const char *path_forwardslash,
+                                       const char *internal_path, char *pattern, uint32_t attribs,
+                                       uint32_t memory_shared_address, bool sidetnfs_network_ok)
 {
 #if SIDETNFS_USE_TNFS_LISTING
     (void)internal_path; // only used by the SD/FatFS backend below
 #if SIDETNFS_CONFIG_DRIVE_ONLY
     (void)sidetnfs_network_ok; // unused this phase -- always RAM-only
+    (void)fsfirst_slot;        // Fase 1: config-drive-only backend has no runtime-slot routing yet
     // Fase 10B: root-only, read-only drive. Same trailing-slash
     // normalization as the real-TNFS path below, so "/" and "" both reach
     // sidetnfs_config_drive_search_start() identically; anything else
@@ -1243,7 +1361,7 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, const char *path_forwardslas
         // one-entry-at-a-time READDIRX, registered under ndta
         // the same way SD's insertDTA()/lookupDTA() works).
         // Never SD.
-        sidetnfs_result = sidetnfs_tnfs_dta_start(ndta, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+        sidetnfs_result = sidetnfs_tnfs_dta_start(ndta, fsfirst_slot, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
     }
     else
     {
@@ -1285,6 +1403,7 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, const char *path_forwardslas
 #else
     (void)path_forwardslash;   // only used by the TNFS backend above
     (void)sidetnfs_network_ok; // only used by the TNFS backend above
+    (void)fsfirst_slot;        // Fase 1: SD/FatFS backend has no runtime-slot routing yet
     bool ndta_exists = lookupDTA(ndta) ? true : false;
 
     // Fase 5X: SD-baseline measurement -- logging only, no behavior
@@ -2153,6 +2272,17 @@ static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t acti
             g_drive_number_table[i] = 0xFFFFFFFF;
         }
     }
+
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    {
+        SidetnfsUartDiagSnapshot *diag = sidetnfs_uart_diag();
+        diag->drive_count = g_drive_count;
+        for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+        {
+            diag->drive_number_table[i] = g_drive_number_table[i];
+        }
+    }
+#endif
 
     // Publish to shared memory -- the exact same table the 68k ROM's
     // validate_drive_table/create_virtual_hard_disk (gemdrive.s) reads
@@ -3328,24 +3458,49 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_DFREE_CALL:
         {
-            uint32_t dfree_unit = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
+            // CMD_DFREE_CALL is a `send_sync ..., 2` call: the 68k side
+            // (gemdrive.s .Dfree) only ever transmits a single 16-bit
+            // payload word (d3.w). payloadPtr[1] is NOT d3's high word --
+            // d3's high word is never sent on the wire for this call -- it
+            // is stale data left over in the reused, never-cleared
+            // protocol payload buffer from whatever command ran before
+            // this one. Combining it in was a bug (GEMDRVEMUL_DGETPATH_CALL,
+            // which has the identical 2-byte payload shape, already reads
+            // only payloadPtr[0]). Read the drive number from payloadPtr[0]
+            // only, same as GET_PAYLOAD_PARAM16.
+            uint32_t dfree_unit = (uint16_t)payloadPtr[0];
 
-            // Fase 1 (multi-drive slot routing): dfree_unit already
-            // arrives as a real, 0-based GEMDOS drive number -- the 68k
-            // ROM's own find_drive_slot_by_number() (gemdrive.s's .Dfree)
-            // already validated it and falls back to the original TOS
-            // handler itself if it isn't one of our managed drives, so
-            // this call never sees GEMDOS's "0 = default drive"
-            // convention. Re-validated here too, defensively: an
-            // unmanaged drive number gets GEMDOS_EDRIVE instead of
-            // silently returning the (only) backend's disk info. Only
-            // slot 0 exists in this phase, so dfree_slot gates entry into
-            // the existing single-backend logic below unchanged -- no
-            // per-slot backend dispatch yet.
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->dfree_calls++;
+            sidetnfs_uart_diag()->dfree_last_drive_number = dfree_unit;
+#endif
+
+            // Fase 1 (multi-drive slot routing): dfree_unit is always a
+            // real, already-resolved 0-based GEMDOS drive number -- never
+            // a "0 = current drive" sentinel to special-case here. The
+            // 68k ROM's .Dfree (gemdrive.s) resolves GEMDOS's own
+            // "0 = current drive" convention itself, via Dgetdrv(),
+            // *before* ever sending anything (a non-zero unit is
+            // converted with a plain -1); it then already validates the
+            // resolved number through find_drive_slot_by_number() and
+            // falls back to the original TOS handler if it isn't one of
+            // our managed drives -- so this call never actually sees an
+            // unmanaged drive number in practice either. Re-resolved here
+            // too, defensively, via the exact same number->slot mapping
+            // GEMDRVEMUL_DGETPATH_CALL uses (gemdos_drive_number_to_slot()):
+            // an unmanaged drive number gets GEMDOS_EDRIVE instead of
+            // silently returning the (only) backend's disk info, no
+            // table indexed either way.
             int dfree_slot = gemdos_drive_number_to_slot(dfree_unit);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->dfree_last_slot = dfree_slot;
+#endif
             if (dfree_slot < 0)
             {
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STATUS, (uint32_t)GEMDOS_EDRIVE);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dfree_last_status = (uint32_t)GEMDOS_EDRIVE;
+#endif
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -3390,6 +3545,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             if (!disk_info_ok)
             {
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_DFREE_STATUS)) = GEMDOS_ERROR;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dfree_last_status = (uint32_t)GEMDOS_ERROR;
+#endif
             }
             else
             {
@@ -3399,6 +3557,9 @@ void init_gemdrvemul(bool safe_config_reboot)
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 8, disk_info.bytes_per_sector);
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DFREE_STRUCT + 12, disk_info.sectors_per_cluster);
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_DFREE_STATUS)) = GEMDOS_EOK;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dfree_last_status = (uint32_t)GEMDOS_EOK;
+#endif
             }
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -3408,31 +3569,48 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint16_t dpath_drive = payloadPtr[0]; // d3 register
 
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->dgetpath_calls++;
+            sidetnfs_uart_diag()->dgetpath_last_drive_number = dpath_drive;
+#endif
+
             DPRINTF("Dpath drive: %x\n", dpath_drive);
             DPRINTF("Dpath string: %s\n", dpath_string_table[0]);
 
-            // Fase 1 (multi-drive slot routing): dpath_drive is either 0
-            // (GEMDOS's "current/default drive" sentinel --
-            // gemdrive.s's .Dgetpath_current_drive, never decremented) or
-            // a real, already-validated 0-based drive number (gemdrive.s
-            // decrements and checks find_drive_slot_by_number itself
-            // before ever sending CMD_DGETPATH_CALL for a non-zero
-            // value). 0 always resolves to slot 0 here too -- there is
-            // only one "current" drive in this phase, so this is exactly
-            // today's behavior for every call this ROM actually sends.
-            int dpath_slot = (dpath_drive == 0) ? 0 : gemdos_drive_number_to_slot(dpath_drive);
+            // Fase 1 (multi-drive slot routing): dpath_drive is always a
+            // real, already-resolved 0-based GEMDOS drive number -- there
+            // is no more "0 means slot 0" special case. The 68k ROM's
+            // .Dgetpath (gemdrive.s) now resolves GEMDOS's own
+            // "0 = current drive" convention itself, via Dgetdrv(),
+            // *before* ever sending anything (a non-zero unit is
+            // converted with a plain -1, same as .Dfree above); it then
+            // already validates the resolved number through
+            // find_drive_slot_by_number() and falls back to the original
+            // TOS handler if it isn't one of our managed drives. A
+            // genuinely received 0 is therefore drive A: itself, resolved
+            // through the exact same gemdos_drive_number_to_slot() helper
+            // GEMDRVEMUL_DFREE_CALL uses above -- never hardcoded to slot 0.
+            int dpath_slot = gemdos_drive_number_to_slot(dpath_drive);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->dgetpath_last_slot = dpath_slot;
+#endif
             if (dpath_slot < 0)
             {
                 // Fase 1: Dgetpath has no dedicated status/error field in
-                // the current wire protocol (unchanged this phase --
-                // gemdrive.s always returns d0=0/success after copying
-                // whatever's here). An empty path is the closest
-                // available "not one of our drives" signal without
-                // changing the protocol -- written directly, bypassing
-                // the trailing-backslash-strip logic below, which assumes
-                // a non-empty string.
+                // the wire protocol (unchanged -- gemdrive.s always
+                // returns d0=0/success after copying whatever's here, and
+                // this phase does not add one). An empty path is the
+                // closest available "not one of our drives" signal
+                // without changing the protocol -- written directly,
+                // bypassing the trailing-backslash-strip logic below
+                // (which assumes a non-empty string), and before any
+                // table (dpath_string_table included) is ever indexed
+                // with the unresolved dpath_slot.
                 char empty_path[MAX_FOLDER_LENGTH] = {0};
                 COPY_AND_CHANGE_ENDIANESS_BLOCK16(empty_path, memory_shared_address + GEMDRVEMUL_DEFAULT_PATH, MAX_FOLDER_LENGTH);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dgetpath_last_path[0] = '\0';
+#endif
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -3459,6 +3637,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             // visible in DEBUG.TXT now that Dsetpath can correctly update
             // dpath_string_table[0] for a real TNFS subdirectory.
             sidetnfs_diag_log(SIDETNFS_DIAG_DGETPATH_RETURN, 0, tmp_path, NULL, NULL, 0, 0, 0, 0);
+#endif
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            snprintf(sidetnfs_uart_diag()->dgetpath_last_path, MAX_FOLDER_LENGTH, "%s", tmp_path);
 #endif
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(tmp_path, memory_shared_address + GEMDRVEMUL_DEFAULT_PATH, MAX_FOLDER_LENGTH);
             write_random_token(memory_shared_address);
@@ -3534,6 +3715,37 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Remove duplicated forward slashes
             remove_dup_slashes(dpath_tmp);
 
+            // Fase 3 (path-normalization fix): collapse "."/".." components
+            // now, before any existence check or write into
+            // dpath_string_table[dsetpath_slot] -- see
+            // normalize_gemdos_path()'s own comment for the root cause this
+            // fixes. A normalization failure (path too long) reports a
+            // GEMDOS path error and leaves dpath_string_table[dsetpath_slot]
+            // (the existing CWD) completely untouched -- same as the
+            // existing invalid-slot early-return above.
+            char dpath_normalized[MAX_FOLDER_LENGTH];
+            bool dsetpath_normalize_ok = normalize_gemdos_path(dpath_tmp, dpath_normalized, sizeof(dpath_normalized));
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->dsetpath_calls++;
+            sidetnfs_uart_diag()->dsetpath_last_slot = dsetpath_slot;
+            snprintf(sidetnfs_uart_diag()->dsetpath_last_input_path, MAX_FOLDER_LENGTH, "%s", dpath_tmp);
+#endif
+            if (!dsetpath_normalize_ok)
+            {
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dsetpath_last_normalized_path[0] = '\0';
+                sidetnfs_uart_diag()->dsetpath_last_result = (uint16_t)GEMDOS_EPTHNF;
+#endif
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EPTHNF;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            snprintf(dpath_tmp, MAX_FOLDER_LENGTH, "%s", dpath_normalized);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            snprintf(sidetnfs_uart_diag()->dsetpath_last_normalized_path, MAX_FOLDER_LENGTH, "%s", dpath_normalized);
+#endif
+
 #if SIDETNFS_USE_TNFS_LISTING
 #if SIDETNFS_CONFIG_DRIVE_ONLY
             // Fase 10B: root-only drive -- Dsetpath only succeeds for the
@@ -3592,11 +3804,17 @@ void init_gemdrvemul(bool safe_config_reboot)
             {
                 DPRINTF("Directory exists: %s\n", dpath_tmp);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EOK;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dsetpath_last_result = (uint16_t)GEMDOS_EOK;
+#endif
             }
             else
             {
                 DPRINTF("Directory does not exist: %s\n", dpath_tmp);
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_SET_DPATH_STATUS)) = GEMDOS_EPTHNF;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dsetpath_last_result = (uint16_t)GEMDOS_EPTHNF;
+#endif
             }
 #if SIDETNFS_CONFIG_DRIVE_ONLY
             // Fase 10B-afronding: a failed Dsetpath (any non-root reference,
@@ -3951,10 +4169,107 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];  // d3 register
             payloadPtr += 2;                                                  // Skip two words
-            uint32_t attribs = payloadPtr[0];                                 // d4 register
+            uint32_t attribs = payloadPtr[0];                                 // d4 register (low word, unchanged)
+            // Fase 1 (multi-drive slot routing): the new GEMDRIVE.BIN's
+            // .fs_first_emulated (sidecart-gemdrive-atari) now sends the
+            // resolved slot index in d4's HIGH word -- verified against
+            // the actual 68k source (gemdrive.s: "swap d0 / or.l d0, d4"
+            // right before send_write_sync), not assumed: payloadPtr[0]
+            // is d4's low word (attribs, as always), payloadPtr[1] is
+            // d4's high word (the new slot index), same
+            // low-word-then-high-word convention already established for
+            // every other multi-word register this protocol sends
+            // (DFREE_CALL/DSETPATH_CALL).
+            int16_t fsfirst_slot_raw = (int16_t)payloadPtr[1]; // d4 register (high word) -- new: runtime slot index
             payloadPtr += 2;                                                  // Skip two words
-            uint32_t fspec = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0]; // d5 register
+            uint32_t fspec = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0]; // d5 register (unchanged, unread as before)
             payloadPtr += 2;                                                  // Skip two words
+
+            // Fase 1 (multi-drive slot routing): validate the slot
+            // BEFORE any table use (g_drive_number_table/g_runtime_drives/
+            // dpath_string_table/s_slot_contexts) -- an invalid slot never
+            // indexes into any of them. Mirrors the DFREE_CALL/
+            // DSETPATH_CALL validation shape (range, then g_drive_count,
+            // then a real runtime-config record), plus (new for this
+            // handler) a live TNFS session requirement, since Fsfirst is
+            // the first place a slot's session is actually used, not just
+            // published.
+            int fsfirst_slot = (int)fsfirst_slot_raw;
+            bool fsfirst_slot_ok = false;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->fsfirst_calls++;
+            sidetnfs_uart_diag()->fsfirst_last_slot = fsfirst_slot;
+            sidetnfs_uart_diag()->fsfirst_last_attribs = (uint8_t)attribs;
+            // Same overall boolean result as the original single combined
+            // "&&" condition below, decomposed into ordered branches purely
+            // so each failure point can be attributed to one of the 1-4
+            // validation-phase codes documented in sidetnfs_probe.h --
+            // behavior/outcome unchanged.
+            uint8_t fsfirst_diag_phase;
+            if (fsfirst_slot < 0 || fsfirst_slot >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
+            {
+                fsfirst_diag_phase = 1; // invalid slot
+            }
+            else if ((uint32_t)fsfirst_slot >= g_drive_count)
+            {
+                fsfirst_diag_phase = 2; // slot outside g_drive_count
+            }
+            else
+            {
+                const sidetnfs_runtime_drive_t *fsfirst_runtime_diag = sidetnfs_runtime_drive_get(fsfirst_slot);
+                if (fsfirst_runtime_diag == NULL)
+                {
+                    fsfirst_diag_phase = 3; // no runtime config
+                }
+                else
+                {
+                    sidetnfs_slot_tnfs_context_t fsfirst_ctx_diag;
+                    if (!sidetnfs_probe_get_slot_context(fsfirst_slot, &fsfirst_ctx_diag))
+                    {
+                        fsfirst_diag_phase = 3; // no runtime config (context not valid)
+                    }
+                    else if (fsfirst_ctx_diag.backend_type == SIDETNFS_DRIVE_TNFS &&
+                             !fsfirst_ctx_diag.session_established)
+                    {
+                        fsfirst_diag_phase = 4; // TNFS session not established
+                    }
+                    else
+                    {
+                        fsfirst_diag_phase = 4; // passed all checks -- overwritten to 5/6 below
+                    }
+                }
+            }
+            sidetnfs_uart_diag()->fsfirst_last_validation_phase = fsfirst_diag_phase;
+#endif
+            if (fsfirst_slot >= 0 && (uint32_t)fsfirst_slot < g_drive_count &&
+                fsfirst_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
+            {
+                const sidetnfs_runtime_drive_t *fsfirst_runtime = sidetnfs_runtime_drive_get(fsfirst_slot);
+                if (fsfirst_runtime != NULL)
+                {
+                    sidetnfs_slot_tnfs_context_t fsfirst_ctx;
+                    if (sidetnfs_probe_get_slot_context(fsfirst_slot, &fsfirst_ctx))
+                    {
+                        fsfirst_slot_ok = (fsfirst_ctx.backend_type != SIDETNFS_DRIVE_TNFS) ||
+                                          fsfirst_ctx.session_established;
+                    }
+                }
+            }
+            if (!fsfirst_slot_ok)
+            {
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->fsfirst_last_result = (uint16_t)GEMDOS_EDRIVE;
+#endif
+                // Invalid/unmanaged/not-yet-mounted slot: appropriate
+                // GEMDOS error, no table is ever indexed with
+                // fsfirst_slot beyond the checks above.
+                nullify_dta(memory_shared_address);
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EDRIVE;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
             char attribs_str[7] = "";
             char internal_path[MAX_FOLDER_LENGTH * 2] = {0};
             char pattern[MAX_FOLDER_LENGTH] = {0};
@@ -3970,7 +4285,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             if (tmp_string[1] == ':')
             {
                 // If the path has the drive letter, jump two positions
-                // and ignore the dpath_string_table[0]
+                // and ignore the dpath_string_table[fsfirst_slot]
                 snprintf(tmp_string, MAX_FOLDER_LENGTH, "%s", tmp_string + 2);
                 DPRINTF("New path_filename: %s\n", tmp_string);
             }
@@ -3982,7 +4297,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             else
             {
-                DPRINTF("Need to concatenate the default path: %s\n", dpath_string_table[0]);
+                DPRINTF("Need to concatenate the default path: %s\n", dpath_string_table[fsfirst_slot]);
 #if SIDETNFS_USE_TNFS_LISTING
                 // Fase 7E: Fsfirst had no dedicated path-resolve
                 // diagnostics of its own before this phase (unlike Fopen's
@@ -3991,14 +4306,47 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // relative-fspec case.
                 fsfirst_path_was_relative = true;
                 sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_INPUT, ndta, tmp_string, NULL, NULL, 0, 0, 0, 0);
-                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, ndta, dpath_string_table[0], NULL, NULL, 0, 0, 0, 0);
+                sidetnfs_diag_log(SIDETNFS_DIAG_PATH_RESOLVE_CWD, ndta, dpath_string_table[fsfirst_slot], NULL, NULL, 0, 0, 0, 0);
 #endif
-                snprintf(fspec_string, sizeof(fspec_string), "%s/%s", dpath_string_table[0], tmp_string);
+                snprintf(fspec_string, sizeof(fspec_string), "%s/%s", dpath_string_table[fsfirst_slot], tmp_string);
                 DPRINTF("Full fspec string: %s\n", fspec_string);
             }
 
             // Remove duplicated forward slashes
             remove_dup_slashes(fspec_string);
+
+            // Fase 3 (path-normalization fix): collapse "."/".." components
+            // in the search path before it's ever split/joined further --
+            // see normalize_gemdos_path()'s own comment above for the root
+            // cause this fixes. dpath_string_table[fsfirst_slot] should
+            // already be normalized (Dsetpath normalizes before storing),
+            // but fspec_string can also carry a literal "."/".." directly
+            // from this single Fsfirst call's own fspec argument
+            // (independent of any prior Dsetpath), so it is normalized here
+            // too, defensively, right before any backend path construction.
+            char fspec_normalized[MAX_FOLDER_LENGTH];
+            if (!normalize_gemdos_path(fspec_string, fspec_normalized, sizeof(fspec_normalized)))
+            {
+                // Path too long to normalize: clean GEMDOS path error, no
+                // backend search is ever started with an unnormalized or
+                // truncated path.
+                nullify_dta(memory_shared_address);
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EPTHNF;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                // fsfirst_calls/last_slot/last_attribs were already
+                // recorded at the top of this case (validation-phase
+                // tracking above) -- only the fields this normalization
+                // failure actually changes are updated here.
+                sidetnfs_uart_diag()->fsfirst_last_searchpath[0] = '\0';
+                sidetnfs_uart_diag()->fsfirst_last_validation_phase = 6;
+                sidetnfs_uart_diag()->fsfirst_last_result = (uint16_t)GEMDOS_EPTHNF;
+#endif
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            snprintf(fspec_string, sizeof(fspec_string), "%s", fspec_normalized);
+
             get_attribs_st_str(attribs_str, attribs);
             seach_path_2_st(fspec_string, internal_path, path_forwardslash, pattern);
 
@@ -4029,8 +4377,17 @@ void init_gemdrvemul(bool safe_config_reboot)
                 attribs |= FS_ST_ARCH;
             }
 
-            gemdrive_backend_fsfirst(ndta, path_forwardslash, internal_path, pattern, attribs, memory_shared_address,
-                                      sidetnfs_network_ok);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            snprintf(sidetnfs_uart_diag()->fsfirst_last_searchpath, MAX_FOLDER_LENGTH, "%s", path_forwardslash);
+            sidetnfs_uart_diag()->fsfirst_last_validation_phase = 5; // backend called
+#endif
+            gemdrive_backend_fsfirst(ndta, fsfirst_slot, path_forwardslash, internal_path, pattern, attribs,
+                                      memory_shared_address, sidetnfs_network_ok);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->fsfirst_last_validation_phase = 6; // backend result received
+            sidetnfs_uart_diag()->fsfirst_last_result =
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND));
+#endif
 
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -4041,7 +4398,15 @@ void init_gemdrvemul(bool safe_config_reboot)
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0]; // d3 register
             DPRINTF("Fsnext ndta: %x\n", ndta);
 
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->fsnext_calls++;
+            sidetnfs_uart_diag()->fsnext_last_dta_slot = sidetnfs_uart_diag_find_dta_slot(ndta);
+#endif
             gemdrive_backend_fsnext(ndta, memory_shared_address);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            sidetnfs_uart_diag()->fsnext_last_result =
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND));
+#endif
 
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -5402,6 +5767,41 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_diag_dump_on_select(hd_folder);
         }
         s_diag_select_prev_pressed = select_pressed_now;
+#endif
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        // Temporary diagnostic build (see report): same edge-triggered
+        // (rising edge only) pattern as the DEBUG.TXT dump above, reusing
+        // the same select_pressed_now read -- writes the compact
+        // SidetnfsUartDiagSnapshot to <hd_folder>/DEBUG.TXT (the physical
+        // UART port turned out not to be usable on this hardware, so the
+        // dump target was switched from sidetnfs_uart_diag_dump() (UART) to
+        // sidetnfs_uart_diag_dump_to_file() (SD) -- same snapshot, same
+        // content/format, only the output sink differs; the UART function
+        // itself is left in place, just unused for now). Fires once per
+        // physical press, before select_button_action() below (which, in
+        // the non-safe-reboot case, reboots immediately and never returns).
+        // Independent static edge-tracker so this can never interfere with
+        // the other DEBUG.TXT dump's own edge state above.
+        static bool s_uart_diag_select_prev_pressed = false;
+        if (select_pressed_now && !s_uart_diag_select_prev_pressed)
+        {
+            sidetnfs_uart_diag_dump_to_file(hd_folder);
+            // Visual confirmation the dump was written -- there is no
+            // serial feedback on this hardware (see report), so blink the
+            // Pico W's onboard LED twice (0.5s on / 0.5s off each) right
+            // after the write completes. One-shot, triggered only on this
+            // SELECT edge -- blocking sleep_ms() here is the same pattern
+            // already used by blink_morse_container()/blink_error() in
+            // config.c, and never runs during GEMDOS/bus handling.
+            for (int diag_blink = 0; diag_blink < 2; diag_blink++)
+            {
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+                sleep_ms(500);
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+                sleep_ms(500);
+            }
+        }
+        s_uart_diag_select_prev_pressed = select_pressed_now;
 #endif
         if (select_pressed_now)
         {

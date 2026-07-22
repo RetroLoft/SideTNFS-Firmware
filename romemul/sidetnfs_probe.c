@@ -547,12 +547,44 @@ static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_S
 // s_state.sid/mount_rc/mount_response_received for slot 0 -- kept
 // separate from s_state (which remains exclusively slot 0's, unchanged)
 // so a failed/slow slot 1 mount can never perturb slot 0's own state.
-// Written only by tnfs_recv_callback()'s seq==TNFS_MOUNT_SEQ_SLOT1
-// branch and send_slot1_mount_request() (both further down in this
-// file); read by sidetnfs_probe_get_slot_context() below.
+// Written only by tnfs_recv_callback()'s pending-slot-1 branch and
+// send_slot1_mount_request() (both further down in this file); read by
+// sidetnfs_probe_get_slot_context() below.
 static uint16_t s_slot1_mount_sid = 0;
 static uint8_t s_slot1_mount_rc = 0xFF; // 0xFF: no response yet (not a real TNFS rc)
 static bool s_slot1_mount_response_received = false;
+
+// Fase 2 (mount pending-slot fix): explicit single-outstanding-MOUNT
+// tracker. -1 means "no MOUNT currently outstanding" -- deliberately NOT
+// 0, since slot 0 is itself a valid slot index and a zero-initialized
+// "0 means none" sentinel would make slot 0's own pending window
+// indistinguishable from "nothing pending" at static-init time. Set to
+// 0/1 by sidetnfs_send_mount_probe()/send_slot1_mount_request()
+// respectively, BEFORE the packet is actually sent (so a very fast
+// response can never race ahead of us marking it pending); cleared back
+// to -1 by tnfs_recv_callback() on an accepted response, and by
+// sidetnfs_probe_mount_runtime_slots() after each bounded wait
+// completes (covers the timeout case, so a late straggler arriving after
+// the wait gave up is never attributed to whichever slot is mounted
+// next).
+//
+// Replaces the previous, protocol-non-conformant design that used a
+// hardcoded, non-zero MOUNT sequence number (0x40) to tell slot 1's
+// response apart from slot 0's. Root cause (see report): on the actual
+// production TNFS server this Pico talks to, a MOUNT response's echoed
+// sequence byte could not be relied on to distinguish slot 1's request
+// from slot 0's the way a synthetic local tnfsd test suggested -- slot
+// 0 and slot 1 mount the same server (only mount_path differs), so a
+// slot 1 response landing with the same address/port as slot 0's own
+// expected reply, while carrying an unexpected seq value, fell through
+// the old seq==0-gated slot-0 branch entirely and was silently dropped
+// by neither branch matching -- or, in the reverse case, could have been
+// wrongly captured by slot 0's own seq==0 gate. This pending-slot design
+// no longer depends on the received sequence byte to attribute a
+// response at all -- only on which single slot is currently the one
+// outstanding MOUNT, plus a defensive address+port match against that
+// slot's own configured server.
+static int s_mount_pending_slot = -1;
 
 void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cfg)
 {
@@ -673,6 +705,16 @@ typedef struct
     // ever sending CLOSEDIR twice for the same handle. Always set/cleared
     // together with `active` (see insertTnfsDTA()/releaseTnfsDTA()).
     bool handle_valid;
+    // Fase 1 (multi-drive slot routing): the runtime slot this search's
+    // OPENDIRX/READDIRX/CLOSEDIR traffic belongs to -- set once by
+    // insertTnfsDTA() (from GEMDRVEMUL_FSFIRST_CALL's already-validated
+    // slot), then read back by tnfs_dta_find_next_match()/
+    // releaseTnfsDTA()/tnfs_dta_closedir() to resolve the right
+    // session_id/host/port via sidetnfs_probe_get_slot_context(). Named
+    // "runtime_slot", not "slot", to avoid colliding with the existing
+    // `SidetnfsTnfsDtaSearch *slot` local-variable convention used
+    // throughout this file.
+    int runtime_slot;
 } SidetnfsTnfsDtaSearch;
 
 static SidetnfsTnfsDtaSearch s_tnfs_dta_searches[SIDETNFS_TNFS_DTA_SLOTS] = {0};
@@ -1533,14 +1575,11 @@ static SidetnfsFsListingResponse s_fslisting_resp = {0};
 // from under an in-flight callback.
 static struct udp_pcb *s_mount_pcb = NULL;
 
-// Fase 1 (multi-drive slot routing, TNFS mount sequencing): slot 1's
-// (O:) own MOUNT sequence number, distinct from slot 0's (0), OPENDIRX's
-// (1, legacy/dead under SIDETNFS_USE_TNFS_LISTING -- see
-// sidetnfs_probe_service()) and READDIRX's (2.., same legacy path) --
-// picked well clear of that range (bounded by SIDETNFS_READDIRX_MAX_ROUNDS,
-// max ~34) so a future revival of that legacy probe still could never
-// collide with this value.
-#define TNFS_MOUNT_SEQ_SLOT1 0x40u
+// Fase 2 (mount pending-slot fix): every MOUNT request (slot 0 and slot
+// 1 alike) now uses the protocol-conformant sequence number 0 -- see
+// s_mount_pending_slot above for how responses are attributed to a slot
+// instead. The previous distinct-sequence-number scheme (0x40 for slot
+// 1) has been removed entirely; it is no longer used anywhere.
 
 // Fase 1: the server address each in-flight MOUNT request was actually
 // sent to, captured at send time (not re-parsed from a hostname string
@@ -1946,33 +1985,97 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     uint8_t cmd = buf[3];
     if (cmd == TNFS_CMD_MOUNT)
     {
-        // Fase 1 (multi-drive slot routing, TNFS mount sequencing): two
-        // sequential MOUNT requests can now be outstanding, one at a
-        // time, against this same PCB (slot 0 with seq 0, slot 1 with
-        // seq TNFS_MOUNT_SEQ_SLOT1) -- route strictly on the echoed
-        // sequence number (offset 2) and, defensively, on the actual UDP
-        // sender matching the slot's own configured server, so a late
-        // response for one slot can never be attributed to the other
-        // (or to neither, if the sender doesn't match at all -- silently
-        // ignored). Slot 0's own matching/state-write below is otherwise
-        // byte-for-byte unchanged from before this phase.
-        uint8_t seq = buf[2];
-        if (seq == 0 && addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot0) && port == s_active_port)
+        // Fase 2 (mount pending-slot fix): attribution no longer depends
+        // on the response's echoed sequence byte at all (see
+        // s_mount_pending_slot's own comment above for why) -- only on
+        // which single slot is the current pending one, defensively
+        // confirmed against that slot's own configured server
+        // address+port. At most one of slot 0/slot 1 can ever be pending
+        // at a time (sidetnfs_probe_mount_runtime_slots() mounts strictly
+        // sequentially), so this is unambiguous.
+        uint8_t seq = buf[2]; // no longer used for routing -- captured into the diag snapshot only, see below
+        (void)seq;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        SidetnfsMountRejectReason reject_reason = SIDETNFS_MOUNT_REJECT_NO_PENDING_SLOT;
+#endif
+        bool accepted = false;
+        if (s_mount_pending_slot == 0)
         {
-            s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-            s_state.mount_rc = n > 4 ? buf[4] : 0;
-            s_state.mount_response_received = true;
-            s_state.debug_dirty = true;
+            if (addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot0))
+            {
+                if (port == s_active_port)
+                {
+                    s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+                    s_state.mount_rc = n > 4 ? buf[4] : 0;
+                    s_state.mount_response_received = true;
+                    s_state.debug_dirty = true;
+                    s_mount_pending_slot = -1;
+                    accepted = true;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                    sidetnfs_uart_diag()->slot0_mount_response_received = true;
+                    sidetnfs_uart_diag()->slot0_mount_rc = s_state.mount_rc;
+                    sidetnfs_uart_diag()->slot0_sid = s_state.sid;
+                    sidetnfs_uart_diag()->slot0_last_recv_seq = seq;
+#endif
+                }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                else
+                {
+                    reject_reason = SIDETNFS_MOUNT_REJECT_PORT_MISMATCH;
+                }
+#endif
+            }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            else
+            {
+                reject_reason = SIDETNFS_MOUNT_REJECT_ADDR_MISMATCH;
+            }
+#endif
         }
-        else if (seq == TNFS_MOUNT_SEQ_SLOT1 && addr != NULL &&
-                 ip_addr_cmp(addr, &s_mount_expected_addr_slot1) && port == s_slot_contexts[1].port)
+        else if (s_mount_pending_slot == 1)
         {
-            s_slot1_mount_sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-            s_slot1_mount_rc = n > 4 ? buf[4] : 0;
-            s_slot1_mount_response_received = true;
+            if (addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot1))
+            {
+                if (port == s_slot_contexts[1].port)
+                {
+                    s_slot1_mount_sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+                    s_slot1_mount_rc = n > 4 ? buf[4] : 0;
+                    s_slot1_mount_response_received = true;
+                    s_mount_pending_slot = -1;
+                    accepted = true;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                    sidetnfs_uart_diag()->slot1_mount_response_received = true;
+                    sidetnfs_uart_diag()->slot1_mount_rc = s_slot1_mount_rc;
+                    sidetnfs_uart_diag()->slot1_sid = s_slot1_mount_sid;
+                    sidetnfs_uart_diag()->slot1_last_recv_seq = seq;
+#endif
+                }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                else
+                {
+                    reject_reason = SIDETNFS_MOUNT_REJECT_PORT_MISMATCH;
+                }
+#endif
+            }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+            else
+            {
+                reject_reason = SIDETNFS_MOUNT_REJECT_ADDR_MISMATCH;
+            }
+#endif
         }
-        // else: unexpected seq or sender -- stray/late/spoofed packet,
-        // ignored, never attributed to either slot.
+        // else: s_mount_pending_slot == -1 -- nothing outstanding right
+        // now (stray/duplicate/very-late packet); reject_reason stays
+        // SIDETNFS_MOUNT_REJECT_NO_PENDING_SLOT.
+        (void)accepted; // only read back via reject_reason below when diag is compiled in
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        if (!accepted)
+        {
+            sidetnfs_uart_diag()->mount_rejected_count++;
+            sidetnfs_uart_diag()->mount_last_reject_reason = (uint8_t)reject_reason;
+        }
+        sidetnfs_uart_diag()->mount_pending_slot = s_mount_pending_slot;
+#endif
     }
     else if (cmd == TNFS_CMD_OPENDIRX)
     {
@@ -2049,6 +2152,12 @@ void sidetnfs_send_mount_probe(void)
     // fire-and-forget probe, "sent" means "we tried this boot".
     s_state.mount_probe_sent = true;
     s_state.debug_dirty = true;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    sidetnfs_uart_diag()->slot0_mount_sent = true;
+    snprintf(sidetnfs_uart_diag()->slot0_host, SIDETNFS_HOST_LEN, "%s", s_active_host);
+    snprintf(sidetnfs_uart_diag()->slot0_mount_path, SIDETNFS_MOUNTPATH_LEN, "%s", s_active_mount_path);
+    sidetnfs_uart_diag()->slot0_port = s_active_port;
+#endif
 
     ip_addr_t server_ip;
     if (!ipaddr_aton(s_active_host, &server_ip))
@@ -2102,6 +2211,11 @@ void sidetnfs_send_mount_probe(void)
         return;
     }
 
+    // Fase 2 (mount pending-slot fix): mark slot 0 as the pending MOUNT
+    // BEFORE the packet actually goes out, so a very fast response can
+    // never race ahead of tnfs_recv_callback() being able to attribute
+    // it (see s_mount_pending_slot's own comment above).
+    s_mount_pending_slot = 0;
     memcpy(p->payload, buf, offset);
     udp_sendto(pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
@@ -2120,20 +2234,27 @@ void sidetnfs_send_mount_probe(void)
     cyw43_arch_lwip_end();
 }
 
-// Fase 1 (multi-drive slot routing, TNFS mount sequencing): sends slot
-// 1's (O:) MOUNT request over the SAME s_mount_pcb slot 0's own mount
-// already created above -- never a second/parallel socket. Uses
-// s_slot_contexts[1]'s host/mount_path (populated by
-// sidetnfs_probe_set_slot_context() before this can ever be called) and
-// the distinct TNFS_MOUNT_SEQ_SLOT1 sequence number, so
-// tnfs_recv_callback() can tell its response apart from slot 0's. A
-// no-op (s_slot1_mount_response_received stays false) if s_mount_pcb
-// doesn't exist yet or the host doesn't parse -- never touches s_state
-// (slot 0) either way.
+// Fase 2 (mount pending-slot fix): sends slot 1's (O:) MOUNT request
+// over the SAME s_mount_pcb slot 0's own mount already created above --
+// never a second/parallel socket. Uses s_slot_contexts[1]'s
+// host/mount_path (populated by sidetnfs_probe_set_slot_context() before
+// this can ever be called) and the same protocol-conformant sequence
+// number 0 slot 0 uses -- tnfs_recv_callback() now tells the response
+// apart from slot 0's via s_mount_pending_slot, not via a distinct
+// sequence number (see that variable's own comment for why). A no-op
+// (s_slot1_mount_response_received stays false) if s_mount_pcb doesn't
+// exist yet or the host doesn't parse -- never touches s_state (slot 0)
+// either way.
 static void send_slot1_mount_request(void)
 {
     s_slot1_mount_response_received = false;
     s_slot1_mount_rc = 0xFF;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    sidetnfs_uart_diag()->slot1_mount_sent = true;
+    snprintf(sidetnfs_uart_diag()->slot1_host, SIDETNFS_HOST_LEN, "%s", s_slot_contexts[1].host);
+    snprintf(sidetnfs_uart_diag()->slot1_mount_path, SIDETNFS_MOUNTPATH_LEN, "%s", s_slot_contexts[1].mount_path);
+    sidetnfs_uart_diag()->slot1_port = s_slot_contexts[1].port;
+#endif
 
     if (s_mount_pcb == NULL)
     {
@@ -2157,7 +2278,7 @@ static void send_slot1_mount_request(void)
     uint8_t buf[6 + SIDETNFS_MOUNTPATH_LEN + 1 + 2];
     buf[0] = 0x00;
     buf[1] = 0x00;
-    buf[2] = TNFS_MOUNT_SEQ_SLOT1;
+    buf[2] = 0x00; // seq 0 for MOUNT -- same protocol-conformant value slot 0 uses
     buf[3] = TNFS_CMD_MOUNT;
     buf[4] = TNFS_PROTO_VER_MINOR;
     buf[5] = TNFS_PROTO_VER_MAJOR;
@@ -2173,6 +2294,10 @@ static void send_slot1_mount_request(void)
         return;
     }
 
+    // Fase 2 (mount pending-slot fix): mark slot 1 as the pending MOUNT
+    // BEFORE the packet actually goes out -- same reasoning as slot 0's
+    // own send above.
+    s_mount_pending_slot = 1;
     memcpy(p->payload, buf, offset);
     udp_sendto(s_mount_pcb, p, &server_ip, s_slot_contexts[1].port);
     pbuf_free(p);
@@ -2221,6 +2346,17 @@ void sidetnfs_probe_mount_runtime_slots(void)
 {
     sidetnfs_send_mount_probe();
     bool slot0_ok = wait_for_mount_response(&s_state.mount_response_received);
+    // Fase 2 (mount pending-slot fix): clear the pending marker once this
+    // slot's bounded wait is over, whether it actually got a response or
+    // timed out -- an accepted response already cleared it to -1 inside
+    // tnfs_recv_callback(), so this is then a no-op; on a timeout it's
+    // the only place that clears it, so a late straggler arriving after
+    // we've moved on (e.g. once slot 1 becomes pending below) can never
+    // be mistaken for the slot that's pending next.
+    if (s_mount_pending_slot == 0)
+    {
+        s_mount_pending_slot = -1;
+    }
     DPRINTF("TNFS mount slot 0 (N:) path=%s: %s rc=%u sid=0x%04X\n",
             s_active_mount_path, slot0_ok ? "responded" : "TIMED OUT",
             s_state.mount_rc, s_state.sid);
@@ -2230,6 +2366,10 @@ void sidetnfs_probe_mount_runtime_slots(void)
     {
         send_slot1_mount_request();
         bool slot1_ok = wait_for_mount_response(&s_slot1_mount_response_received);
+        if (s_mount_pending_slot == 1)
+        {
+            s_mount_pending_slot = -1;
+        }
         DPRINTF("TNFS mount slot 1 (O:) path=%s: %s rc=%u sid=0x%04X\n",
                 s_slot_contexts[1].mount_path, slot1_ok ? "responded" : "TIMED OUT",
                 s_slot1_mount_rc, s_slot1_mount_sid);
@@ -2814,19 +2954,28 @@ static bool fslisting_ensure_pcb(void)
 // never waits. The response (if any) is picked up later by
 // tnfs_fslisting_recv_callback() and consumed by the TNFS DTA-registry path
 // (sidetnfs_tnfs_dta_start(), Fase 5Y). Wire pattern is always "*" (local
-// filtering only -- see sidetnfs_probe.h). Session id reused from the root
-// probe's MOUNT response (s_state.sid); TNFS sessions are keyed by session
-// id, not UDP source port, so sharing it across this separate PCB is safe.
+// filtering only -- see sidetnfs_probe.h).
+//
+// Fase 1 (multi-drive slot routing): host/port/session id now come from
+// *ctx (the caller's already-resolved runtime slot -- see
+// sidetnfs_probe_get_slot_context()), not the single-session
+// s_active_host/s_active_port/s_state.sid globals. s_readdirx_seq is a
+// single, ever-incrementing counter shared by every fslisting_send_*
+// function regardless of slot, so every request+response pair still gets
+// a globally unique sequence number -- fslisting_wait_for()'s existing
+// cmd+seq correlation needs no other change to keep two slots' traffic
+// apart, as long as (as required by this phase) at most one request is
+// ever outstanding at a time.
 // *out_seq receives the sequence number used, for cmd+seq response
 // correlation (Fase 5R) -- only valid if this function returns true.
-static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
+static bool fslisting_send_opendirx(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -2835,8 +2984,8 @@ static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[8 + 1 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_OPENDIRX;
     buf[offset++] = 0x00; // diropts
@@ -2858,7 +3007,7 @@ static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2867,23 +3016,25 @@ static bool fslisting_send_opendirx(const char *tnfs_path, uint8_t *out_seq)
 
 // Fire-and-forget READDIRX send for up to max_entries entries on an
 // already-open handle. Same non-blocking contract as
-// fslisting_send_opendirx(), including *out_seq.
-static bool fslisting_send_readdirx(uint8_t dir_handle, uint8_t max_entries, uint8_t *out_seq)
+// fslisting_send_opendirx(), including *out_seq and the *ctx-based
+// host/port/session id (Fase 1, multi-drive slot routing).
+static bool fslisting_send_readdirx(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t dir_handle, uint8_t max_entries,
+                                     uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
 
     uint8_t seq = s_readdirx_seq++;
     uint8_t buf[6];
-    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[1] = (uint8_t)(ctx->session_id >> 8);
     buf[2] = seq;
     buf[3] = TNFS_CMD_READDIRX;
     buf[4] = dir_handle;
@@ -2898,7 +3049,7 @@ static bool fslisting_send_readdirx(uint8_t dir_handle, uint8_t max_entries, uin
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -2907,23 +3058,24 @@ static bool fslisting_send_readdirx(uint8_t dir_handle, uint8_t max_entries, uin
 
 // Fase 5AA: fire-and-forget CLOSEDIR send for a handle obtained from
 // OPENDIRX. Same non-blocking contract and wire shape as
-// fslisting_send_readdirx() (header + single handle byte).
-static bool fslisting_send_closedir(uint8_t dir_handle, uint8_t *out_seq)
+// fslisting_send_readdirx() (header + single handle byte), including the
+// *ctx-based host/port/session id (Fase 1, multi-drive slot routing).
+static bool fslisting_send_closedir(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t dir_handle, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
 
     uint8_t seq = s_readdirx_seq++;
     uint8_t buf[5];
-    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[1] = (uint8_t)(ctx->session_id >> 8);
     buf[2] = seq;
     buf[3] = TNFS_CMD_CLOSEDIR;
     buf[4] = dir_handle;
@@ -2937,7 +3089,7 @@ static bool fslisting_send_closedir(uint8_t dir_handle, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3455,8 +3607,10 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
 // Fsfirst. See report -- the SD-baseline hardware test showed real
 // GEMDRVEMUL_FSNEXT_CALL dispatch works once state is registered this way.
 // Fase 5AA: defined below (after fslisting_wait_for()) -- forward-declared
-// here so insertTnfsDTA()/releaseTnfsDTA() can call it.
-static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle);
+// here so insertTnfsDTA()/releaseTnfsDTA() can call it. Fase 1
+// (multi-drive slot routing): runtime_slot identifies which slot's
+// session/host/port to resolve for the CLOSEDIR itself.
+static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle, int runtime_slot);
 
 static SidetnfsTnfsDtaSearch *lookupTnfsDTA(uint32_t ndta)
 {
@@ -3485,7 +3639,7 @@ static SidetnfsTnfsDtaSearch *alloc_tnfs_dta_slot(void)
     SidetnfsTnfsDtaSearch *victim = &s_tnfs_dta_searches[0];
     if (victim->handle_valid)
     {
-        tnfs_dta_closedir(victim->ndta, victim->dir_handle);
+        tnfs_dta_closedir(victim->ndta, victim->dir_handle, victim->runtime_slot);
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_HANDLE_RELEASE, victim->ndta, NULL, NULL, NULL, 0, victim->dir_handle, 0,
                            0);
         victim->handle_valid = false;
@@ -3504,14 +3658,18 @@ static SidetnfsTnfsDtaSearch *alloc_tnfs_dta_slot(void)
 // (no EOF/release happened in between), that handle is CLOSEDIR'd first --
 // otherwise a repeated Fsfirst/refresh cycle leaks one handle per repeat.
 static SidetnfsTnfsDtaSearch *insertTnfsDTA(uint32_t ndta, const char *path, const char *pattern, uint8_t attribs,
-                                             uint8_t dir_handle)
+                                             uint8_t dir_handle, int runtime_slot)
 {
     SidetnfsTnfsDtaSearch *slot = lookupTnfsDTA(ndta);
     if (slot)
     {
         if (slot->handle_valid)
         {
-            tnfs_dta_closedir(ndta, slot->dir_handle);
+            // Fase 1: the OLD search's own runtime slot, read before the
+            // memset() below overwrites it -- the entry being replaced
+            // may belong to a different slot than the new one being
+            // inserted.
+            tnfs_dta_closedir(ndta, slot->dir_handle, slot->runtime_slot);
             sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_HANDLE_RELEASE, ndta, NULL, NULL, NULL, 0, slot->dir_handle, 0, 0);
             slot->handle_valid = false;
         }
@@ -3528,6 +3686,11 @@ static SidetnfsTnfsDtaSearch *insertTnfsDTA(uint32_t ndta, const char *path, con
     slot->dir_handle = dir_handle;
     slot->handle_valid = true;
     slot->active = true;
+    // Fase 1 (multi-drive slot routing): the slot this search's own
+    // OPENDIRX just succeeded against -- read back by
+    // tnfs_dta_find_next_match()/releaseTnfsDTA()/tnfs_dta_closedir() for
+    // every subsequent READDIRX/CLOSEDIR this search issues.
+    slot->runtime_slot = runtime_slot;
     // Fase 7J-correctie-diag: fires on every ordinary Fsfirst, not just a
     // Ddelete's own directory -- gated the same way as the READDIRX detail
     // events (see SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL) so routine Desktop
@@ -3552,7 +3715,7 @@ static void releaseTnfsDTA(uint32_t ndta)
     {
         if (slot->handle_valid)
         {
-            tnfs_dta_closedir(ndta, slot->dir_handle);
+            tnfs_dta_closedir(ndta, slot->dir_handle, slot->runtime_slot);
             sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_HANDLE_RELEASE, ndta, NULL, NULL, NULL, 0, slot->dir_handle, 0, 0);
             slot->handle_valid = false;
         }
@@ -3609,10 +3772,21 @@ static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
 // testing confirmed leaked, un-CLOSEDIR'd directory handles caused
 // listings to go empty after repeated refreshes (see report), so there is
 // no longer a "local-only release" fallback mode.
-static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle)
+static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle, int runtime_slot)
 {
+    // Fase 1 (multi-drive slot routing): resolve the search's own slot's
+    // host/port/session id -- a slot that's become invalid or lost its
+    // session between OPENDIRX and now is treated exactly like any other
+    // send failure below (logged, local cleanup still proceeds in every
+    // caller regardless).
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_CLOSEDIR_ERROR, ndta, NULL, NULL, NULL, 0, dir_handle, 0, 0);
+        return;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_closedir(dir_handle, &seq))
+    if (!fslisting_send_closedir(&ctx, dir_handle, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_CLOSEDIR_ERROR, ndta, NULL, NULL, NULL, 0, dir_handle, 0, 0);
         return;
@@ -3644,6 +3818,17 @@ static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle)
 // non-FOUND result), only search->eof is DTA-search state this helper owns.
 static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *search, SidetnfsAtariDirEntry *out_entry)
 {
+    // Fase 1 (multi-drive slot routing): this search's own slot's
+    // host/port/session id -- read once per call (Fsnext calls this
+    // again for every entry), never re-resolved mid-round. A slot that's
+    // become invalid/lost its session is treated as a plain send/round
+    // failure, same as any other network error this loop already handles.
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(search->runtime_slot, &ctx))
+    {
+        return SIDETNFS_DIR_SEARCH_ERROR;
+    }
+
     for (uint32_t round = 0; round < SIDETNFS_TNFS_DTA_MAX_ROUNDS; round++)
     {
         if (search->eof)
@@ -3652,7 +3837,7 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
         }
 
         uint8_t seq = 0;
-        if (!fslisting_send_readdirx(search->dir_handle, (uint8_t)SIDETNFS_READDIRX_MAX_ENTRIES, &seq))
+        if (!fslisting_send_readdirx(&ctx, search->dir_handle, (uint8_t)SIDETNFS_READDIRX_MAX_ENTRIES, &seq))
         {
             return SIDETNFS_DIR_SEARCH_ERROR;
         }
@@ -3724,10 +3909,22 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
     return SIDETNFS_DIR_SEARCH_ERROR;
 }
 
-SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
+SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const char *path,
                                                   const char *pattern, uint8_t attribs,
                                                   SidetnfsAtariDirEntry *out_entry)
 {
+    // Fase 1 (multi-drive slot routing): `slot` is trusted here -- the
+    // caller (GEMDRVEMUL_FSFIRST_CALL in gemdrvemul.c) has already
+    // validated range/g_drive_count/runtime-config/session_established
+    // before ever reaching this function. Resolved once, up front; a
+    // slot that somehow fails to resolve here anyway is treated as a
+    // plain OPENDIRX failure, same as any other network error below.
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return SIDETNFS_DIR_SEARCH_ERROR;
+    }
+
     // Fase 5Y: OPENDIRX first -- the registry entry is only inserted
     // (insertTnfsDTA()) once we actually have a dir_handle, exactly like
     // the SD/FatFS backend only calls insertDTA() after f_findfirst()
@@ -3735,7 +3932,7 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
     // the same ndta always starts fresh, deliberately (the Fase 5U/5V
     // repeat-continuation workaround was removed in Fase 6B -- see report).
     uint8_t seq = 0;
-    if (!fslisting_send_opendirx(path, &seq))
+    if (!fslisting_send_opendirx(&ctx, path, &seq))
     {
         return SIDETNFS_DIR_SEARCH_ERROR;
     }
@@ -3762,7 +3959,7 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, const char *path,
     sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_OPENDIRX_OK, ndta, path, NULL, NULL, 0, handle, 0, 0);
 #endif
 
-    SidetnfsTnfsDtaSearch *search = insertTnfsDTA(ndta, path, pattern, attribs, handle);
+    SidetnfsTnfsDtaSearch *search = insertTnfsDTA(ndta, path, pattern, attribs, handle, slot);
 
     SidetnfsDirSearchResult result = tnfs_dta_find_next_match(search, out_entry);
     if (result != SIDETNFS_DIR_SEARCH_FOUND)
@@ -3873,8 +4070,14 @@ bool sidetnfs_tnfs_dta_close_by_path(const char *tnfs_path, uint16_t *out_matche
                 continue;
             }
 
+            // Fase 1 (multi-drive slot routing): this registry entry's
+            // own slot (set by insertTnfsDTA() when Fsfirst opened it) --
+            // a resolution failure is folded into the same "send failed"
+            // path below, same as any other network error here.
+            sidetnfs_slot_tnfs_context_t ddelete_close_ctx;
             uint8_t seq = 0;
-            if (!fslisting_send_closedir(slot->dir_handle, &seq))
+            if (!sidetnfs_probe_get_slot_context(slot->runtime_slot, &ddelete_close_ctx) ||
+                !fslisting_send_closedir(&ddelete_close_ctx, slot->dir_handle, &seq))
             {
                 sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_CLOSE_RC, slot->ndta, tnfs_path, NULL, NULL, 0,
                                    slot->dir_handle, 0xFFu, 0);
@@ -4282,10 +4485,24 @@ void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle)
 // ndta or leave one behind. Always attempts to CLOSEDIR the handle it
 // opens (best-effort, same "cleanup can't hang or be retried" contract as
 // tnfs_dta_closedir()) before returning.
+//
+// Fase 1 (multi-drive slot routing): fslisting_send_opendirx()/
+// _closedir() now take an explicit context -- this function is only
+// ever called by Dsetpath, which is out of scope for this phase and
+// stays exactly as before (implicitly slot 0's session), so slot 0's
+// context is resolved here directly rather than threading a slot
+// parameter through a call chain this phase doesn't otherwise touch.
 bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
 {
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(0, &ctx))
+    {
+        *out_rc = 0xFFu;
+        return false;
+    }
+
     uint8_t seq = 0;
-    if (!fslisting_send_opendirx(tnfs_path, &seq))
+    if (!fslisting_send_opendirx(&ctx, tnfs_path, &seq))
     {
         *out_rc = 0xFFu;
         return false;
@@ -4308,7 +4525,7 @@ bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
     // failed/timed-out CLOSEDIR here still must not change the existence
     // result already established above, nor block/retry.
     uint8_t close_seq = 0;
-    if (fslisting_send_closedir(handle, &close_seq))
+    if (fslisting_send_closedir(&ctx, handle, &close_seq))
     {
         fslisting_wait_for(TNFS_CMD_CLOSEDIR, close_seq);
         s_fslisting_resp.response_ready = false;
@@ -5300,3 +5517,220 @@ void sidetnfs_debug_file_service(const char *hd_folder)
     s_state.debug_write_count++;
 #endif // SIDETNFS_DEBUG_FILE_ENABLED
 }
+
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+// Temporary diagnostic build only (see report). Zero-initialized static
+// instance -- all counters/last-values start at 0/empty and are only ever
+// updated by plain scalar/array stores from gemdrvemul.c and the mount
+// send/receive code below. No malloc, no ring buffer, no wraparound logic.
+static SidetnfsUartDiagSnapshot s_uart_diag = {0};
+
+SidetnfsUartDiagSnapshot *sidetnfs_uart_diag(void)
+{
+    return &s_uart_diag;
+}
+
+// Fase (temporary diagnostic build): find the s_tnfs_dta_searches[] array
+// index actually holding ndta's active TNFS DTA search, purely for the
+// UART snapshot's "gevonden DTA-slot" field. Read-only -- does not affect
+// lookupTnfsDTA()/alloc_tnfs_dta_slot()/any functional DTA-registry
+// behavior at all.
+int sidetnfs_uart_diag_find_dta_slot(uint32_t ndta)
+{
+    for (int i = 0; i < (int)SIDETNFS_TNFS_DTA_SLOTS; i++)
+    {
+        if (s_tnfs_dta_searches[i].active && s_tnfs_dta_searches[i].ndta == ndta)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void sidetnfs_uart_diag_dump(void)
+{
+    const SidetnfsUartDiagSnapshot *d = &s_uart_diag;
+
+    printf("\r\n===== SIDETNFS UART DIAG SNAPSHOT =====\r\n");
+
+    printf("drive_count: %lu\r\n", (unsigned long)d->drive_count);
+    printf("drive_number_table:");
+    for (uint32_t i = 0; i < (uint32_t)(SIDETNFS_MAX_DRIVES + 1); i++)
+    {
+        printf(" [%lu]=0x%08lx", (unsigned long)i, (unsigned long)d->drive_number_table[i]);
+    }
+    printf("\r\n");
+
+    printf("slot0 mount: sent=%d response_received=%d rc=%u sid=0x%04x recv_seq=%u host=%s path=%s port=%u\r\n",
+           (int)d->slot0_mount_sent, (int)d->slot0_mount_response_received,
+           (unsigned)d->slot0_mount_rc, (unsigned)d->slot0_sid, (unsigned)d->slot0_last_recv_seq,
+           d->slot0_host, d->slot0_mount_path, (unsigned)d->slot0_port);
+    printf("slot1 mount: sent=%d response_received=%d rc=%u sid=0x%04x recv_seq=%u host=%s path=%s port=%u\r\n",
+           (int)d->slot1_mount_sent, (int)d->slot1_mount_response_received,
+           (unsigned)d->slot1_mount_rc, (unsigned)d->slot1_sid, (unsigned)d->slot1_last_recv_seq,
+           d->slot1_host, d->slot1_mount_path, (unsigned)d->slot1_port);
+    printf("mount pending_slot=%ld rejected_count=%lu last_reject_reason=%u\r\n",
+           (long)d->mount_pending_slot, (unsigned long)d->mount_rejected_count,
+           (unsigned)d->mount_last_reject_reason);
+
+    printf("Dsetpath: calls=%lu last_slot=%ld last_input=\"%s\" last_normalized=\"%s\" last_result=0x%04x\r\n",
+           (unsigned long)d->dsetpath_calls, (long)d->dsetpath_last_slot,
+           d->dsetpath_last_input_path, d->dsetpath_last_normalized_path,
+           (unsigned)d->dsetpath_last_result);
+
+    printf("Dfree: calls=%lu last_drive=%lu last_slot=%ld last_status=0x%08lx\r\n",
+           (unsigned long)d->dfree_calls, (unsigned long)d->dfree_last_drive_number,
+           (long)d->dfree_last_slot, (unsigned long)d->dfree_last_status);
+
+    printf("Dgetpath: calls=%lu last_drive=%lu last_slot=%ld last_path=\"%s\"\r\n",
+           (unsigned long)d->dgetpath_calls, (unsigned long)d->dgetpath_last_drive_number,
+           (long)d->dgetpath_last_slot, d->dgetpath_last_path);
+
+    printf("Fsfirst: calls=%lu last_slot=%ld last_attribs=0x%02x last_searchpath=\"%s\" "
+           "last_validation_phase=%u last_result=0x%04x\r\n",
+           (unsigned long)d->fsfirst_calls, (long)d->fsfirst_last_slot,
+           (unsigned)d->fsfirst_last_attribs, d->fsfirst_last_searchpath,
+           (unsigned)d->fsfirst_last_validation_phase, (unsigned)d->fsfirst_last_result);
+
+    printf("Fsnext: calls=%lu last_dta_slot=%ld last_result=0x%04x\r\n",
+           (unsigned long)d->fsnext_calls, (long)d->fsnext_last_dta_slot,
+           (unsigned)d->fsnext_last_result);
+
+    printf("===== END SNAPSHOT =====\r\n");
+}
+
+// Same content/format as sidetnfs_uart_diag_dump() above, written to
+// <hd_folder>/DEBUG.TXT instead of UART -- see report (hardware's serial
+// port wasn't usable). Same f_open/f_write/f_close shape as
+// sidetnfs_diag_dump_on_select() elsewhere in this file.
+void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
+{
+    if (hd_folder == NULL)
+    {
+        return;
+    }
+    char path[160];
+    int n = snprintf(path, sizeof(path), "%s/DEBUG.TXT", hd_folder);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+    {
+        return;
+    }
+
+    FIL file;
+    FRESULT fr = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK)
+    {
+        return; // stay silent, no crash
+    }
+
+    const SidetnfsUartDiagSnapshot *d = &s_uart_diag;
+    char line[384];
+    UINT written;
+
+    int len = snprintf(line, sizeof(line), "===== SIDETNFS UART DIAG SNAPSHOT =====\r\n");
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "drive_count: %lu\r\ndrive_number_table:",
+                    (unsigned long)d->drive_count);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    for (uint32_t i = 0; i < (uint32_t)(SIDETNFS_MAX_DRIVES + 1); i++)
+    {
+        len = snprintf(line, sizeof(line), " [%lu]=0x%08lx", (unsigned long)i,
+                        (unsigned long)d->drive_number_table[i]);
+        if (len > 0)
+        {
+            f_write(&file, line, (UINT)len, &written);
+        }
+    }
+    len = snprintf(line, sizeof(line), "\r\n");
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "slot0 mount: sent=%d response_received=%d rc=%u sid=0x%04x recv_seq=%u host=%s path=%s port=%u\r\n",
+                    (int)d->slot0_mount_sent, (int)d->slot0_mount_response_received,
+                    (unsigned)d->slot0_mount_rc, (unsigned)d->slot0_sid, (unsigned)d->slot0_last_recv_seq,
+                    d->slot0_host, d->slot0_mount_path, (unsigned)d->slot0_port);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line),
+                    "slot1 mount: sent=%d response_received=%d rc=%u sid=0x%04x recv_seq=%u host=%s path=%s port=%u\r\n",
+                    (int)d->slot1_mount_sent, (int)d->slot1_mount_response_received,
+                    (unsigned)d->slot1_mount_rc, (unsigned)d->slot1_sid, (unsigned)d->slot1_last_recv_seq,
+                    d->slot1_host, d->slot1_mount_path, (unsigned)d->slot1_port);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line), "mount pending_slot=%ld rejected_count=%lu last_reject_reason=%u\r\n",
+                    (long)d->mount_pending_slot, (unsigned long)d->mount_rejected_count,
+                    (unsigned)d->mount_last_reject_reason);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Dsetpath: calls=%lu last_slot=%ld last_input=\"%s\" last_normalized=\"%s\" last_result=0x%04x\r\n",
+                    (unsigned long)d->dsetpath_calls, (long)d->dsetpath_last_slot,
+                    d->dsetpath_last_input_path, d->dsetpath_last_normalized_path,
+                    (unsigned)d->dsetpath_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Dfree: calls=%lu last_drive=%lu last_slot=%ld last_status=0x%08lx\r\n",
+                    (unsigned long)d->dfree_calls, (unsigned long)d->dfree_last_drive_number,
+                    (long)d->dfree_last_slot, (unsigned long)d->dfree_last_status);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Dgetpath: calls=%lu last_drive=%lu last_slot=%ld last_path=\"%s\"\r\n",
+                    (unsigned long)d->dgetpath_calls, (unsigned long)d->dgetpath_last_drive_number,
+                    (long)d->dgetpath_last_slot, d->dgetpath_last_path);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Fsfirst: calls=%lu last_slot=%ld last_attribs=0x%02x last_searchpath=\"%s\" "
+                    "last_validation_phase=%u last_result=0x%04x\r\n",
+                    (unsigned long)d->fsfirst_calls, (long)d->fsfirst_last_slot,
+                    (unsigned)d->fsfirst_last_attribs, d->fsfirst_last_searchpath,
+                    (unsigned)d->fsfirst_last_validation_phase, (unsigned)d->fsfirst_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Fsnext: calls=%lu last_dta_slot=%ld last_result=0x%04x\r\n",
+                    (unsigned long)d->fsnext_calls, (long)d->fsnext_last_dta_slot,
+                    (unsigned)d->fsnext_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "===== END SNAPSHOT =====\r\n");
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    f_close(&file);
+}
+#endif // SIDETNFS_UART_DIAG_DUMP_ON_SELECT
