@@ -4395,7 +4395,7 @@ void init_gemdrvemul(bool safe_config_reboot)
                 uint16_t tnfs_ddelete_dta_matches = 0;
                 uint8_t tnfs_ddelete_dta_close_rc = 0xFFu;
                 bool tnfs_ddelete_dta_ok = sidetnfs_tnfs_dta_close_by_path(
-                    tnfs_ddelete_path, &tnfs_ddelete_dta_matches, &tnfs_ddelete_dta_close_rc);
+                    ddelete_rom_slot, tnfs_ddelete_path, &tnfs_ddelete_dta_matches, &tnfs_ddelete_dta_close_rc);
                 sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_RELEASE_BEFORE, 0, tnfs_ddelete_path, NULL, NULL,
                                     tnfs_ddelete_dta_matches, 0, tnfs_ddelete_dta_close_rc,
                                     tnfs_ddelete_dta_ok ? 1 : 0);

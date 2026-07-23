@@ -918,7 +918,17 @@ void sidetnfs_tnfs_dta_release_by_path(const char *tnfs_path);
 // sent, or if a send/timeout failure occurred). Returns true iff every
 // matching slot (if any) was successfully closed and released -- the
 // caller (Ddelete) must not send RMDIR when this returns false.
-bool sidetnfs_tnfs_dta_close_by_path(const char *tnfs_path, uint16_t *out_matches, uint8_t *out_close_rc);
+// Fase 11C: runtime_slot -- a registration now matches only when BOTH its
+// own runtime_slot (set by insertTnfsDTA() at Fsfirst time) AND its path
+// equal the request; path text alone is no longer sufficient (two
+// different drives can have an identically-named directory open for
+// search at the same time). Only a negative runtime_slot is rejected
+// directly here (the upper bound -- g_drive_count/
+// GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES -- is validated by the caller in
+// gemdrvemul.c before this is ever reached, same layering every other
+// slot-aware function in this file already relies on).
+bool sidetnfs_tnfs_dta_close_by_path(int runtime_slot, const char *tnfs_path, uint16_t *out_matches,
+                                      uint8_t *out_close_rc);
 
 // Fase 5O/6B: continue the active fake no-network search for ndta. Pure
 // RAM scan -- no network, no wait, ever.
@@ -1686,6 +1696,19 @@ typedef struct
     int32_t fattrib_last_rom_slot;
     int32_t fattrib_last_prefix_slot; // diagnostic-only cross-check, -1 if no prefix
     uint16_t fattrib_last_result;
+
+    // Fase 11C (DTA close-by-path slot-aware fix): bounded snapshot of the
+    // last sidetnfs_tnfs_dta_close_by_path() call (Ddelete's pre-RMDIR
+    // close). matched_slot is the LAST matched entry's own runtime_slot --
+    // always equal to requested_slot by construction now (the match
+    // condition itself requires it), kept here mainly as a hardware-trace
+    // proof that no cross-slot match occurred.
+    uint32_t ddelete_dta_close_calls;
+    int32_t ddelete_dta_close_requested_slot;
+    char ddelete_dta_close_requested_path[MAX_FOLDER_LENGTH];
+    uint16_t ddelete_dta_close_matches;
+    int32_t ddelete_dta_close_matched_slot; // -1 if no match this call
+    uint8_t ddelete_dta_close_last_rc;
 } SidetnfsUartDiagSnapshot;
 
 // Returns a pointer to the single static instance -- callers in

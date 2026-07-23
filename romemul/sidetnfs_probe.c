@@ -4103,26 +4103,52 @@ void sidetnfs_tnfs_dta_release_by_path(const char *tnfs_path)
 // only cleared once its CLOSEDIR is confirmed successful; a failed/timed
 // out CLOSEDIR leaves the slot exactly as-is (still active, still
 // handle_valid) so no local state silently drifts out of sync with an
-// unconfirmed server-side handle. Only exact path matches are touched --
-// never a broader reset.
-bool sidetnfs_tnfs_dta_close_by_path(const char *tnfs_path, uint16_t *out_matches, uint8_t *out_close_rc)
+// unconfirmed server-side handle. Only exact runtime_slot+path matches are
+// touched -- never a broader reset.
+//
+// Fase 11C: runtime_slot -- the caller's own already-validated
+// (0 <= slot < g_drive_count < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES,
+// checked in gemdrvemul.c's GEMDRVEMUL_DDELETE_CALL before this is ever
+// called; this file has no visibility into g_drive_count/
+// GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES itself, same layering every other
+// slot-aware function here already follows -- see
+// sidetnfs_tnfs_file_delete() etc., which likewise trust their own caller
+// for the upper bound and only guard the lower one here) ROM-resolved
+// slot. Previously ONLY tnfs_path was the match key, so a search left open
+// on a DIFFERENT drive with the same relative path text (e.g. both
+// N:\DATA and O:\DATA) could be matched -- and closed -- by a Ddelete
+// targeting only one of them. A registration now matches only when BOTH
+// its own runtime_slot (set once by insertTnfsDTA() at Fsfirst time) AND
+// its path agree with the request.
+bool sidetnfs_tnfs_dta_close_by_path(int runtime_slot, const char *tnfs_path, uint16_t *out_matches,
+                                      uint8_t *out_close_rc)
 {
     uint16_t matches = 0;
     uint16_t closed = 0;
     uint16_t close_errors = 0;
     uint8_t last_rc = 0xFFu;
     bool all_ok = true;
+    int32_t matched_slot = -1;
 
-    if (tnfs_path != NULL)
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    SidetnfsUartDiagSnapshot *dta_close_diag = sidetnfs_uart_diag();
+    dta_close_diag->ddelete_dta_close_calls++;
+    dta_close_diag->ddelete_dta_close_requested_slot = runtime_slot;
+    snprintf(dta_close_diag->ddelete_dta_close_requested_path, MAX_FOLDER_LENGTH, "%s",
+             tnfs_path ? tnfs_path : "");
+#endif
+
+    if (runtime_slot >= 0 && tnfs_path != NULL)
     {
         for (int i = 0; i < (int)SIDETNFS_TNFS_DTA_SLOTS; i++)
         {
             SidetnfsTnfsDtaSearch *slot = &s_tnfs_dta_searches[i];
-            if (!slot->active || strcmp(slot->path, tnfs_path) != 0)
+            if (!slot->active || slot->runtime_slot != runtime_slot || strcmp(slot->path, tnfs_path) != 0)
             {
                 continue;
             }
             matches++;
+            matched_slot = (int32_t)slot->runtime_slot;
             sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_MATCH, slot->ndta, tnfs_path, NULL, NULL, 0,
                                slot->dir_handle, 0, 0);
 
@@ -4186,6 +4212,11 @@ bool sidetnfs_tnfs_dta_close_by_path(const char *tnfs_path, uint16_t *out_matche
     }
 
     sidetnfs_note_tnfs_ddelete_dta(matches, closed, close_errors, last_rc);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    dta_close_diag->ddelete_dta_close_matches = matches;
+    dta_close_diag->ddelete_dta_close_matched_slot = matched_slot;
+    dta_close_diag->ddelete_dta_close_last_rc = last_rc;
+#endif
     if (out_matches)
     {
         *out_matches = matches;
@@ -5951,6 +5982,12 @@ void sidetnfs_uart_diag_dump(void)
     printf("Fattrib: calls=%lu rom_slot=%ld prefix_slot=%ld result=0x%04x\r\n", (unsigned long)d->fattrib_calls,
            (long)d->fattrib_last_rom_slot, (long)d->fattrib_last_prefix_slot, (unsigned)d->fattrib_last_result);
 
+    printf("Ddelete DTA close-by-path: calls=%lu requested_slot=%ld requested_path=\"%s\" matches=%u "
+           "matched_slot=%ld tnfs_rc=0x%02x\r\n",
+           (unsigned long)d->ddelete_dta_close_calls, (long)d->ddelete_dta_close_requested_slot,
+           d->ddelete_dta_close_requested_path, (unsigned)d->ddelete_dta_close_matches,
+           (long)d->ddelete_dta_close_matched_slot, (unsigned)d->ddelete_dta_close_last_rc);
+
     printf("===== END SNAPSHOT =====\r\n");
 }
 
@@ -6256,6 +6293,17 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
     len = snprintf(line, sizeof(line), "Fattrib: calls=%lu rom_slot=%ld prefix_slot=%ld result=0x%04x\r\n",
                     (unsigned long)d->fattrib_calls, (long)d->fattrib_last_rom_slot,
                     (long)d->fattrib_last_prefix_slot, (unsigned)d->fattrib_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Ddelete DTA close-by-path: calls=%lu requested_slot=%ld requested_path=\"%s\" matches=%u "
+                    "matched_slot=%ld tnfs_rc=0x%02x\r\n",
+                    (unsigned long)d->ddelete_dta_close_calls, (long)d->ddelete_dta_close_requested_slot,
+                    d->ddelete_dta_close_requested_path, (unsigned)d->ddelete_dta_close_matches,
+                    (long)d->ddelete_dta_close_matched_slot, (unsigned)d->ddelete_dta_close_last_rc);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
