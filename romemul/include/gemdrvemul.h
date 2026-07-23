@@ -412,6 +412,15 @@ typedef struct FileDescriptors
     // there. Lets GEMDRVEMUL_WRITE_BUFF_CALL deny a write to a read-only
     // TNFS handle locally, before ever contacting the server.
     bool tnfs_writable;
+    // Fase 10 (Fopen/Fcreate slot-aware fix): the runtime slot (0=N:,
+    // 1=O:, ...) this handle's TNFS session belongs to -- set once at
+    // Fopen/Fcreate time (see gemdrive_backend_fopen()/
+    // GEMDRVEMUL_FCREATE_CALL) and read back by every later call that
+    // needs this handle's own host/port/session_id (Fread/Fwrite/Fseek/
+    // Fclose/Fdatime -- not changed in this phase, still slot-0-only, but
+    // this is the field they will read from once they are). Meaningful
+    // only when backend == GEMDRIVE_FILE_BACKEND_TNFS.
+    int runtime_slot;
     // Fase 10B: direct pointer into the existing Fase 10A const flash
     // array (sidetnfs_config_prg/sidetnfs_config_readme) -- never a copy.
     // Valid only when backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH.

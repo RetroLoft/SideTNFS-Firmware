@@ -599,7 +599,18 @@ typedef enum
 // indefinitely, never crashes on a wrong/unsupported opcode guess. On
 // SIDETNFS_FILE_OPEN_OK, *out_handle is the TNFS-side file handle to use
 // for subsequent read/write/close calls.
-SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t gemdos_mode, uint8_t *out_handle);
+//
+// Fase 10 (slot-aware fix): runtime_slot selects whose TNFS
+// session/host/port this OPEN resolves via sidetnfs_probe_get_slot_context()
+// -- previously hardcoded to slot 0 (s_active_host/s_active_port/s_state.sid)
+// inside fslisting_send_open(), which made a Fopen for O: (slot 1) silently
+// open the file through N:'s session instead. The caller passes the slot
+// already resolved from the path's own drive-letter prefix (see
+// get_tnfs_relative_pathname_for_slot() in gemdrvemul.c).
+// sidetnfs_probe_get_slot_context() itself bounds-checks runtime_slot and
+// never indexes s_slot_contexts[] with an out-of-range value.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_open(int runtime_slot, const char *tnfs_path, uint16_t gemdos_mode,
+                                                 uint8_t *out_handle);
 
 // Fase 7K: open tnfs_path over TNFS for GEMDOS Fcreate -- always
 // create-if-missing + truncate-to-zero + read/write, matching the SD/FatFS
@@ -607,7 +618,11 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t g
 // Fcreate never preserves existing content). Same bounded-wait contract as
 // sidetnfs_tnfs_file_open(). On SIDETNFS_FILE_OPEN_OK, *out_handle is the
 // TNFS-side file handle to use for subsequent write/close calls.
-SidetnfsFileOpenResult sidetnfs_tnfs_file_create(const char *tnfs_path, uint8_t *out_handle);
+//
+// Fase 10 (slot-aware fix): same runtime_slot meaning as
+// sidetnfs_tnfs_file_open() above -- the file is created on the
+// SELECTED slot's own mount, never implicitly on slot 0.
+SidetnfsFileOpenResult sidetnfs_tnfs_file_create(int runtime_slot, const char *tnfs_path, uint8_t *out_handle);
 
 // Read up to requested bytes (internally chunked and bounded -- see
 // SIDETNFS_TNFS_READ_CHUNK_MAX in sidetnfs_probe.c) from tnfs_handle
@@ -616,7 +631,17 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_create(const char *tnfs_path, uint8_t 
 // *out_actual receives the actual byte count (0 at EOF -- not an error).
 // Returns false only on a genuine protocol error/timeout/unexpected wire
 // error, never for EOF or a short read.
-bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *out_buf,
+//
+// Fase 11 (handle-based calls slot-aware fix): runtime_slot -- read from
+// the caller's own FileDescriptors entry (set at Fopen/Fcreate time,
+// Fase 10) -- selects whose TNFS session/host/port this READ resolves via
+// sidetnfs_probe_get_slot_context(). Previously hardcoded to slot 0
+// (s_active_host/s_active_port/s_state.sid), which made a read on an
+// O:-opened (slot 1) handle silently use N:'s session instead -- TNFS
+// handle numbers are per-session and can collide between slots (slot 0
+// handle 2 and slot 1 handle 2 are different files), so this was a
+// genuine cross-session misrouting risk, not just cosmetic.
+bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, uint8_t *out_buf,
                               uint16_t requested, uint16_t *out_actual);
 
 // Fase 7K: write up to requested bytes (internally chunked and bounded --
@@ -636,15 +661,24 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *ou
 // SD/FatFS route, which also discards its own bytes_write on an FR_*
 // error). *out_rc (nullable) receives the last raw TNFS wire rc byte seen
 // (0xFF if a send/timeout failure occurred instead).
-bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, const uint8_t *data, uint16_t requested,
-                               uint16_t *out_actual, uint8_t *out_rc);
+// Fase 11: runtime_slot -- same meaning as sidetnfs_tnfs_file_read() above.
+bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, const uint8_t *data,
+                               uint16_t requested, uint16_t *out_actual, uint8_t *out_rc);
 
 // Send TNFS CLOSE for tnfs_handle and wait (bounded, same contract as
 // tnfs_dta_closedir()). Always logs the outcome but never reports failure
 // back to the caller -- per Fase 7D requirements, the local file descriptor
 // must always be released regardless of whether the network close
 // succeeded, so there is nothing meaningful for the caller to act on.
-void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle);
+//
+// Fase 11: runtime_slot -- same meaning as sidetnfs_tnfs_file_read() above.
+// If sidetnfs_probe_get_slot_context(runtime_slot, ...) itself fails (e.g.
+// g_drive_count shrank after this handle was opened), the TNFS CLOSE is
+// simply never sent -- still not reported as failure, same "local
+// descriptor always released regardless" contract; the caller
+// (gemdrive_backend_fclose()) always deletes its own tracking entry
+// right after this call either way.
+void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot);
 
 // Fase 7E: one-shot TNFS directory-existence probe for GEMDRVEMUL_DSETPATH_CALL
 // -- OPENDIRX followed immediately by CLOSEDIR, never touching the TNFS
@@ -653,7 +687,17 @@ void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle);
 // Fsfirst/Fsnext for some other ndta. Returns true iff tnfs_path exists as
 // a directory; *out_rc receives the raw TNFS wire rc byte (0xFF if no
 // response was ever received) for logging/error-mapping upstream.
-bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc);
+//
+// Fase (slot-aware Dsetpath fix): runtime_slot selects whose TNFS
+// session/host/port this probe resolves via sidetnfs_probe_get_slot_context()
+// -- previously hardcoded to slot 0, which made Dsetpath's existence check
+// for O: (slot 1) incorrectly query N:'s (slot 0's) session, spuriously
+// returning EPTHNF for paths that genuinely exist under O:'s own mount.
+// The caller (GEMDRVEMUL_DSETPATH_CALL) passes its own already-validated
+// dsetpath_slot. sidetnfs_probe_get_slot_context() itself bounds-checks
+// runtime_slot and never indexes s_slot_contexts[] with an out-of-range
+// value.
+bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uint8_t *out_rc);
 
 // Fase 7F: TNFS SEEK for an already-open file handle. seek_from_end==false
 // always sends an absolute TNFS SEEK_SET request for `offset` (the caller
@@ -669,7 +713,8 @@ bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc);
 // (nullable, Fase 7F-debugfix) receives the raw TNFS wire rc byte (0xFF if
 // no response was ever received) -- purely additive, for diagnostic
 // counters upstream, does not affect the seek itself.
-bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, bool seek_from_end,
+// Fase 11: runtime_slot -- same meaning as sidetnfs_tnfs_file_read() above.
+bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, bool seek_from_end,
                               int32_t offset, uint32_t *out_new_offset, uint8_t *out_rc);
 
 // Fase 7G: TNFS delete results. Mirrors the SidetnfsFileOpenResult shape
@@ -690,7 +735,14 @@ typedef enum
 // the raw TNFS wire rc byte (0xFF if no response was ever received), for
 // diagnostic logging/counters upstream (does not affect the result
 // mapping itself).
-SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(const char *tnfs_path, uint8_t *out_rc);
+// Fase 11B: runtime_slot -- the ROM-resolved slot the caller's own
+// GEMDRVEMUL_FDELETE_CALL already validated (gemdrive.s's .Fdelete now
+// sends it in d3's low word, the same detect_emulated_drive_letter-based
+// mechanism .Fopen/.Fcreate/.Dsetpath already use). Resolved to a
+// sidetnfs_slot_tnfs_context_t here via sidetnfs_probe_get_slot_context(),
+// which itself bounds-checks runtime_slot and never indexes past
+// s_slot_contexts[] with an out-of-range value.
+SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc);
 
 // Fase 7H: TNFS rename results. Same shape/reasoning as
 // SidetnfsFileDeleteResult above. EXISTS is folded into ACCESS_DENIED (see
@@ -711,7 +763,16 @@ typedef enum
 // so a rename can never be reported as successful unless the server says
 // so. out_rc (nullable) receives the raw TNFS wire rc byte (0xFF if no
 // response was ever received), for diagnostic logging/counters upstream.
-SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(const char *old_path, const char *new_path, uint8_t *out_rc);
+// Fase 11B: runtime_slot -- both old_path and new_path must already have
+// been confirmed by the caller to resolve to the SAME runtime slot (the
+// ROM's .Frename sends each path's own independently-resolved slot in
+// d3/d4's low words; the GEMDRVEMUL_FRENAME_CALL handler rejects a
+// cross-slot rename with a GEMDOS error before ever reaching this
+// function -- no cross-server copy+delete emulation exists). Resolved to
+// a sidetnfs_slot_tnfs_context_t here via
+// sidetnfs_probe_get_slot_context(), same as every other slot-aware call.
+SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char *old_path, const char *new_path,
+                                                    uint8_t *out_rc);
 
 // Fase 7I: TNFS mkdir results. PATH_NOT_FOUND is unambiguous here (unlike
 // the Fopen/Fdelete/Frename ENOENT cases) -- for Dcreate, ENOENT can only
@@ -731,7 +792,9 @@ typedef enum
 // preceding directory listing. out_rc (nullable) receives the raw TNFS
 // wire rc byte (0xFF if no response was ever received), for diagnostic
 // logging/counters upstream.
-SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(const char *tnfs_path, uint8_t *out_rc);
+// Fase 11B: runtime_slot -- same meaning as sidetnfs_tnfs_file_delete()
+// above (ROM-resolved via gemdrive.s's .Dcreate, d3's low word).
+SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const char *tnfs_path, uint8_t *out_rc);
 
 // Fase 7J: TNFS rmdir results. PATH_NOT_FOUND covers both "directory
 // doesn't exist" (ENOENT) and "not a directory" (ENOTDIR, per the report's
@@ -754,7 +817,9 @@ typedef enum
 // sidetnfs_tnfs_file_delete()/UNLINK. out_rc (nullable) receives the raw
 // TNFS wire rc byte (0xFF if no response was ever received), for
 // diagnostic logging/counters upstream.
-SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(const char *tnfs_path, uint8_t *out_rc);
+// Fase 11B: runtime_slot -- same meaning as sidetnfs_tnfs_file_delete()
+// above (ROM-resolved via gemdrive.s's .Ddelete, d3's low word).
+SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc);
 
 // Fase 7L: TNFS attribute-query/set results for GEMDRVEMUL_FATTRIB_CALL.
 // Mirrors the OK/NOT_FOUND/PATH_NOT_FOUND/ACCESS_DENIED/ERROR shape used
@@ -776,7 +841,15 @@ typedef enum
 // report: hidden/system/archive/label have no POSIX-mode equivalent this
 // server exposes). out_rc (nullable) receives the raw TNFS wire rc byte
 // (0xFF if no response was ever received).
-SidetnfsAttrResult sidetnfs_tnfs_get_attributes(const char *tnfs_path, uint8_t *out_st_attribs, uint8_t *out_rc);
+// Fase 11: runtime_slot -- shares tnfs_stat_raw() with
+// sidetnfs_tnfs_get_datetime() below.
+// Fase 11B: GEMDRVEMUL_FATTRIB_CALL's own call site now passes the
+// ROM-resolved slot (gemdrive.s's .Fattrib sends it in d5's low word,
+// the one register of its d3/d4/d5 header not already used by the mode
+// flag/new-attribute value) -- the Fase 11A prefix-only resolution and
+// its slot-0 fallback for a relative path are both gone.
+SidetnfsAttrResult sidetnfs_tnfs_get_attributes(int runtime_slot, const char *tnfs_path, uint8_t *out_st_attribs,
+                                                 uint8_t *out_rc);
 
 // Fase 7Lb: for Fattrib set (wflag 1). Confirmed against the actual server
 // source (tnfsd 24.0522.1) that TNFS_CHMODFILE (0x27) is registered in its
@@ -803,7 +876,10 @@ SidetnfsAttrResult sidetnfs_tnfs_set_attributes(const char *tnfs_path, uint8_t r
 // rtcemul.h). *out_unix_mtime (nullable) is the raw value STAT reported.
 // out_rc (nullable) receives the raw TNFS wire rc byte (0xFF if no
 // response was ever received).
-SidetnfsAttrResult sidetnfs_tnfs_get_datetime(const char *tnfs_path, uint16_t *out_gemdos_date,
+// Fase 11: runtime_slot -- read from the caller's FileDescriptors entry
+// (set at Fopen/Fcreate time), same meaning as sidetnfs_tnfs_file_read()'s
+// own runtime_slot.
+SidetnfsAttrResult sidetnfs_tnfs_get_datetime(int runtime_slot, const char *tnfs_path, uint16_t *out_gemdos_date,
                                                uint16_t *out_gemdos_time, uint32_t *out_unix_mtime, uint8_t *out_rc);
 
 // Fase 7M: for Fdatime set (wflag 1). The actual server's protocol header
@@ -1402,10 +1478,111 @@ typedef struct
     char dsetpath_last_normalized_path[MAX_FOLDER_LENGTH];
     uint16_t dsetpath_last_result;
 
+    // Temporary (EPTHNF-on-existing-path investigation): the exact last
+    // sidetnfs_tnfs_directory_exists() call Dsetpath made -- see that
+    // function in sidetnfs_probe.c. dsetpath_exists_runtime_slot is
+    // deliberately captured even though the function hardcodes slot 0
+    // today, specifically to prove/disprove that against
+    // dsetpath_last_slot above.
+    uint32_t dsetpath_exists_calls;
+    int32_t dsetpath_exists_runtime_slot;
+    uint16_t dsetpath_exists_session_id;
+    char dsetpath_exists_host[SIDETNFS_HOST_LEN];
+    uint16_t dsetpath_exists_port;
+    char dsetpath_exists_tnfs_path[MAX_FOLDER_LENGTH];
+    uint8_t dsetpath_exists_opendirx_seq;
+    bool dsetpath_exists_opendirx_response_received; // false = bounded-wait timeout
+    uint8_t dsetpath_exists_opendirx_rc;
+    uint8_t dsetpath_exists_dir_handle;
+    bool dsetpath_exists_closedir_sent;
+    bool dsetpath_exists_closedir_response_received;
+    uint8_t dsetpath_exists_closedir_rc;
+
     uint32_t dfree_calls;
     uint32_t dfree_last_drive_number;
     int32_t dfree_last_slot;
     uint32_t dfree_last_status;
+    // Temporary (TNFS Dfree fictitious-capacity fix): the four actual
+    // GEMDOS Dfree field values -- RAW, BEFORE WRITE_AND_SWAP_LONGWORD's
+    // high/low-word swap -- plus the resulting byte capacity
+    // (64-bit-computed, see GEMDRVEMUL_DFREE_CALL) -- whichever backend
+    // (TNFS synthetic, SD real, config-drive real) actually produced them.
+    uint32_t dfree_last_free_clusters;
+    uint32_t dfree_last_total_clusters;
+    uint32_t dfree_last_bytes_per_sector;
+    uint32_t dfree_last_sectors_per_cluster;
+    uint64_t dfree_last_capacity_bytes;
+
+    // Temporary (32767-cluster-bomb investigation): full byte-level trace
+    // of GEMDRVEMUL_DFREE_CALL's write into GEMDRVEMUL_DFREE_STRUCT --
+    // see the handler's own comments and the report for the full
+    // Pico+Atari-ROM trace this accompanies.
+    //
+    // dfree_last_buffer_address is the PICO-side shared-memory base
+    // address (memory_shared_address + GEMDRVEMUL_DFREE_STRUCT) the four
+    // longwords are written to -- NOT the Atari-side DISKINFO buffer
+    // pointer (a4 in gemdrive.s's .Dfree), which the Pico never receives
+    // over the wire at all (CMD_DFREE_CALL's payload is only the 16-bit
+    // drive number) and can therefore never capture here; that side of
+    // the trace comes from the ROM source itself (see report).
+    uint32_t dfree_last_buffer_address;
+    // The same four values as dfree_last_free_clusters/etc. above, but
+    // AFTER WRITE_AND_SWAP_LONGWORD's high/low 16-bit word swap -- the
+    // literal 32-bit pattern actually stored at each write address below,
+    // i.e. exactly what gemdrive.s's `move.l (a5)+,(a4)+` loop reads.
+    uint32_t dfree_last_swapped_free_clusters;
+    uint32_t dfree_last_swapped_total_clusters;
+    uint32_t dfree_last_swapped_bytes_per_sector;
+    uint32_t dfree_last_swapped_sectors_per_cluster;
+    // Exact write address of each longword -- always
+    // dfree_last_buffer_address + {0,4,8,12}; captured explicitly (not
+    // just asserted) so a hardware dump proves the +4 stride rather than
+    // assuming it.
+    uint32_t dfree_last_write_addr_free;
+    uint32_t dfree_last_write_addr_total;
+    uint32_t dfree_last_write_addr_bytes_per_sector;
+    uint32_t dfree_last_write_addr_sectors_per_cluster;
+    uint32_t dfree_last_bytes_written; // 16 on the success path, 0 if the error path was taken (no struct write at all)
+    // Last handler phase actually reached, for a call that crashes the
+    // Atari before a UART-less SD dump could otherwise prove how far it
+    // got: 0=entry/slot resolution, 1=disk_info obtained, 2=all four
+    // longwords written, 3=status longword written (handler complete).
+    uint8_t dfree_last_handler_phase;
+
+    // Fase 10 (Fopen/Fcreate slot-aware fix): bounded snapshot of the last
+    // Fopen and last Fcreate call, each with its own field set (both share
+    // the wire-level tnfs_open_with_flags() in sidetnfs_probe.c, but are
+    // logged separately here so a dump always shows both, not just
+    // whichever ran most recently).
+    uint32_t fopen_calls;
+    char fopen_last_input_path[MAX_FOLDER_LENGTH];       // raw payload path, before prefix-stripping
+    char fopen_last_normalized_path[MAX_FOLDER_LENGTH];  // final TNFS path actually sent
+    char fopen_last_drive_letter;                        // explicit prefix letter, or 0 if none was present
+    int32_t fopen_last_slot;                             // slot as RECEIVED from the ROM (d4 low word) -- the ROM's own resolved slot, verbatim
+    int32_t fopen_last_prefix_slot;                       // explicit prefix letter's own resolved slot, or -1 if no prefix was present
+    uint8_t fopen_last_consistency_ok;                     // 1 = no prefix, or prefix matched received slot; 0 = prefix disagreed (GEMDOS_EDRIVE)
+    uint16_t fopen_last_session_id;                       // that slot's TNFS session_id used for the OPEN
+    uint8_t fopen_last_tnfs_rc;                            // raw TNFS OPEN wire rc byte (0xFF = no response/timeout)
+    uint8_t fopen_last_tnfs_handle;                        // TNFS-side file handle, valid only on success
+    uint16_t fopen_last_gemdos_handle;                     // GEMDOS/runtime fd assigned to the caller
+    uint8_t fopen_last_stored_backend;                     // GemdriveFileBackend actually stored in the new FileDescriptors entry
+    int32_t fopen_last_stored_slot;                        // runtime_slot actually stored in that entry
+    uint16_t fopen_last_result;                            // final GEMDOS status returned to the Atari
+
+    uint32_t fcreate_calls;
+    char fcreate_last_input_path[MAX_FOLDER_LENGTH];
+    char fcreate_last_normalized_path[MAX_FOLDER_LENGTH];
+    char fcreate_last_drive_letter;
+    int32_t fcreate_last_slot;        // slot as RECEIVED from the ROM (d4 low word)
+    int32_t fcreate_last_prefix_slot; // explicit prefix letter's own resolved slot, or -1 if none
+    uint8_t fcreate_last_consistency_ok;
+    uint16_t fcreate_last_session_id;
+    uint8_t fcreate_last_tnfs_rc;
+    uint8_t fcreate_last_tnfs_handle;
+    uint16_t fcreate_last_gemdos_handle;
+    uint8_t fcreate_last_stored_backend;
+    int32_t fcreate_last_stored_slot;
+    uint16_t fcreate_last_result;
 
     uint32_t dgetpath_calls;
     uint32_t dgetpath_last_drive_number;
@@ -1422,6 +1599,93 @@ typedef struct
     uint32_t fsnext_calls;
     int32_t fsnext_last_dta_slot;
     uint16_t fsnext_last_result;
+
+    // Fase 11 (handle-based TNFS calls slot-aware fix): bounded snapshot of
+    // the last Fread/Fwrite/Fseek/Fclose/Fdatime call, each with its own
+    // field set -- same "found/backend/stored_slot/tnfs_handle" shape as
+    // fopen_last_*/fcreate_last_* above, since runtime_slot is now read
+    // from the caller's own FileDescriptors entry rather than any global.
+    uint32_t fread_calls;
+    uint16_t fread_last_gemdos_handle;
+    uint8_t fread_last_found;
+    uint8_t fread_last_backend;
+    int32_t fread_last_stored_slot;
+    uint8_t fread_last_tnfs_handle;
+    uint16_t fread_last_requested;
+    uint16_t fread_last_actual;
+    uint16_t fread_last_result;
+
+    uint32_t fwrite_calls;
+    uint16_t fwrite_last_gemdos_handle;
+    uint8_t fwrite_last_found;
+    uint8_t fwrite_last_backend;
+    int32_t fwrite_last_stored_slot;
+    uint8_t fwrite_last_tnfs_handle;
+    uint16_t fwrite_last_requested;
+    uint16_t fwrite_last_actual;
+    uint8_t fwrite_last_tnfs_rc;
+    uint16_t fwrite_last_result;
+
+    uint32_t fseek_calls;
+    uint16_t fseek_last_gemdos_handle;
+    uint8_t fseek_last_found;
+    uint8_t fseek_last_backend;
+    int32_t fseek_last_stored_slot;
+    uint8_t fseek_last_tnfs_handle;
+    uint16_t fseek_last_mode;
+    int32_t fseek_last_offset_in;
+    uint32_t fseek_last_offset_out;
+    uint8_t fseek_last_tnfs_rc;
+    uint16_t fseek_last_result;
+
+    uint32_t fclose_calls;
+    uint16_t fclose_last_gemdos_handle;
+    uint8_t fclose_last_found;
+    uint8_t fclose_last_backend;
+    int32_t fclose_last_stored_slot;
+    uint8_t fclose_last_tnfs_handle;
+    uint16_t fclose_last_result;
+
+    uint32_t fdatime_calls;
+    uint16_t fdatime_last_gemdos_handle;
+    uint8_t fdatime_last_found;
+    uint8_t fdatime_last_backend;
+    int32_t fdatime_last_stored_slot;
+    uint16_t fdatime_last_flag; // FDATETIME_INQUIRE or FDATETIME_SET
+    uint8_t fdatime_last_tnfs_rc;
+    uint16_t fdatime_last_result;
+
+    // Fase 11B (remaining path-based TNFS calls slot-aware fix): bounded
+    // snapshot of the last Dcreate/Ddelete/Fdelete/Frename/Fattrib call.
+    // *_last_rom_slot is the slot gemdrive.s's own detect_emulated_drive_letter
+    // resolved and sent over the wire -- the sole source of truth since
+    // this phase (no more slot-0 fallback for a relative/no-prefix path).
+    uint32_t dcreate_calls;
+    int32_t dcreate_last_rom_slot;
+    uint16_t dcreate_last_result;
+
+    uint32_t ddelete_calls;
+    int32_t ddelete_last_rom_slot;
+    uint16_t ddelete_last_result;
+
+    uint32_t fdelete_calls;
+    int32_t fdelete_last_rom_slot;
+    uint16_t fdelete_last_result;
+
+    // Frename resolves BOTH paths' own slot independently (see gemdrive.s's
+    // .Frename) -- *_prefix_slot_src/dst are the diagnostic-only explicit-
+    // prefix cross-check against the ROM slot, -1 if no prefix was present.
+    uint32_t frename_calls;
+    int32_t frename_rom_slot_src;
+    int32_t frename_rom_slot_dst;
+    int32_t frename_prefix_slot_src;
+    int32_t frename_prefix_slot_dst;
+    uint16_t frename_last_result;
+
+    uint32_t fattrib_calls;
+    int32_t fattrib_last_rom_slot;
+    int32_t fattrib_last_prefix_slot; // diagnostic-only cross-check, -1 if no prefix
+    uint16_t fattrib_last_result;
 } SidetnfsUartDiagSnapshot;
 
 // Returns a pointer to the single static instance -- callers in
@@ -1447,6 +1711,52 @@ void sidetnfs_uart_diag_dump(void);
 // does nothing if hd_folder is NULL or the SD write fails -- never
 // crashes, same contract as sidetnfs_diag_dump_on_select() above.
 void sidetnfs_uart_diag_dump_to_file(const char *hd_folder);
+
+// Temporary diagnostic build (BUGGYBGX/BULGX investigation, see report): a
+// fixed-size, 16-entry RING buffer (oldest entry overwritten first, unlike
+// SidetnfsDiagEvent above which stops at its cap) of name-handling events,
+// so a dump right after a corruption/crash always shows the last 16
+// name-related events leading up to it, not just the first 16 of the
+// whole boot. RAM-only, no dynamic allocation, no I/O and no UART during
+// normal GEMDOS/bus handling -- written only in sidetnfs_normalize_dir_entry()
+// (raw TNFS name + converted 8.3 name) and from gemdrvemul.c right after
+// populate_dta_from_sidetnfs_entry() (name actually written into the
+// 44-byte GEMDOS DTA, which is also exactly the name Fsnext/Fsfirst
+// returns to the Atari -- there is no further transformation after that
+// point). Dumped to SD (DEBUG.TXT) only, via
+// sidetnfs_uart_diag_dump_to_file() above -- never to UART.
+typedef enum
+{
+    SIDETNFS_NAME_EVT_READDIRX_NORMALIZE = 0, // raw_name/converted_name valid
+    SIDETNFS_NAME_EVT_DTA_WRITE = 1,          // dta_written_name/fsnext_returned_name valid
+} SidetnfsNameTraceEventType;
+
+#define SIDETNFS_NAME_TRACE_MAX_EVENTS 16
+
+typedef struct
+{
+    uint8_t event_type; // SidetnfsNameTraceEventType
+    uint32_t ndta;
+    int32_t runtime_slot; // -1 if not resolvable at the point of logging
+    char raw_name[14];
+    char converted_name[14];
+    char dta_written_name[14];
+    char fsnext_returned_name[14];
+} SidetnfsNameTraceEvent;
+
+// Append one event to the fixed 16-entry ring buffer. Any name pointer may
+// be NULL (left as an empty string in the stored record) -- callers only
+// ever know a subset of the four name fields at their own point in the
+// pipeline. No malloc, no I/O, pure RAM ring-buffer write.
+void sidetnfs_name_trace_log(SidetnfsNameTraceEventType event_type, uint32_t ndta, int32_t runtime_slot,
+                              const char *raw_name, const char *converted_name, const char *dta_written_name,
+                              const char *fsnext_returned_name);
+
+// Look up the runtime_slot (0/1/...) currently recorded for ndta's active
+// TNFS DTA-registry search, or -1 if ndta has no active search. Read-only,
+// purely informational -- for the name-trace log above, called from
+// gemdrvemul.c where runtime_slot itself isn't otherwise in scope.
+int sidetnfs_tnfs_dta_get_runtime_slot(uint32_t ndta);
 
 #endif // SIDETNFS_UART_DIAG_DUMP_ON_SELECT
 

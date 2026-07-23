@@ -1566,6 +1566,25 @@ typedef struct
 
 static SidetnfsFsListingResponse s_fslisting_resp = {0};
 
+// Fase (BUGGYBGX/BULGX fix): true for exactly the duration of an active
+// fslisting_wait_for() call -- see that function and
+// tnfs_fslisting_recv_callback() below. Root cause (see report): every
+// fslisting_send_*() shares one 8-bit s_readdirx_seq counter across every
+// request type (OPENDIRX/READDIRX/CLOSEDIR/OPEN/READ/WRITE/...), and
+// fslisting_wait_for() only ever validated cmd+seq -- with only 256
+// possible values and "Show Information" issuing hundreds of round-trips
+// per browse, the counter wraps multiple times per session. A response
+// that arrives AFTER its own request's bounded wait already gave up
+// (timeout) used to sit in s_fslisting_resp with response_ready=true
+// until whatever future request happened to reuse that seq value came
+// along and (wrongly) accepted it -- silently substituting a stale,
+// unrelated directory entry into a completely different search. This
+// flag closes that window: any packet arriving while nothing is actively
+// waiting is now discarded immediately in the receive callback, so a
+// late response for an already-abandoned request can never survive to
+// be misattributed to a later, unrelated one.
+static volatile bool s_fslisting_waiting = false;
+
 // Fase 9E: this used to be "intentionally never removed once created" --
 // true only while sidetnfs_send_mount_probe() was a genuine one-shot,
 // once-per-Pico-boot action. It can now run again on every Atari reset
@@ -2924,6 +2943,18 @@ static void tnfs_fslisting_recv_callback(void *arg, struct udp_pcb *pcb, struct 
         return;
     }
 
+    // Fase (BUGGYBGX/BULGX fix): nobody is currently waiting for anything
+    // on this channel -- this is necessarily a stale response to an
+    // already-abandoned (timed-out) request. Discard it immediately
+    // rather than storing it, so it can never later be mismatched against
+    // a future, unrelated request that happens to reuse the same 8-bit
+    // seq value (see s_fslisting_waiting's own comment above).
+    if (!s_fslisting_waiting)
+    {
+        pbuf_free(p);
+        return;
+    }
+
     uint16_t n = p->tot_len < sizeof(s_fslisting_resp.buf) ? (uint16_t)p->tot_len : (uint16_t)sizeof(s_fslisting_resp.buf);
     pbuf_copy_partial(p, s_fslisting_resp.buf, n, 0);
     s_fslisting_resp.len = n;
@@ -3102,14 +3133,20 @@ static bool fslisting_send_closedir(const sidetnfs_slot_tnfs_context_t *ctx, uin
 // flags -- Fase 7K's sidetnfs_tnfs_file_create() passes 0644 (0x1A4);
 // every other caller passes 0 (ignored by the server when O_CREAT isn't
 // requested, same as before this phase).
-static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t mode, uint8_t *out_seq)
+//
+// Fase 10 (slot-aware fix): ctx (host/port/session_id) now comes from the
+// caller's own resolved runtime slot, never the slot-0-only
+// s_active_host/s_active_port/s_state.sid globals this used to read
+// directly.
+static bool fslisting_send_open(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint16_t flags,
+                                 uint16_t mode, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3118,8 +3155,8 @@ static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t 
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + 4 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_OPEN;
     buf[offset++] = (uint8_t)(flags & 0xFFu);
@@ -3139,7 +3176,7 @@ static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t 
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3149,14 +3186,14 @@ static bool fslisting_send_open(const char *tnfs_path, uint16_t flags, uint16_t 
 // Fase 7G: fire-and-forget UNLINK send -- header + null-terminated path,
 // no other fields (matches the general "path-only" shape already used by
 // OPENDIRX's path portion, minus the pattern prefix).
-static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
+static bool fslisting_send_unlink(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3165,8 +3202,8 @@ static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_UNLINK;
     memcpy(&buf[offset], tnfs_path, path_len);
@@ -3182,7 +3219,7 @@ static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3191,14 +3228,14 @@ static bool fslisting_send_unlink(const char *tnfs_path, uint8_t *out_seq)
 
 // Fase 7L: fire-and-forget STAT send -- header + null-terminated path, no
 // other fields (same shape as fslisting_send_unlink(), different opcode).
-static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
+static bool fslisting_send_stat(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3207,8 +3244,8 @@ static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_STAT;
     memcpy(&buf[offset], tnfs_path, path_len);
@@ -3224,7 +3261,7 @@ static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3241,14 +3278,14 @@ static bool fslisting_send_stat(const char *tnfs_path, uint8_t *out_seq)
 // Fase 7I: fire-and-forget MKDIR send -- header + null-terminated path,
 // no other fields (same shape as fslisting_send_unlink(), different
 // opcode).
-static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
+static bool fslisting_send_mkdir(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3257,8 +3294,8 @@ static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_MKDIR;
     memcpy(&buf[offset], tnfs_path, path_len);
@@ -3274,7 +3311,7 @@ static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(mkdir_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, mkdir_p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, mkdir_p, &server_ip, ctx->port);
     pbuf_free(mkdir_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3284,14 +3321,14 @@ static bool fslisting_send_mkdir(const char *tnfs_path, uint8_t *out_seq)
 // Fase 7J: fire-and-forget RMDIR send -- header + null-terminated path,
 // no other fields (same shape as fslisting_send_mkdir(), different
 // opcode). Never used as a fallback for UNLINK or vice versa.
-static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
+static bool fslisting_send_rmdir(const sidetnfs_slot_tnfs_context_t *ctx, const char *tnfs_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3300,8 +3337,8 @@ static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
     size_t path_len = strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + MAX_FOLDER_LENGTH];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_RMDIR;
     memcpy(&buf[offset], tnfs_path, path_len);
@@ -3317,7 +3354,7 @@ static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
         return false;
     }
     memcpy(rmdir_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, rmdir_p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, rmdir_p, &server_ip, ctx->port);
     pbuf_free(rmdir_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3326,14 +3363,15 @@ static bool fslisting_send_rmdir(const char *tnfs_path, uint8_t *out_seq)
 
 // Fase 7H: fire-and-forget RENAME send -- header + null-terminated old
 // path + null-terminated new path, no other fields.
-static bool fslisting_send_rename(const char *old_path, const char *new_path, uint8_t *out_seq)
+static bool fslisting_send_rename(const sidetnfs_slot_tnfs_context_t *ctx, const char *old_path,
+                                   const char *new_path, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3343,8 +3381,8 @@ static bool fslisting_send_rename(const char *old_path, const char *new_path, ui
     size_t new_len = strnlen(new_path, MAX_FOLDER_LENGTH - 1);
     uint8_t buf[4 + (MAX_FOLDER_LENGTH * 2)];
     size_t offset = 0;
-    buf[offset++] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[offset++] = (uint8_t)(s_state.sid >> 8);
+    buf[offset++] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[offset++] = (uint8_t)(ctx->session_id >> 8);
     buf[offset++] = seq;
     buf[offset++] = TNFS_CMD_RENAME;
     memcpy(&buf[offset], old_path, old_len);
@@ -3363,7 +3401,7 @@ static bool fslisting_send_rename(const char *old_path, const char *new_path, ui
         return false;
     }
     memcpy(rename_p->payload, buf, offset);
-    udp_sendto(s_fslisting_pcb, rename_p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, rename_p, &server_ip, ctx->port);
     pbuf_free(rename_p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3373,22 +3411,23 @@ static bool fslisting_send_rename(const char *old_path, const char *new_path, ui
 // Fase 7D: fire-and-forget READ send for up to size bytes on an
 // already-open TNFS file handle. Same non-blocking contract as the other
 // fslisting_send_* helpers.
-static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out_seq)
+static bool fslisting_send_read(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t tnfs_handle, uint16_t size,
+                                 uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
 
     uint8_t seq = s_readdirx_seq++;
     uint8_t buf[7];
-    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[1] = (uint8_t)(ctx->session_id >> 8);
     buf[2] = seq;
     buf[3] = TNFS_CMD_READ;
     buf[4] = tnfs_handle;
@@ -3404,7 +3443,7 @@ static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3420,22 +3459,23 @@ static bool fslisting_send_read(uint8_t tnfs_handle, uint16_t size, uint8_t *out
 // pbuf payload (no intermediate stack copy of the chunk itself -- only the
 // small fixed header is ever built on the stack), per the "no large
 // temporary stack buffer" requirement.
-static bool fslisting_send_write(uint8_t tnfs_handle, const uint8_t *data, uint16_t size, uint8_t *out_seq)
+static bool fslisting_send_write(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t tnfs_handle, const uint8_t *data,
+                                  uint16_t size, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
 
     uint8_t seq = s_readdirx_seq++;
     uint8_t header[7];
-    header[0] = (uint8_t)(s_state.sid & 0xFFu);
-    header[1] = (uint8_t)(s_state.sid >> 8);
+    header[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    header[1] = (uint8_t)(ctx->session_id >> 8);
     header[2] = seq;
     header[3] = TNFS_CMD_WRITE;
     header[4] = tnfs_handle;
@@ -3455,7 +3495,7 @@ static bool fslisting_send_write(uint8_t tnfs_handle, const uint8_t *data, uint1
     {
         memcpy((uint8_t *)p->payload + sizeof(header), data, size);
     }
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3465,22 +3505,22 @@ static bool fslisting_send_write(uint8_t tnfs_handle, const uint8_t *data, uint1
 // Fase 7D: fire-and-forget CLOSE send for a TNFS file handle obtained from
 // OPEN. Same wire shape as fslisting_send_closedir() (header + single
 // handle byte), different opcode/namespace (file handle, not dir handle).
-static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
+static bool fslisting_send_close(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t tnfs_handle, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
 
     uint8_t seq = s_readdirx_seq++;
     uint8_t buf[5];
-    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[1] = (uint8_t)(ctx->session_id >> 8);
     buf[2] = seq;
     buf[3] = TNFS_CMD_CLOSE;
     buf[4] = tnfs_handle;
@@ -3494,7 +3534,7 @@ static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3505,14 +3545,15 @@ static bool fslisting_send_close(uint8_t tnfs_handle, uint8_t *out_seq)
 // whence is TNFS_SEEK_SET or TNFS_SEEK_END (see sidetnfs_tnfs_file_seek()).
 // position is sent as a signed 32-bit LE value, matching the published
 // TNFS LSEEK request shape (fd + whence + signed offset).
-static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t position, uint8_t *out_seq)
+static bool fslisting_send_seek(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t tnfs_handle, uint8_t whence,
+                                 int32_t position, uint8_t *out_seq)
 {
     if (!fslisting_ensure_pcb())
     {
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!ipaddr_aton(ctx->host, &server_ip))
     {
         return false;
     }
@@ -3520,8 +3561,8 @@ static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t pos
     uint8_t seq = s_readdirx_seq++;
     uint8_t buf[10];
     uint32_t position_u = (uint32_t)position;
-    buf[0] = (uint8_t)(s_state.sid & 0xFFu);
-    buf[1] = (uint8_t)(s_state.sid >> 8);
+    buf[0] = (uint8_t)(ctx->session_id & 0xFFu);
+    buf[1] = (uint8_t)(ctx->session_id >> 8);
     buf[2] = seq;
     buf[3] = TNFS_CMD_SEEK;
     buf[4] = tnfs_handle;
@@ -3540,7 +3581,7 @@ static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t pos
         return false;
     }
     memcpy(p->payload, buf, sizeof(buf));
-    udp_sendto(s_fslisting_pcb, p, &server_ip, s_active_port);
+    udp_sendto(s_fslisting_pcb, p, &server_ip, ctx->port);
     pbuf_free(p);
     cyw43_arch_lwip_end();
     *out_seq = seq;
@@ -3554,7 +3595,8 @@ static bool fslisting_send_seek(uint8_t tnfs_handle, uint8_t whence, int32_t pos
 // counted in *out_skipped (dot-entries are skipped silently, uncounted --
 // matches the existing root-probe's own convention).
 static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_entries,
-                                       uint8_t max_entries, uint16_t *out_skipped)
+                                       uint8_t max_entries, uint16_t *out_skipped,
+                                       uint32_t trace_ndta, int32_t trace_runtime_slot)
 {
     const uint8_t *buf = s_fslisting_resp.buf;
     uint16_t n = s_fslisting_resp.len;
@@ -3588,7 +3630,18 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
         {
             continue; // skip "." / ".." entries, not counted as skipped
         }
-        if (sidetnfs_normalize_dir_entry(name, flags, size, mtime, &out_entries[count]))
+        bool normalized_ok = sidetnfs_normalize_dir_entry(name, flags, size, mtime, &out_entries[count]);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        {
+            char raw_name_trace[14] = {0};
+            size_t raw_copy_len = nlen < sizeof(raw_name_trace) - 1 ? nlen : sizeof(raw_name_trace) - 1;
+            memcpy(raw_name_trace, name, raw_copy_len);
+            raw_name_trace[raw_copy_len] = '\0';
+            sidetnfs_name_trace_log(SIDETNFS_NAME_EVT_READDIRX_NORMALIZE, trace_ndta, trace_runtime_slot,
+                                     raw_name_trace, normalized_ok ? out_entries[count].name : "", NULL, NULL);
+        }
+#endif
+        if (normalized_ok)
         {
             count++;
         }
@@ -3743,8 +3796,18 @@ void sidetnfs_tnfs_dta_release_all(void)
 // Bounded-wait for a response matching expect_cmd+expect_seq. Any
 // stray/mismatched response is discarded (never misread as the answer to
 // a later request) -- see report on sequence/callback correlation.
+//
+// Fase (BUGGYBGX/BULGX fix): s_fslisting_waiting is true for exactly the
+// duration of this call, so tnfs_fslisting_recv_callback() only ever
+// stores a response while someone is genuinely waiting for one -- a
+// response for a request THIS function already gave up on (timed out)
+// arriving later, outside any wait_for call, is discarded at the
+// callback instead of lingering to be misattributed to a future,
+// unrelated request with a reused seq value. Set back to false on every
+// return path.
 static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
 {
+    s_fslisting_waiting = true;
     for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
     {
         cyw43_arch_poll();
@@ -3752,12 +3815,14 @@ static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
         {
             if (s_fslisting_resp.cmd == expect_cmd && s_fslisting_resp.seq == expect_seq)
             {
+                s_fslisting_waiting = false;
                 return true;
             }
             s_fslisting_resp.response_ready = false; // stray/late response -- discard
         }
         sleep_us(SIDETNFS_FS_WAIT_STEP_US);
     }
+    s_fslisting_waiting = false;
     return false; // bounded-wait timeout
 }
 
@@ -3881,7 +3946,7 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
 
         SidetnfsAtariDirEntry entry;
         uint16_t skipped = 0;
-        uint8_t got = fslisting_parse_batch(batch, &entry, 1, &skipped);
+        uint8_t got = fslisting_parse_batch(batch, &entry, 1, &skipped, search->ndta, (int32_t)search->runtime_slot);
         if (got == 0)
         {
 #if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
@@ -4153,13 +4218,39 @@ uint16_t sidetnfs_tnfs_dta_count_active(void)
 // triggered it. See TNFS_CMD_OPEN comment above for the opcode
 // disclosure/risk note. ndta is not used for file ops (0) -- path is the
 // identifying field in the log until a guest handle exists.
-static SidetnfsFileOpenResult tnfs_open_with_flags(const char *tnfs_path, uint16_t flags, uint16_t mode,
-                                                    uint8_t *out_handle)
+//
+// Fase 10 (slot-aware fix): runtime_slot resolves this OPEN's own
+// host/port/session_id via sidetnfs_probe_get_slot_context() (bounds-checked
+// there, never indexes s_slot_contexts[] out of range) -- an invalid slot
+// is treated as a plain OPEN-send failure (SIDETNFS_FILE_OPEN_ERROR), same
+// as any other network-level failure this function already handles.
+static SidetnfsFileOpenResult tnfs_open_with_flags(int runtime_slot, const char *tnfs_path, uint16_t flags,
+                                                    uint16_t mode, uint8_t *out_handle)
 {
+    bool is_create = (flags & TNFS_OPEN_CREAT) != 0;
     s_state.tnfs_fopen_calls++;
     s_state.debug_dirty = true;
+
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
+        return SIDETNFS_FILE_OPEN_ERROR;
+    }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    SidetnfsUartDiagSnapshot *diag = sidetnfs_uart_diag();
+    if (is_create)
+    {
+        diag->fcreate_last_session_id = ctx.session_id;
+    }
+    else
+    {
+        diag->fopen_last_session_id = ctx.session_id;
+    }
+#endif
+
     uint8_t seq = 0;
-    if (!fslisting_send_open(tnfs_path, flags, mode, &seq))
+    if (!fslisting_send_open(&ctx, tnfs_path, flags, mode, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_FILE_OPEN_ERROR;
@@ -4168,6 +4259,9 @@ static SidetnfsFileOpenResult tnfs_open_with_flags(const char *tnfs_path, uint16
     if (!fslisting_wait_for(TNFS_CMD_OPEN, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        if (is_create) { diag->fcreate_last_tnfs_rc = 0xFFu; } else { diag->fopen_last_tnfs_rc = 0xFFu; }
+#endif
         return SIDETNFS_FILE_OPEN_ERROR;
     }
     uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
@@ -4176,12 +4270,18 @@ static SidetnfsFileOpenResult tnfs_open_with_flags(const char *tnfs_path, uint16
     // Fase 7D-debug: unconditional -- the exact wire rc byte for this OPEN,
     // whatever it turns out to be, regardless of success/failure.
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, rc, 0);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    if (is_create) { diag->fcreate_last_tnfs_rc = rc; } else { diag->fopen_last_tnfs_rc = rc; }
+#endif
     if (rc == TNFS_OK)
     {
         *out_handle = handle;
         s_state.tnfs_fopen_ok++;
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_OK, handle, tnfs_path, NULL, NULL, 0, 0, 0, 0);
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_HANDLE, handle, tnfs_path, NULL, NULL, handle, 0, 0, 0);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        if (is_create) { diag->fcreate_last_tnfs_handle = handle; } else { diag->fopen_last_tnfs_handle = handle; }
+#endif
         return SIDETNFS_FILE_OPEN_OK;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, rc, 0);
@@ -4195,7 +4295,8 @@ static SidetnfsFileOpenResult tnfs_open_with_flags(const char *tnfs_path, uint16
 // Fopen never creates a file, matching the SD/FatFS route's own
 // mode-to-FA_* mapping (FA_READ / FA_WRITE / FA_READ|FA_WRITE, no
 // FA_CREATE_ALWAYS).
-SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t gemdos_mode, uint8_t *out_handle)
+SidetnfsFileOpenResult sidetnfs_tnfs_file_open(int runtime_slot, const char *tnfs_path, uint16_t gemdos_mode,
+                                                 uint8_t *out_handle)
 {
     uint16_t flags;
     switch (gemdos_mode)
@@ -4211,7 +4312,7 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t g
         flags = TNFS_OPEN_RDONLY;
         break;
     }
-    return tnfs_open_with_flags(tnfs_path, flags, 0, out_handle);
+    return tnfs_open_with_flags(runtime_slot, tnfs_path, flags, 0, out_handle);
 }
 
 // Fase 7K: TNFS OPEN for GEMDOS Fcreate -- always creates the file if it
@@ -4224,10 +4325,11 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_open(const char *tnfs_path, uint16_t g
 // attribute byte (hidden/system/etc.), not a Unix permission mode, and
 // nothing here has verified how (or whether) this server maps one to the
 // other.
-SidetnfsFileOpenResult sidetnfs_tnfs_file_create(const char *tnfs_path, uint8_t *out_handle)
+SidetnfsFileOpenResult sidetnfs_tnfs_file_create(int runtime_slot, const char *tnfs_path, uint8_t *out_handle)
 {
-    return tnfs_open_with_flags(tnfs_path, TNFS_OPEN_RDONLY | TNFS_OPEN_WRITE | TNFS_OPEN_CREAT | TNFS_OPEN_TRUNC,
-                                 0x1A4u, out_handle);
+    return tnfs_open_with_flags(runtime_slot, tnfs_path,
+                                 TNFS_OPEN_RDONLY | TNFS_OPEN_WRITE | TNFS_OPEN_CREAT | TNFS_OPEN_TRUNC, 0x1A4u,
+                                 out_handle);
 }
 
 // Fase 7D5: TNFS READ. Writes directly into the caller's buffer (the guest
@@ -4243,11 +4345,18 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_create(const char *tnfs_path, uint8_t 
 // EOF. Any wire error mid-loop discards this call's progress entirely and
 // returns false, same as f_read() reporting FR_* failure regardless of
 // bytes already read internally by FatFS.
-bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *out_buf,
+bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, uint8_t *out_buf,
                               uint16_t requested, uint16_t *out_actual)
 {
     s_state.tnfs_fread_calls++;
     s_state.debug_dirty = true;
+
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
+        return false;
+    }
 
     uint16_t total = 0;
     uint8_t last_rc = TNFS_OK;
@@ -4260,7 +4369,7 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *ou
         }
         uint16_t chunk = remaining > SIDETNFS_TNFS_READ_CHUNK_MAX ? (uint16_t)SIDETNFS_TNFS_READ_CHUNK_MAX : remaining;
         uint8_t seq = 0;
-        if (!fslisting_send_read(tnfs_handle, chunk, &seq))
+        if (!fslisting_send_read(&ctx, tnfs_handle, chunk, &seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
             return false;
@@ -4344,14 +4453,29 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, uint8_t *ou
 // past bug elsewhere in this codebase involved an ACK handler clearing a
 // byte count too early, so this phase avoids adding any per-chunk logging
 // that could perturb it.
-bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, const uint8_t *data, uint16_t requested,
-                               uint16_t *out_actual, uint8_t *out_rc)
+bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, const uint8_t *data,
+                               uint16_t requested, uint16_t *out_actual, uint8_t *out_rc)
 {
     // Fase 7K: no low-level counter bumped here -- the call-level counters
     // (fwrite calls/ok/errors/... , see SidetnfsDebugState) are recorded
     // once per GEMDRVEMUL_WRITE_BUFF_CALL by sidetnfs_note_tnfs_fwrite(),
     // called from gemdrvemul.c, matching the compact/call-level-only
     // diagnostics this phase asks for.
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_TRANSPORT_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
+        if (out_actual)
+        {
+            *out_actual = 0;
+        }
+        if (out_rc)
+        {
+            *out_rc = 0xFFu;
+        }
+        return false;
+    }
+
     uint16_t total = 0;
     uint8_t last_rc = TNFS_OK;
     for (uint32_t round = 0; round < SIDETNFS_TNFS_WRITE_MAX_ROUNDS; round++)
@@ -4364,7 +4488,7 @@ bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, const uint
         uint16_t chunk =
             remaining > SIDETNFS_TNFS_WRITE_CHUNK_MAX ? (uint16_t)SIDETNFS_TNFS_WRITE_CHUNK_MAX : remaining;
         uint8_t seq = 0;
-        if (!fslisting_send_write(tnfs_handle, data + total, chunk, &seq))
+        if (!fslisting_send_write(&ctx, tnfs_handle, data + total, chunk, &seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_TRANSPORT_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk,
                                0xFFu, 0);
@@ -4447,12 +4571,22 @@ bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, const uint
 // the caller (see header comment) -- the local file descriptor must always
 // be released regardless, same "cleanup can't hang or be retried" contract
 // as tnfs_dta_closedir() for directory handles.
-void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle)
+void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot)
 {
     s_state.tnfs_fclose_calls++;
     s_state.debug_dirty = true;
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        // Same "local descriptor always released regardless" contract as
+        // every other failure path here -- an unresolvable slot just means
+        // the TNFS CLOSE is never sent; the caller still deletes its own
+        // tracking entry right after this call either way.
+        sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
+        return;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_close(tnfs_handle, &seq))
+    if (!fslisting_send_close(&ctx, tnfs_handle, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
         return;
@@ -4492,14 +4626,39 @@ void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle)
 // stays exactly as before (implicitly slot 0's session), so slot 0's
 // context is resolved here directly rather than threading a slot
 // parameter through a call chain this phase doesn't otherwise touch.
-bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
+bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    // Reset this call's record up front so a bail-out below still leaves a
+    // consistent, fully-overwritten snapshot rather than mixing fields
+    // from a previous call. Purely additive -- no functional change below.
+    SidetnfsUartDiagSnapshot *diag = sidetnfs_uart_diag();
+    diag->dsetpath_exists_calls++;
+    diag->dsetpath_exists_runtime_slot = runtime_slot;
+    diag->dsetpath_exists_session_id = 0;
+    diag->dsetpath_exists_host[0] = '\0';
+    diag->dsetpath_exists_port = 0;
+    snprintf(diag->dsetpath_exists_tnfs_path, MAX_FOLDER_LENGTH, "%s", tnfs_path ? tnfs_path : "");
+    diag->dsetpath_exists_opendirx_seq = 0;
+    diag->dsetpath_exists_opendirx_response_received = false;
+    diag->dsetpath_exists_opendirx_rc = 0xFFu;
+    diag->dsetpath_exists_dir_handle = 0;
+    diag->dsetpath_exists_closedir_sent = false;
+    diag->dsetpath_exists_closedir_response_received = false;
+    diag->dsetpath_exists_closedir_rc = 0xFFu;
+#endif
+
     sidetnfs_slot_tnfs_context_t ctx;
-    if (!sidetnfs_probe_get_slot_context(0, &ctx))
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
     {
         *out_rc = 0xFFu;
         return false;
     }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    diag->dsetpath_exists_session_id = ctx.session_id;
+    snprintf(diag->dsetpath_exists_host, SIDETNFS_HOST_LEN, "%s", ctx.host);
+    diag->dsetpath_exists_port = ctx.port;
+#endif
 
     uint8_t seq = 0;
     if (!fslisting_send_opendirx(&ctx, tnfs_path, &seq))
@@ -4507,15 +4666,25 @@ bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
         *out_rc = 0xFFu;
         return false;
     }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    diag->dsetpath_exists_opendirx_seq = seq;
+#endif
     if (!fslisting_wait_for(TNFS_CMD_OPENDIRX, seq))
     {
         *out_rc = 0xFFu;
         return false;
     }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    diag->dsetpath_exists_opendirx_response_received = true;
+#endif
     uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
     uint8_t handle = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
     s_fslisting_resp.response_ready = false;
     *out_rc = rc;
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    diag->dsetpath_exists_opendirx_rc = rc;
+    diag->dsetpath_exists_dir_handle = handle;
+#endif
     if (rc != TNFS_OK)
     {
         return false;
@@ -4527,7 +4696,19 @@ bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
     uint8_t close_seq = 0;
     if (fslisting_send_closedir(&ctx, handle, &close_seq))
     {
-        fslisting_wait_for(TNFS_CMD_CLOSEDIR, close_seq);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        diag->dsetpath_exists_closedir_sent = true;
+#endif
+        bool closedir_responded = fslisting_wait_for(TNFS_CMD_CLOSEDIR, close_seq);
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+        diag->dsetpath_exists_closedir_response_received = closedir_responded;
+        if (closedir_responded)
+        {
+            diag->dsetpath_exists_closedir_rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+        }
+#else
+        (void)closedir_responded;
+#endif
         s_fslisting_resp.response_ready = false;
     }
     return true;
@@ -4538,7 +4719,7 @@ bool sidetnfs_tnfs_directory_exists(const char *tnfs_path, uint8_t *out_rc)
 // additive diagnostic parameter -- the raw wire rc byte, for
 // sidetnfs_note_tnfs_fseek()'s "fseek last rc" counter in gemdrvemul.c.
 // Does not change the seek logic, payload, or return value contract.
-bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, bool seek_from_end,
+bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, bool seek_from_end,
                               int32_t offset, uint32_t *out_new_offset, uint8_t *out_rc)
 {
     uint8_t whence = seek_from_end ? TNFS_SEEK_END : TNFS_SEEK_SET;
@@ -4546,8 +4727,14 @@ bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, bool seek_f
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, whence, 0xFFu, 0);
+        return false;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_seek(tnfs_handle, whence, offset, &seq))
+    if (!fslisting_send_seek(&ctx, tnfs_handle, whence, offset, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, whence, 0xFFu, 0);
         return false;
@@ -4601,14 +4788,19 @@ bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, bool seek_f
 // gemdrvemul.c) always treats as "not deleted", never as success -- so a
 // directory can never be silently reported as deleted regardless of the
 // exact rc the server happens to return for that case.
-SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(const char *tnfs_path, uint8_t *out_rc)
+SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        return SIDETNFS_FILE_DELETE_ERROR;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_unlink(tnfs_path, &seq))
+    if (!fslisting_send_unlink(&ctx, tnfs_path, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_FILE_DELETE_ERROR;
@@ -4651,14 +4843,20 @@ SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(const char *tnfs_path, uint8_
 // surface as EEXIST, unverified against this specific server), that is
 // folded into ACCESS_DENIED rather than silently overwriting or inventing
 // a delete-then-rename fallback.
-SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(const char *old_path, const char *new_path, uint8_t *out_rc)
+SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char *old_path, const char *new_path,
+                                                    uint8_t *out_rc)
 {
     if (out_rc)
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        return SIDETNFS_FILE_RENAME_ERROR;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_rename(old_path, new_path, &seq))
+    if (!fslisting_send_rename(&ctx, old_path, new_path, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_TNFS_RC, 0, old_path, NULL, new_path, 0, 0, 0xFFu, 0);
         return SIDETNFS_FILE_RENAME_ERROR;
@@ -4697,14 +4895,19 @@ SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(const char *old_path, const c
 
 // Fase 7I: TNFS MKDIR. No pre-check of existence -- no directory listing,
 // no separate stat. The wire rc alone determines the result.
-SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(const char *tnfs_path, uint8_t *out_rc)
+SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        return SIDETNFS_DIR_CREATE_ERROR;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_mkdir(tnfs_path, &seq))
+    if (!fslisting_send_mkdir(&ctx, tnfs_path, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_DIR_CREATE_ERROR;
@@ -4746,14 +4949,19 @@ SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(const char *tnfs_path, ui
 // Fase 7J: TNFS RMDIR. No pre-check, no directory enumeration to see
 // whether the directory is empty -- the server must bear that
 // responsibility atomically. Never falls back to TNFS_CMD_UNLINK.
-SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(const char *tnfs_path, uint8_t *out_rc)
+SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        return SIDETNFS_DIR_DELETE_ERROR;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_rmdir(tnfs_path, &seq))
+    if (!fslisting_send_rmdir(&ctx, tnfs_path, &seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_DIR_DELETE_ERROR;
@@ -4834,14 +5042,20 @@ typedef enum
 
 // Fase 7L/7M: send TNFS STAT and parse its response into a raw mode/size/
 // mtime triple.
-static SidetnfsTnfsStatResult tnfs_stat_raw(const char *tnfs_path, SidetnfsTnfsRawStat *out_stat, uint8_t *out_rc)
+static SidetnfsTnfsStatResult tnfs_stat_raw(int runtime_slot, const char *tnfs_path, SidetnfsTnfsRawStat *out_stat,
+                                             uint8_t *out_rc)
 {
     if (out_rc)
     {
         *out_rc = 0xFFu;
     }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
+    {
+        return SIDETNFS_TNFS_STAT_ERROR;
+    }
     uint8_t seq = 0;
-    if (!fslisting_send_stat(tnfs_path, &seq))
+    if (!fslisting_send_stat(&ctx, tnfs_path, &seq))
     {
         return SIDETNFS_TNFS_STAT_ERROR;
     }
@@ -4937,10 +5151,11 @@ static uint8_t tnfs_mode_to_st_attribs(uint16_t mode)
 }
 
 // Fase 7L: TNFS STAT -> GEMDOS/DOS-style attributes, for Fattrib inquire.
-SidetnfsAttrResult sidetnfs_tnfs_get_attributes(const char *tnfs_path, uint8_t *out_st_attribs, uint8_t *out_rc)
+SidetnfsAttrResult sidetnfs_tnfs_get_attributes(int runtime_slot, const char *tnfs_path, uint8_t *out_st_attribs,
+                                                 uint8_t *out_rc)
 {
     SidetnfsTnfsRawStat stat = {0};
-    SidetnfsTnfsStatResult result = tnfs_stat_raw(tnfs_path, &stat, out_rc);
+    SidetnfsTnfsStatResult result = tnfs_stat_raw(runtime_slot, tnfs_path, &stat, out_rc);
     if (result != SIDETNFS_TNFS_STAT_OK)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FATTRIB_STAT_ERROR, 0, tnfs_path, NULL, NULL, 0, 0,
@@ -5041,11 +5256,11 @@ static void tnfs_unix_time_to_gemdos(uint32_t unix_time, uint16_t *out_date, uin
 // (see GEMDRVEMUL_FDATETIME_CALL in gemdrvemul.c, which never writes a
 // partial date/time to shared memory on error). *out_unix_mtime (nullable)
 // is the raw value STAT reported, for diagnostic logging upstream.
-SidetnfsAttrResult sidetnfs_tnfs_get_datetime(const char *tnfs_path, uint16_t *out_gemdos_date,
+SidetnfsAttrResult sidetnfs_tnfs_get_datetime(int runtime_slot, const char *tnfs_path, uint16_t *out_gemdos_date,
                                                uint16_t *out_gemdos_time, uint32_t *out_unix_mtime, uint8_t *out_rc)
 {
     SidetnfsTnfsRawStat stat = {0};
-    SidetnfsTnfsStatResult result = tnfs_stat_raw(tnfs_path, &stat, out_rc);
+    SidetnfsTnfsStatResult result = tnfs_stat_raw(runtime_slot, tnfs_path, &stat, out_rc);
     if (result != SIDETNFS_TNFS_STAT_OK)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FDATIME_INQUIRE_ERR, 0, tnfs_path, NULL, NULL, 0, 0,
@@ -5530,6 +5745,52 @@ SidetnfsUartDiagSnapshot *sidetnfs_uart_diag(void)
     return &s_uart_diag;
 }
 
+// Fase (BUGGYBGX/BULGX investigation): fixed 16-entry RING buffer -- see
+// SidetnfsNameTraceEvent's own doc comment in sidetnfs_probe.h. Unlike
+// s_diag_events above (stops at its cap, keeps the earliest events), this
+// always overwrites the OLDEST entry once full, so a dump taken right
+// after a corruption/crash shows the last 16 name events leading up to
+// it.
+static SidetnfsNameTraceEvent s_name_trace[SIDETNFS_NAME_TRACE_MAX_EVENTS];
+static uint8_t s_name_trace_next = 0;
+static uint8_t s_name_trace_filled = 0; // number of valid entries, caps at SIDETNFS_NAME_TRACE_MAX_EVENTS
+
+static void copy_trace_name(char *dst, const char *src)
+{
+    if (src == NULL)
+    {
+        dst[0] = '\0';
+        return;
+    }
+    snprintf(dst, 14, "%s", src);
+}
+
+void sidetnfs_name_trace_log(SidetnfsNameTraceEventType event_type, uint32_t ndta, int32_t runtime_slot,
+                              const char *raw_name, const char *converted_name, const char *dta_written_name,
+                              const char *fsnext_returned_name)
+{
+    SidetnfsNameTraceEvent *e = &s_name_trace[s_name_trace_next];
+    e->event_type = (uint8_t)event_type;
+    e->ndta = ndta;
+    e->runtime_slot = runtime_slot;
+    copy_trace_name(e->raw_name, raw_name);
+    copy_trace_name(e->converted_name, converted_name);
+    copy_trace_name(e->dta_written_name, dta_written_name);
+    copy_trace_name(e->fsnext_returned_name, fsnext_returned_name);
+
+    s_name_trace_next = (uint8_t)((s_name_trace_next + 1) % SIDETNFS_NAME_TRACE_MAX_EVENTS);
+    if (s_name_trace_filled < SIDETNFS_NAME_TRACE_MAX_EVENTS)
+    {
+        s_name_trace_filled++;
+    }
+}
+
+int sidetnfs_tnfs_dta_get_runtime_slot(uint32_t ndta)
+{
+    SidetnfsTnfsDtaSearch *slot = lookupTnfsDTA(ndta);
+    return slot ? slot->runtime_slot : -1;
+}
+
 // Fase (temporary diagnostic build): find the s_tnfs_dta_searches[] array
 // index actually holding ndta's active TNFS DTA search, purely for the
 // UART snapshot's "gevonden DTA-slot" field. Read-only -- does not affect
@@ -5578,9 +5839,55 @@ void sidetnfs_uart_diag_dump(void)
            d->dsetpath_last_input_path, d->dsetpath_last_normalized_path,
            (unsigned)d->dsetpath_last_result);
 
+    printf("Dsetpath directory_exists: calls=%lu runtime_slot=%ld session_id=0x%04x host=%s port=%u "
+           "tnfs_path=\"%s\" opendirx_seq=%u opendirx_response_received=%d opendirx_rc=0x%02x dir_handle=%u "
+           "closedir_sent=%d closedir_response_received=%d closedir_rc=0x%02x\r\n",
+           (unsigned long)d->dsetpath_exists_calls, (long)d->dsetpath_exists_runtime_slot,
+           (unsigned)d->dsetpath_exists_session_id, d->dsetpath_exists_host, (unsigned)d->dsetpath_exists_port,
+           d->dsetpath_exists_tnfs_path, (unsigned)d->dsetpath_exists_opendirx_seq,
+           (int)d->dsetpath_exists_opendirx_response_received, (unsigned)d->dsetpath_exists_opendirx_rc,
+           (unsigned)d->dsetpath_exists_dir_handle, (int)d->dsetpath_exists_closedir_sent,
+           (int)d->dsetpath_exists_closedir_response_received, (unsigned)d->dsetpath_exists_closedir_rc);
+
     printf("Dfree: calls=%lu last_drive=%lu last_slot=%ld last_status=0x%08lx\r\n",
            (unsigned long)d->dfree_calls, (unsigned long)d->dfree_last_drive_number,
            (long)d->dfree_last_slot, (unsigned long)d->dfree_last_status);
+    printf("Dfree geometry: free_clusters=%lu total_clusters=%lu bytes_per_sector=%lu "
+           "sectors_per_cluster=%lu capacity_bytes=%llu\r\n",
+           (unsigned long)d->dfree_last_free_clusters, (unsigned long)d->dfree_last_total_clusters,
+           (unsigned long)d->dfree_last_bytes_per_sector, (unsigned long)d->dfree_last_sectors_per_cluster,
+           (unsigned long long)d->dfree_last_capacity_bytes);
+    printf("Dfree buffer: base=0x%08lx phase=%u bytes_written=%lu\r\n",
+           (unsigned long)d->dfree_last_buffer_address, (unsigned)d->dfree_last_handler_phase,
+           (unsigned long)d->dfree_last_bytes_written);
+    printf("Dfree swapped (post-WRITE_AND_SWAP_LONGWORD, as stored): free=0x%08lx@0x%08lx "
+           "total=0x%08lx@0x%08lx bytes_per_sector=0x%08lx@0x%08lx sectors_per_cluster=0x%08lx@0x%08lx\r\n",
+           (unsigned long)d->dfree_last_swapped_free_clusters, (unsigned long)d->dfree_last_write_addr_free,
+           (unsigned long)d->dfree_last_swapped_total_clusters, (unsigned long)d->dfree_last_write_addr_total,
+           (unsigned long)d->dfree_last_swapped_bytes_per_sector,
+           (unsigned long)d->dfree_last_write_addr_bytes_per_sector,
+           (unsigned long)d->dfree_last_swapped_sectors_per_cluster,
+           (unsigned long)d->dfree_last_write_addr_sectors_per_cluster);
+
+    printf("Fopen: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
+           "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
+           "stored_backend=%u stored_slot=%ld result=0x%04x\r\n",
+           (unsigned long)d->fopen_calls, d->fopen_last_input_path, d->fopen_last_normalized_path,
+           d->fopen_last_drive_letter ? d->fopen_last_drive_letter : '-', (long)d->fopen_last_slot,
+           (long)d->fopen_last_prefix_slot, (unsigned)d->fopen_last_consistency_ok,
+           (unsigned)d->fopen_last_session_id, (unsigned)d->fopen_last_tnfs_rc, (unsigned)d->fopen_last_tnfs_handle,
+           (unsigned)d->fopen_last_gemdos_handle, (unsigned)d->fopen_last_stored_backend,
+           (long)d->fopen_last_stored_slot, (unsigned)d->fopen_last_result);
+    printf("Fcreate: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
+           "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
+           "stored_backend=%u stored_slot=%ld result=0x%04x\r\n",
+           (unsigned long)d->fcreate_calls, d->fcreate_last_input_path, d->fcreate_last_normalized_path,
+           d->fcreate_last_drive_letter ? d->fcreate_last_drive_letter : '-', (long)d->fcreate_last_slot,
+           (long)d->fcreate_last_prefix_slot, (unsigned)d->fcreate_last_consistency_ok,
+           (unsigned)d->fcreate_last_session_id, (unsigned)d->fcreate_last_tnfs_rc,
+           (unsigned)d->fcreate_last_tnfs_handle, (unsigned)d->fcreate_last_gemdos_handle,
+           (unsigned)d->fcreate_last_stored_backend, (long)d->fcreate_last_stored_slot,
+           (unsigned)d->fcreate_last_result);
 
     printf("Dgetpath: calls=%lu last_drive=%lu last_slot=%ld last_path=\"%s\"\r\n",
            (unsigned long)d->dgetpath_calls, (unsigned long)d->dgetpath_last_drive_number,
@@ -5595,6 +5902,54 @@ void sidetnfs_uart_diag_dump(void)
     printf("Fsnext: calls=%lu last_dta_slot=%ld last_result=0x%04x\r\n",
            (unsigned long)d->fsnext_calls, (long)d->fsnext_last_dta_slot,
            (unsigned)d->fsnext_last_result);
+
+    printf("Fread: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u "
+           "requested=%u actual=%u result=0x%04x\r\n",
+           (unsigned long)d->fread_calls, (unsigned)d->fread_last_gemdos_handle, (unsigned)d->fread_last_found,
+           (unsigned)d->fread_last_backend, (long)d->fread_last_stored_slot, (unsigned)d->fread_last_tnfs_handle,
+           (unsigned)d->fread_last_requested, (unsigned)d->fread_last_actual, (unsigned)d->fread_last_result);
+
+    printf("Fwrite: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u "
+           "requested=%u actual=%u tnfs_rc=0x%02x result=0x%04x\r\n",
+           (unsigned long)d->fwrite_calls, (unsigned)d->fwrite_last_gemdos_handle, (unsigned)d->fwrite_last_found,
+           (unsigned)d->fwrite_last_backend, (long)d->fwrite_last_stored_slot, (unsigned)d->fwrite_last_tnfs_handle,
+           (unsigned)d->fwrite_last_requested, (unsigned)d->fwrite_last_actual, (unsigned)d->fwrite_last_tnfs_rc,
+           (unsigned)d->fwrite_last_result);
+
+    printf("Fseek: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u mode=%u "
+           "offset_in=%ld offset_out=%lu tnfs_rc=0x%02x result=0x%04x\r\n",
+           (unsigned long)d->fseek_calls, (unsigned)d->fseek_last_gemdos_handle, (unsigned)d->fseek_last_found,
+           (unsigned)d->fseek_last_backend, (long)d->fseek_last_stored_slot, (unsigned)d->fseek_last_tnfs_handle,
+           (unsigned)d->fseek_last_mode, (long)d->fseek_last_offset_in, (unsigned long)d->fseek_last_offset_out,
+           (unsigned)d->fseek_last_tnfs_rc, (unsigned)d->fseek_last_result);
+
+    printf("Fclose: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u result=0x%04x\r\n",
+           (unsigned long)d->fclose_calls, (unsigned)d->fclose_last_gemdos_handle, (unsigned)d->fclose_last_found,
+           (unsigned)d->fclose_last_backend, (long)d->fclose_last_stored_slot, (unsigned)d->fclose_last_tnfs_handle,
+           (unsigned)d->fclose_last_result);
+
+    printf("Fdatime: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld flag=%u tnfs_rc=0x%02x "
+           "result=0x%04x\r\n",
+           (unsigned long)d->fdatime_calls, (unsigned)d->fdatime_last_gemdos_handle, (unsigned)d->fdatime_last_found,
+           (unsigned)d->fdatime_last_backend, (long)d->fdatime_last_stored_slot, (unsigned)d->fdatime_last_flag,
+           (unsigned)d->fdatime_last_tnfs_rc, (unsigned)d->fdatime_last_result);
+
+    printf("Dcreate: calls=%lu rom_slot=%ld result=0x%04x\r\n", (unsigned long)d->dcreate_calls,
+           (long)d->dcreate_last_rom_slot, (unsigned)d->dcreate_last_result);
+
+    printf("Ddelete: calls=%lu rom_slot=%ld result=0x%04x\r\n", (unsigned long)d->ddelete_calls,
+           (long)d->ddelete_last_rom_slot, (unsigned)d->ddelete_last_result);
+
+    printf("Fdelete: calls=%lu rom_slot=%ld result=0x%04x\r\n", (unsigned long)d->fdelete_calls,
+           (long)d->fdelete_last_rom_slot, (unsigned)d->fdelete_last_result);
+
+    printf("Frename: calls=%lu rom_slot_src=%ld rom_slot_dst=%ld prefix_slot_src=%ld prefix_slot_dst=%ld "
+           "result=0x%04x\r\n",
+           (unsigned long)d->frename_calls, (long)d->frename_rom_slot_src, (long)d->frename_rom_slot_dst,
+           (long)d->frename_prefix_slot_src, (long)d->frename_prefix_slot_dst, (unsigned)d->frename_last_result);
+
+    printf("Fattrib: calls=%lu rom_slot=%ld prefix_slot=%ld result=0x%04x\r\n", (unsigned long)d->fattrib_calls,
+           (long)d->fattrib_last_rom_slot, (long)d->fattrib_last_prefix_slot, (unsigned)d->fattrib_last_result);
 
     printf("===== END SNAPSHOT =====\r\n");
 }
@@ -5690,9 +6045,85 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
         f_write(&file, line, (UINT)len, &written);
     }
 
+    len = snprintf(line, sizeof(line),
+                    "Dsetpath directory_exists: calls=%lu runtime_slot=%ld session_id=0x%04x host=%s port=%u "
+                    "tnfs_path=\"%s\" opendirx_seq=%u opendirx_response_received=%d opendirx_rc=0x%02x "
+                    "dir_handle=%u closedir_sent=%d closedir_response_received=%d closedir_rc=0x%02x\r\n",
+                    (unsigned long)d->dsetpath_exists_calls, (long)d->dsetpath_exists_runtime_slot,
+                    (unsigned)d->dsetpath_exists_session_id, d->dsetpath_exists_host,
+                    (unsigned)d->dsetpath_exists_port, d->dsetpath_exists_tnfs_path,
+                    (unsigned)d->dsetpath_exists_opendirx_seq, (int)d->dsetpath_exists_opendirx_response_received,
+                    (unsigned)d->dsetpath_exists_opendirx_rc, (unsigned)d->dsetpath_exists_dir_handle,
+                    (int)d->dsetpath_exists_closedir_sent, (int)d->dsetpath_exists_closedir_response_received,
+                    (unsigned)d->dsetpath_exists_closedir_rc);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
     len = snprintf(line, sizeof(line), "Dfree: calls=%lu last_drive=%lu last_slot=%ld last_status=0x%08lx\r\n",
                     (unsigned long)d->dfree_calls, (unsigned long)d->dfree_last_drive_number,
                     (long)d->dfree_last_slot, (unsigned long)d->dfree_last_status);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line),
+                    "Dfree geometry: free_clusters=%lu total_clusters=%lu bytes_per_sector=%lu "
+                    "sectors_per_cluster=%lu capacity_bytes=%llu\r\n",
+                    (unsigned long)d->dfree_last_free_clusters, (unsigned long)d->dfree_last_total_clusters,
+                    (unsigned long)d->dfree_last_bytes_per_sector, (unsigned long)d->dfree_last_sectors_per_cluster,
+                    (unsigned long long)d->dfree_last_capacity_bytes);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line), "Dfree buffer: base=0x%08lx phase=%u bytes_written=%lu\r\n",
+                    (unsigned long)d->dfree_last_buffer_address, (unsigned)d->dfree_last_handler_phase,
+                    (unsigned long)d->dfree_last_bytes_written);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line),
+                    "Dfree swapped (post-WRITE_AND_SWAP_LONGWORD, as stored): free=0x%08lx@0x%08lx "
+                    "total=0x%08lx@0x%08lx bytes_per_sector=0x%08lx@0x%08lx sectors_per_cluster=0x%08lx@0x%08lx\r\n",
+                    (unsigned long)d->dfree_last_swapped_free_clusters, (unsigned long)d->dfree_last_write_addr_free,
+                    (unsigned long)d->dfree_last_swapped_total_clusters, (unsigned long)d->dfree_last_write_addr_total,
+                    (unsigned long)d->dfree_last_swapped_bytes_per_sector,
+                    (unsigned long)d->dfree_last_write_addr_bytes_per_sector,
+                    (unsigned long)d->dfree_last_swapped_sectors_per_cluster,
+                    (unsigned long)d->dfree_last_write_addr_sectors_per_cluster);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line),
+                    "Fopen: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
+                    "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
+                    "stored_backend=%u stored_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->fopen_calls, d->fopen_last_input_path, d->fopen_last_normalized_path,
+                    d->fopen_last_drive_letter ? d->fopen_last_drive_letter : '-', (long)d->fopen_last_slot,
+                    (long)d->fopen_last_prefix_slot, (unsigned)d->fopen_last_consistency_ok,
+                    (unsigned)d->fopen_last_session_id, (unsigned)d->fopen_last_tnfs_rc,
+                    (unsigned)d->fopen_last_tnfs_handle, (unsigned)d->fopen_last_gemdos_handle,
+                    (unsigned)d->fopen_last_stored_backend, (long)d->fopen_last_stored_slot,
+                    (unsigned)d->fopen_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line),
+                    "Fcreate: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
+                    "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
+                    "stored_backend=%u stored_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->fcreate_calls, d->fcreate_last_input_path, d->fcreate_last_normalized_path,
+                    d->fcreate_last_drive_letter ? d->fcreate_last_drive_letter : '-', (long)d->fcreate_last_slot,
+                    (long)d->fcreate_last_prefix_slot, (unsigned)d->fcreate_last_consistency_ok,
+                    (unsigned)d->fcreate_last_session_id, (unsigned)d->fcreate_last_tnfs_rc,
+                    (unsigned)d->fcreate_last_tnfs_handle, (unsigned)d->fcreate_last_gemdos_handle,
+                    (unsigned)d->fcreate_last_stored_backend, (long)d->fcreate_last_stored_slot,
+                    (unsigned)d->fcreate_last_result);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
@@ -5725,7 +6156,145 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
         f_write(&file, line, (UINT)len, &written);
     }
 
+    len = snprintf(line, sizeof(line),
+                    "Fread: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u "
+                    "requested=%u actual=%u result=0x%04x\r\n",
+                    (unsigned long)d->fread_calls, (unsigned)d->fread_last_gemdos_handle,
+                    (unsigned)d->fread_last_found, (unsigned)d->fread_last_backend, (long)d->fread_last_stored_slot,
+                    (unsigned)d->fread_last_tnfs_handle, (unsigned)d->fread_last_requested,
+                    (unsigned)d->fread_last_actual, (unsigned)d->fread_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Fwrite: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u "
+                    "requested=%u actual=%u tnfs_rc=0x%02x result=0x%04x\r\n",
+                    (unsigned long)d->fwrite_calls, (unsigned)d->fwrite_last_gemdos_handle,
+                    (unsigned)d->fwrite_last_found, (unsigned)d->fwrite_last_backend,
+                    (long)d->fwrite_last_stored_slot, (unsigned)d->fwrite_last_tnfs_handle,
+                    (unsigned)d->fwrite_last_requested, (unsigned)d->fwrite_last_actual,
+                    (unsigned)d->fwrite_last_tnfs_rc, (unsigned)d->fwrite_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Fseek: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u mode=%u "
+                    "offset_in=%ld offset_out=%lu tnfs_rc=0x%02x result=0x%04x\r\n",
+                    (unsigned long)d->fseek_calls, (unsigned)d->fseek_last_gemdos_handle,
+                    (unsigned)d->fseek_last_found, (unsigned)d->fseek_last_backend, (long)d->fseek_last_stored_slot,
+                    (unsigned)d->fseek_last_tnfs_handle, (unsigned)d->fseek_last_mode,
+                    (long)d->fseek_last_offset_in, (unsigned long)d->fseek_last_offset_out,
+                    (unsigned)d->fseek_last_tnfs_rc, (unsigned)d->fseek_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Fclose: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld tnfs_handle=%u "
+                    "result=0x%04x\r\n",
+                    (unsigned long)d->fclose_calls, (unsigned)d->fclose_last_gemdos_handle,
+                    (unsigned)d->fclose_last_found, (unsigned)d->fclose_last_backend,
+                    (long)d->fclose_last_stored_slot, (unsigned)d->fclose_last_tnfs_handle,
+                    (unsigned)d->fclose_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Fdatime: calls=%lu gemdos_handle=%u found=%u backend=%u stored_slot=%ld flag=%u tnfs_rc=0x%02x "
+                    "result=0x%04x\r\n",
+                    (unsigned long)d->fdatime_calls, (unsigned)d->fdatime_last_gemdos_handle,
+                    (unsigned)d->fdatime_last_found, (unsigned)d->fdatime_last_backend,
+                    (long)d->fdatime_last_stored_slot, (unsigned)d->fdatime_last_flag,
+                    (unsigned)d->fdatime_last_tnfs_rc, (unsigned)d->fdatime_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Dcreate: calls=%lu rom_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->dcreate_calls, (long)d->dcreate_last_rom_slot,
+                    (unsigned)d->dcreate_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Ddelete: calls=%lu rom_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->ddelete_calls, (long)d->ddelete_last_rom_slot,
+                    (unsigned)d->ddelete_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Fdelete: calls=%lu rom_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->fdelete_calls, (long)d->fdelete_last_rom_slot,
+                    (unsigned)d->fdelete_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line),
+                    "Frename: calls=%lu rom_slot_src=%ld rom_slot_dst=%ld prefix_slot_src=%ld prefix_slot_dst=%ld "
+                    "result=0x%04x\r\n",
+                    (unsigned long)d->frename_calls, (long)d->frename_rom_slot_src, (long)d->frename_rom_slot_dst,
+                    (long)d->frename_prefix_slot_src, (long)d->frename_prefix_slot_dst,
+                    (unsigned)d->frename_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "Fattrib: calls=%lu rom_slot=%ld prefix_slot=%ld result=0x%04x\r\n",
+                    (unsigned long)d->fattrib_calls, (long)d->fattrib_last_rom_slot,
+                    (long)d->fattrib_last_prefix_slot, (unsigned)d->fattrib_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
     len = snprintf(line, sizeof(line), "===== END SNAPSHOT =====\r\n");
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    // Fase (BUGGYBGX/BULGX investigation): the 16-entry name-trace ring
+    // buffer, oldest-first (so the last line printed is the most recent
+    // event -- the one closest to any corruption/crash). SD only, never
+    // UART -- see sidetnfs_name_trace_log()'s own comment.
+    len = snprintf(line, sizeof(line), "\r\n===== NAME TRACE (last %u events, oldest first) =====\r\n",
+                    (unsigned)s_name_trace_filled);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    uint8_t trace_start = (s_name_trace_filled < SIDETNFS_NAME_TRACE_MAX_EVENTS)
+                               ? 0
+                               : s_name_trace_next; // oldest slot once the ring has wrapped
+    for (uint8_t i = 0; i < s_name_trace_filled; i++)
+    {
+        uint8_t idx = (uint8_t)((trace_start + i) % SIDETNFS_NAME_TRACE_MAX_EVENTS);
+        const SidetnfsNameTraceEvent *ev = &s_name_trace[idx];
+        len = snprintf(line, sizeof(line),
+                        "[%u] event=%u ndta=0x%08lx runtime_slot=%ld raw=\"%s\" converted=\"%s\" "
+                        "dta_written=\"%s\" fsnext_returned=\"%s\"\r\n",
+                        (unsigned)i, (unsigned)ev->event_type, (unsigned long)ev->ndta, (long)ev->runtime_slot,
+                        ev->raw_name, ev->converted_name, ev->dta_written_name, ev->fsnext_returned_name);
+        if (len > 0)
+        {
+            f_write(&file, line, (UINT)len, &written);
+        }
+    }
+    len = snprintf(line, sizeof(line), "===== END NAME TRACE =====\r\n");
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
