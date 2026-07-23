@@ -5909,6 +5909,8 @@ void sidetnfs_uart_diag_dump(void)
            (unsigned)d->fopen_last_session_id, (unsigned)d->fopen_last_tnfs_rc, (unsigned)d->fopen_last_tnfs_handle,
            (unsigned)d->fopen_last_gemdos_handle, (unsigned)d->fopen_last_stored_backend,
            (long)d->fopen_last_stored_slot, (unsigned)d->fopen_last_result);
+    printf("Fopen raw payload words: d3=0x%04x d4=0x%04x d5=0x%04x\r\n", (unsigned)d->fopen_raw_payload_words[0],
+           (unsigned)d->fopen_raw_payload_words[1], (unsigned)d->fopen_raw_payload_words[2]);
     printf("Fcreate: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
            "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
            "stored_backend=%u stored_slot=%ld result=0x%04x\r\n",
@@ -5919,6 +5921,8 @@ void sidetnfs_uart_diag_dump(void)
            (unsigned)d->fcreate_last_tnfs_handle, (unsigned)d->fcreate_last_gemdos_handle,
            (unsigned)d->fcreate_last_stored_backend, (long)d->fcreate_last_stored_slot,
            (unsigned)d->fcreate_last_result);
+    printf("Fcreate raw payload words: d3=0x%04x d4=0x%04x d5=0x%04x\r\n", (unsigned)d->fcreate_raw_payload_words[0],
+           (unsigned)d->fcreate_raw_payload_words[1], (unsigned)d->fcreate_raw_payload_words[2]);
 
     printf("Dgetpath: calls=%lu last_drive=%lu last_slot=%ld last_path=\"%s\"\r\n",
            (unsigned long)d->dgetpath_calls, (unsigned long)d->dgetpath_last_drive_number,
@@ -6150,6 +6154,13 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
     {
         f_write(&file, line, (UINT)len, &written);
     }
+    len = snprintf(line, sizeof(line), "Fopen raw payload words: d3=0x%04x d4=0x%04x d5=0x%04x\r\n",
+                    (unsigned)d->fopen_raw_payload_words[0], (unsigned)d->fopen_raw_payload_words[1],
+                    (unsigned)d->fopen_raw_payload_words[2]);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
     len = snprintf(line, sizeof(line),
                     "Fcreate: calls=%lu input=\"%s\" normalized=\"%s\" drive=%c rom_slot=%ld prefix_slot=%ld "
                     "consistency_ok=%u session_id=0x%04x tnfs_rc=0x%02x tnfs_handle=%u gemdos_handle=%u "
@@ -6161,6 +6172,13 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
                     (unsigned)d->fcreate_last_tnfs_handle, (unsigned)d->fcreate_last_gemdos_handle,
                     (unsigned)d->fcreate_last_stored_backend, (long)d->fcreate_last_stored_slot,
                     (unsigned)d->fcreate_last_result);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    len = snprintf(line, sizeof(line), "Fcreate raw payload words: d3=0x%04x d4=0x%04x d5=0x%04x\r\n",
+                    (unsigned)d->fcreate_raw_payload_words[0], (unsigned)d->fcreate_raw_payload_words[1],
+                    (unsigned)d->fcreate_raw_payload_words[2]);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);

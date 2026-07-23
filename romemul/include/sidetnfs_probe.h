@@ -1578,6 +1578,13 @@ typedef struct
     uint8_t fopen_last_stored_backend;                     // GemdriveFileBackend actually stored in the new FileDescriptors entry
     int32_t fopen_last_stored_slot;                        // runtime_slot actually stored in that entry
     uint16_t fopen_last_result;                            // final GEMDOS status returned to the Atari
+    // Fase 11D: raw d3/d4/d5-header low words exactly as received on the
+    // wire, captured before any parsing -- [0]=d3(mode) [1]=d4(slot)
+    // [2]=d5(unused). Proves what the ROM actually sent, independent of
+    // this handler's own interpretation (see report: .Pexec's internal
+    // Fopen send was found stashing a stale register into d4 instead of
+    // the resolved slot).
+    uint16_t fopen_raw_payload_words[3];
 
     uint32_t fcreate_calls;
     char fcreate_last_input_path[MAX_FOLDER_LENGTH];
@@ -1593,6 +1600,7 @@ typedef struct
     uint8_t fcreate_last_stored_backend;
     int32_t fcreate_last_stored_slot;
     uint16_t fcreate_last_result;
+    uint16_t fcreate_raw_payload_words[3]; // same shape as fopen_raw_payload_words above
 
     uint32_t dgetpath_calls;
     uint32_t dgetpath_last_drive_number;

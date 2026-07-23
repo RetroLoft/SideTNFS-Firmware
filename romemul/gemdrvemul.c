@@ -4831,6 +4831,15 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
             sidetnfs_uart_diag()->fopen_calls++;
             sidetnfs_uart_diag()->fopen_last_slot = fopen_rom_slot;
+            // Fase 11D: raw d3/d4/d5-header low words exactly as received,
+            // captured before any interpretation -- payload offset used
+            // for the slot itself is index [1] here (payloadPtr[2], i.e.
+            // d4's low word). Lets a hardware trace prove/disprove what
+            // the ROM actually put on the wire, independent of this
+            // handler's own parsing.
+            sidetnfs_uart_diag()->fopen_raw_payload_words[0] = payloadPtr[0]; // d3 low (mode)
+            sidetnfs_uart_diag()->fopen_raw_payload_words[1] = payloadPtr[2]; // d4 low (slot)
+            sidetnfs_uart_diag()->fopen_raw_payload_words[2] = payloadPtr[4]; // d5 low (unused)
 #endif
             // Fase 10: hard slot-bounds check before ANY slot/context/table
             // access below (get_tnfs_relative_pathname_for_slot() indexes
@@ -4935,6 +4944,10 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
             sidetnfs_uart_diag()->fcreate_calls++;
             sidetnfs_uart_diag()->fcreate_last_slot = fcreate_rom_slot;
+            // Fase 11D: raw d3/d4/d5-header low words, same as Fopen above.
+            sidetnfs_uart_diag()->fcreate_raw_payload_words[0] = payloadPtr[0]; // d3 low (mode)
+            sidetnfs_uart_diag()->fcreate_raw_payload_words[1] = payloadPtr[2]; // d4 low (slot)
+            sidetnfs_uart_diag()->fcreate_raw_payload_words[2] = payloadPtr[4]; // d5 low (unused)
 #endif
             // Fase 10: hard slot-bounds check before ANY slot/context/table
             // access below -- same reasoning as Fopen above.
