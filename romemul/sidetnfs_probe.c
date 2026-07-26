@@ -61,6 +61,17 @@ void sidetnfs_probe_load_active_server(void)
         {
             continue;
         }
+        // Fase 12B: sidetnfs_config_get_drive() now returns OK for an
+        // EMPTY slot too, and a DISABLED slot can hold a fully valid TNFS
+        // record (a state that could not exist before this phase) -- skip
+        // both explicitly so only an ENABLED drive can ever become "the"
+        // active server. Every pre-existing (migrated) configuration only
+        // ever produces EMPTY/ENABLED records, so this is a no-op for any
+        // config that existed before Fase 12B.
+        if (!sidetnfs_drive_slot_is_enabled(&drive))
+        {
+            continue;
+        }
         if (drive.type != SIDETNFS_DRIVE_TNFS)
         {
             continue;
@@ -539,34 +550,32 @@ static uint8_t s_readdirx_seq = 2; // MOUNT uses 0, OPENDIRX uses 1
 // Fase 1 (multi-drive slot routing): the per-slot TNFS/backend identity
 // table -- see sidetnfs_slot_tnfs_context_t's own comment in
 // sidetnfs_probe.h. Populated exclusively by sidetnfs_probe_set_slot_context()
-// below; nothing else in this file writes to it.
-static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_SLOTS];
-
-// Fase 1 (multi-drive slot routing, TNFS mount sequencing): slot 1's own
-// MOUNT response state, the direct analogue of
-// s_state.sid/mount_rc/mount_response_received for slot 0 -- kept
-// separate from s_state (which remains exclusively slot 0's, unchanged)
-// so a failed/slow slot 1 mount can never perturb slot 0's own state.
-// Written only by tnfs_recv_callback()'s pending-slot-1 branch and
-// send_slot1_mount_request() (both further down in this file); read by
+// below. Fase 13: also now the single place every slot's own MOUNT
+// session state (mount_pending/response_received/mount_result/
+// session_id/session_established/expected_addr) lives -- replaces the
+// old slot-1-only s_slot1_mount_sid/rc/response_received and
+// s_mount_expected_addr_slot0/slot1 pair, generalized to every slot 0..
+// SIDETNFS_PROBE_MAX_RUNTIME_SLOTS-1. Written by
+// sidetnfs_send_mount_probe()/send_slot_mount_request() (send side) and
+// tnfs_recv_callback() (response side); read by
 // sidetnfs_probe_get_slot_context() below.
-static uint16_t s_slot1_mount_sid = 0;
-static uint8_t s_slot1_mount_rc = 0xFF; // 0xFF: no response yet (not a real TNFS rc)
-static bool s_slot1_mount_response_received = false;
+static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_SLOTS];
 
 // Fase 2 (mount pending-slot fix): explicit single-outstanding-MOUNT
 // tracker. -1 means "no MOUNT currently outstanding" -- deliberately NOT
 // 0, since slot 0 is itself a valid slot index and a zero-initialized
 // "0 means none" sentinel would make slot 0's own pending window
 // indistinguishable from "nothing pending" at static-init time. Set to
-// 0/1 by sidetnfs_send_mount_probe()/send_slot1_mount_request()
-// respectively, BEFORE the packet is actually sent (so a very fast
-// response can never race ahead of us marking it pending); cleared back
-// to -1 by tnfs_recv_callback() on an accepted response, and by
+// the slot index by sidetnfs_send_mount_probe()/send_slot_mount_request()
+// BEFORE the packet is actually sent (so a very fast response can never
+// race ahead of us marking it pending); cleared back to -1 by
+// tnfs_recv_callback() on an accepted response, and by
 // sidetnfs_probe_mount_runtime_slots() after each bounded wait
 // completes (covers the timeout case, so a late straggler arriving after
 // the wait gave up is never attributed to whichever slot is mounted
-// next).
+// next). Fase 13: was already a generic int (not two bools) before this
+// phase -- only ever set to 0 or 1 until now; sidetnfs_probe_mount_runtime_slots()
+// below is the only caller that now sets it to any slot 0..N-1.
 //
 // Replaces the previous, protocol-non-conformant design that used a
 // hardcoded, non-zero MOUNT sequence number (0x40) to tell slot 1's
@@ -602,9 +611,12 @@ void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cf
     ctx->port = cfg->port;
     strncpy(ctx->mount_path, cfg->mount_path, sizeof(ctx->mount_path) - 1);
     strncpy(ctx->sd_path, cfg->sd_path, sizeof(ctx->sd_path) - 1);
-    // session_id/session_established stay 0/false here -- see
-    // sidetnfs_probe_get_slot_context() for the one place slot 0's real
-    // session state is ever reflected.
+    // Fase 13: mount_pending/response_received/mount_result/session_id/
+    // session_established/expected_addr all already zeroed by the
+    // memset() above -- this slot starts "configured, not yet mounted"
+    // every time it's (re)populated, e.g. at GEMDRVEMUL_PING reinit, so a
+    // slot can never carry a stale session forward from a previous
+    // config generation.
     ctx->valid = true;
 }
 
@@ -619,32 +631,120 @@ bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out
         return false;
     }
 
+    // Fase 13: no more slot==0/slot==1 special cases -- every slot's own
+    // session_id/session_established/mount_result/response_received/
+    // mount_pending are kept live directly in s_slot_contexts[slot] by
+    // sidetnfs_probe_mount_runtime_slots()/tnfs_recv_callback(), so a
+    // plain struct copy is now the whole implementation.
     *out = s_slot_contexts[slot];
-
-    if (slot == 0)
-    {
-        // Fase 1: slot 0's real session state -- read live from the
-        // existing single-session TNFS client fields, never mutating
-        // s_slot_contexts itself. Same "mounted successfully" condition
-        // already used elsewhere in this file (e.g. sidetnfs_tnfs_listing_ready()).
-        out->session_id = s_state.sid;
-        out->session_established = s_state.mount_response_received && (s_state.mount_rc == TNFS_OK);
-    }
-    else if (slot == 1)
-    {
-        // Fase 1 (multi-drive slot routing, TNFS mount sequencing):
-        // slot 1's own real session state, set by
-        // sidetnfs_probe_mount_runtime_slots()'s sequential MOUNT of
-        // slot 1 -- read live, same shape as slot 0 above. No longer
-        // forced false.
-        out->session_id = s_slot1_mount_sid;
-        out->session_established = s_slot1_mount_response_received && (s_slot1_mount_rc == TNFS_OK);
-    }
-    // Every other slot: session_id/session_established stay at
-    // s_slot_contexts[slot]'s own values (0/false) -- never populated by
-    // anything in this phase.
-
     return true;
+}
+
+// Fase 5 (virtual NET_ERR.TXT root): derives WHY runtime slot `slot`'s
+// TNFS session isn't usable right now, purely from wifi_ok and this
+// slot's own already-stored sidetnfs_slot_tnfs_context_t -- never sends
+// network traffic, never blocks, never invents a new TNFS error code.
+// Fixed priority order: no WiFi first (nothing else can matter without
+// it), then DNS/host-parse failure (deterministic, no wait ever
+// happened), then "no response within the bounded wait" (timeout),
+// then "response received but rc != TNFS_OK" (mount failed), and
+// finally "no session context at all" for a slot that was never even
+// populated by sidetnfs_probe_set_slot_context() -- which, for an
+// ENABLED TNFS drive, should not normally happen (every valid TNFS slot
+// is populated alongside g_runtime_drives), but is the one remaining
+// honest bucket for "geen geldige sessie" if it ever does.
+SidetnfsDriveErrorCategory sidetnfs_probe_classify_slot_error(int slot, bool wifi_ok)
+{
+    if (!wifi_ok)
+    {
+        return SIDETNFS_DRIVE_ERR_NO_WIFI;
+    }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return SIDETNFS_DRIVE_ERR_NO_SESSION;
+    }
+    if (ctx.session_established)
+    {
+        return SIDETNFS_DRIVE_ERR_NONE;
+    }
+    if (ctx.host_unresolvable)
+    {
+        return SIDETNFS_DRIVE_ERR_DNS_FAILED;
+    }
+    if (!ctx.response_received)
+    {
+        return SIDETNFS_DRIVE_ERR_SERVER_UNREACHABLE;
+    }
+    return SIDETNFS_DRIVE_ERR_MOUNT_FAILED;
+}
+
+const char *sidetnfs_drive_error_category_text(SidetnfsDriveErrorCategory category)
+{
+    switch (category)
+    {
+    case SIDETNFS_DRIVE_ERR_NONE:
+        return "OK";
+    case SIDETNFS_DRIVE_ERR_NO_WIFI:
+        return "NO WIFI";
+    case SIDETNFS_DRIVE_ERR_DNS_FAILED:
+        return "DNS FAILED";
+    case SIDETNFS_DRIVE_ERR_SERVER_UNREACHABLE:
+        return "SERVER UNREACHABLE";
+    case SIDETNFS_DRIVE_ERR_MOUNT_FAILED:
+        return "MOUNT FAILED";
+    case SIDETNFS_DRIVE_ERR_NO_SESSION:
+    default:
+        return "NO SESSION";
+    }
+}
+
+// Fase 5: NET_ERR.TXT's body text -- driveletter/wifi_ok are supplied by
+// the caller (gemdrvemul.c already has both without a second lookup);
+// host/port/mount_path/the raw TNFS rc come straight from this slot's own
+// sidetnfs_slot_tnfs_context_t, never a separate/duplicated record. Always
+// NUL-terminates and never writes past out_size; returns the length
+// written (excluding the NUL) -- callers use this same value as the
+// file's reported size (Fsfirst entry.size and the Fopen descriptor's
+// config_flash_size), so the two can never disagree (test E).
+size_t sidetnfs_build_net_err_text(int slot, char driveletter, bool wifi_ok, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0)
+    {
+        return 0;
+    }
+    SidetnfsDriveErrorCategory category = sidetnfs_probe_classify_slot_error(slot, wifi_ok);
+    sidetnfs_slot_tnfs_context_t ctx;
+    bool have_ctx = sidetnfs_probe_get_slot_context(slot, &ctx);
+    int n;
+    if (category == SIDETNFS_DRIVE_ERR_NO_WIFI || !have_ctx)
+    {
+        n = snprintf(out, out_size,
+                     "SideTNFS drive %c: not available\r\n"
+                     "Reason: %s\r\n",
+                     driveletter, sidetnfs_drive_error_category_text(category));
+    }
+    else
+    {
+        n = snprintf(out, out_size,
+                     "SideTNFS drive %c: not available\r\n"
+                     "Reason: %s\r\n"
+                     "Host: %s:%u\r\n"
+                     "Mount: %s\r\n"
+                     "TNFS rc: %u\r\n",
+                     driveletter, sidetnfs_drive_error_category_text(category), ctx.host, (unsigned)ctx.port,
+                     ctx.mount_path, (unsigned)ctx.mount_result);
+    }
+    if (n < 0)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+    if ((size_t)n >= out_size)
+    {
+        return out_size - 1; // snprintf truncated -- already NUL-terminated at out_size-1
+    }
+    return (size_t)n;
 }
 
 // Fase 7D4: suppress back-to-back TNFS_READDIRX_EOF events for the same
@@ -670,6 +770,21 @@ static bool s_last_readdirx_eof_ndta_valid = false;
 // sequence around a single folder refresh). Used only when TNFS was never
 // available this boot; real TNFS searches use the separate
 // SidetnfsTnfsDtaSearch registry below.
+// Fase 5 (virtual NET_ERR.TXT root): which single synthetic entry a
+// search slot produces -- the legacy, unchanged "NO_NETW.TXT" fallback
+// (still exclusively for a non-TNFS ordinary/SD slot, see
+// gemdrive_backend_fsfirst()'s own comment -- "SD backend niet
+// wijzigen") or the new per-slot, categorized NET_ERR.TXT for an
+// ENABLED TNFS drive that isn't ready. Kept in the same table/slots as
+// the legacy kind since both are "one synthetic root entry, closed on
+// exhaustion" -- every other consumer (next/is_active/close/close_all/
+// count_active) stays kind-agnostic and unchanged.
+typedef enum
+{
+    SIDETNFS_FAKE_SEARCH_KIND_LEGACY_NO_NETWORK = 0,
+    SIDETNFS_FAKE_SEARCH_KIND_NET_ERR,
+} SidetnfsFakeSearchKind;
+
 typedef struct
 {
     bool active;
@@ -678,6 +793,10 @@ typedef struct
     char pattern[13];
     uint8_t attribs;
     uint16_t next_index;
+    SidetnfsFakeSearchKind kind;
+    int slot;          // meaningful only when kind == SIDETNFS_FAKE_SEARCH_KIND_NET_ERR
+    char driveletter;  // meaningful only when kind == SIDETNFS_FAKE_SEARCH_KIND_NET_ERR
+    bool wifi_ok;      // meaningful only when kind == SIDETNFS_FAKE_SEARCH_KIND_NET_ERR
 } SidetnfsFakeSearchSlot;
 
 static SidetnfsFakeSearchSlot s_fake_searches[SIDETNFS_SEARCH_SLOTS] = {0};
@@ -1604,9 +1723,10 @@ static struct udp_pcb *s_mount_pcb = NULL;
 // sent to, captured at send time (not re-parsed from a hostname string
 // on every incoming packet) -- tnfs_recv_callback() checks the response
 // sender against these, so a spoofed/unexpected-source packet is never
-// attributed to either slot regardless of its sequence number.
-static ip_addr_t s_mount_expected_addr_slot0;
-static ip_addr_t s_mount_expected_addr_slot1;
+// attributed to any slot regardless of its sequence number. Fase 13:
+// now stored generically in s_slot_contexts[slot].expected_addr (a plain
+// uint32_t IPv4 address, not ip_addr_t -- see that field's own comment
+// in sidetnfs_probe.h) instead of these two named per-slot variables.
 
 bool sidetnfs_udp_connect_test(void)
 {
@@ -2004,37 +2124,76 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     uint8_t cmd = buf[3];
     if (cmd == TNFS_CMD_MOUNT)
     {
-        // Fase 2 (mount pending-slot fix): attribution no longer depends
-        // on the response's echoed sequence byte at all (see
-        // s_mount_pending_slot's own comment above for why) -- only on
-        // which single slot is the current pending one, defensively
-        // confirmed against that slot's own configured server
-        // address+port. At most one of slot 0/slot 1 can ever be pending
-        // at a time (sidetnfs_probe_mount_runtime_slots() mounts strictly
-        // sequentially), so this is unambiguous.
+        // Fase 13 (generalized from Fase 2's mount pending-slot fix):
+        // attribution still does not depend on the response's echoed
+        // sequence byte at all (see s_mount_pending_slot's own comment
+        // for why) -- only on which single slot is the current pending
+        // one, defensively confirmed against THAT slot's own configured
+        // server address+port, read generically from
+        // s_slot_contexts[pending] instead of two named slot-0/slot-1
+        // variable pairs. Exactly one slot can ever be pending at a time
+        // (sidetnfs_probe_mount_runtime_slots() mounts strictly
+        // sequentially), so this is unambiguous for any valid slot index.
         uint8_t seq = buf[2]; // no longer used for routing -- captured into the diag snapshot only, see below
         (void)seq;
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
         SidetnfsMountRejectReason reject_reason = SIDETNFS_MOUNT_REJECT_NO_PENDING_SLOT;
 #endif
         bool accepted = false;
-        if (s_mount_pending_slot == 0)
+        int pending = s_mount_pending_slot;
+        if (pending >= 0 && pending < SIDETNFS_PROBE_MAX_RUNTIME_SLOTS && s_slot_contexts[pending].valid)
         {
-            if (addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot0))
+            sidetnfs_slot_tnfs_context_t *ctx = &s_slot_contexts[pending];
+            if (addr != NULL && addr->addr == ctx->expected_addr)
             {
-                if (port == s_active_port)
+                if (port == ctx->port)
                 {
-                    s_state.sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-                    s_state.mount_rc = n > 4 ? buf[4] : 0;
-                    s_state.mount_response_received = true;
-                    s_state.debug_dirty = true;
+                    uint16_t sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+                    uint8_t rc = n > 4 ? buf[4] : 0;
+                    ctx->session_id = sid;
+                    ctx->mount_result = rc;
+                    ctx->response_received = true;
+                    ctx->mount_pending = false;
+                    ctx->session_established = (rc == TNFS_OK);
+                    if (pending == 0)
+                    {
+                        // Fase 13: slot 0 also mirrors into the legacy
+                        // single-session s_state fields --
+                        // send_opendirx_probe()/send_readdirx_probe()/
+                        // sidetnfs_probe_service()/
+                        // sidetnfs_tnfs_listing_ready()/build_status_text()
+                        // (status window) all still read s_state directly
+                        // and are out of scope for this phase; this keeps
+                        // them byte-for-byte unchanged while the
+                        // attribution logic above no longer special-cases
+                        // slot 0's own control flow to reach them.
+                        s_state.sid = sid;
+                        s_state.mount_rc = rc;
+                        s_state.mount_response_received = true;
+                        s_state.debug_dirty = true;
+                    }
                     s_mount_pending_slot = -1;
                     accepted = true;
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-                    sidetnfs_uart_diag()->slot0_mount_response_received = true;
-                    sidetnfs_uart_diag()->slot0_mount_rc = s_state.mount_rc;
-                    sidetnfs_uart_diag()->slot0_sid = s_state.sid;
-                    sidetnfs_uart_diag()->slot0_last_recv_seq = seq;
+                    if (pending == 0)
+                    {
+                        sidetnfs_uart_diag()->slot0_mount_response_received = true;
+                        sidetnfs_uart_diag()->slot0_mount_rc = rc;
+                        sidetnfs_uart_diag()->slot0_sid = sid;
+                        sidetnfs_uart_diag()->slot0_last_recv_seq = seq;
+                    }
+                    else if (pending == 1)
+                    {
+                        sidetnfs_uart_diag()->slot1_mount_response_received = true;
+                        sidetnfs_uart_diag()->slot1_mount_rc = rc;
+                        sidetnfs_uart_diag()->slot1_sid = sid;
+                        sidetnfs_uart_diag()->slot1_last_recv_seq = seq;
+                    }
+                    // Fase 13: slots 2.. have no fixed field in the old,
+                    // two-slot SidetnfsUartDiagSnapshot -- out of scope
+                    // to extend here (see send_slot_mount_request()'s own
+                    // comment); their result is still visible via the new
+                    // compact SIDETNFS_ENABLE_DIAG_UART boot log instead.
 #endif
                 }
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
@@ -2051,40 +2210,9 @@ static void tnfs_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
             }
 #endif
         }
-        else if (s_mount_pending_slot == 1)
-        {
-            if (addr != NULL && ip_addr_cmp(addr, &s_mount_expected_addr_slot1))
-            {
-                if (port == s_slot_contexts[1].port)
-                {
-                    s_slot1_mount_sid = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
-                    s_slot1_mount_rc = n > 4 ? buf[4] : 0;
-                    s_slot1_mount_response_received = true;
-                    s_mount_pending_slot = -1;
-                    accepted = true;
-#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-                    sidetnfs_uart_diag()->slot1_mount_response_received = true;
-                    sidetnfs_uart_diag()->slot1_mount_rc = s_slot1_mount_rc;
-                    sidetnfs_uart_diag()->slot1_sid = s_slot1_mount_sid;
-                    sidetnfs_uart_diag()->slot1_last_recv_seq = seq;
-#endif
-                }
-#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-                else
-                {
-                    reject_reason = SIDETNFS_MOUNT_REJECT_PORT_MISMATCH;
-                }
-#endif
-            }
-#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-            else
-            {
-                reject_reason = SIDETNFS_MOUNT_REJECT_ADDR_MISMATCH;
-            }
-#endif
-        }
-        // else: s_mount_pending_slot == -1 -- nothing outstanding right
-        // now (stray/duplicate/very-late packet); reject_reason stays
+        // else: s_mount_pending_slot == -1, or pending is somehow out of
+        // range/not valid -- nothing outstanding right now (stray/
+        // duplicate/very-late packet); reject_reason stays
         // SIDETNFS_MOUNT_REJECT_NO_PENDING_SLOT.
         (void)accepted; // only read back via reject_reason below when diag is compiled in
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
@@ -2181,6 +2309,11 @@ void sidetnfs_send_mount_probe(void)
     ip_addr_t server_ip;
     if (!ipaddr_aton(s_active_host, &server_ip))
     {
+        // Fase 5 (virtual NET_ERR.TXT root): capture this existing check's
+        // already-computed result instead of discarding it -- the closest
+        // honest "DNS mislukt" signal this codebase has (see
+        // sidetnfs_slot_tnfs_context_t.host_unresolvable's own comment).
+        s_slot_contexts[0].host_unresolvable = true;
         return;
     }
 
@@ -2235,6 +2368,12 @@ void sidetnfs_send_mount_probe(void)
     // never race ahead of tnfs_recv_callback() being able to attribute
     // it (see s_mount_pending_slot's own comment above).
     s_mount_pending_slot = 0;
+    // Fase 13: slot 0's own generic session-administration fields --
+    // same reset send_slot_mount_request() does for every other slot,
+    // so tnfs_recv_callback()'s now-generic attribution logic can treat
+    // slot 0 the same as any other slot.
+    s_slot_contexts[0].mount_pending = true;
+    s_slot_contexts[0].response_received = false;
     memcpy(p->payload, buf, offset);
     udp_sendto(pcb, p, &server_ip, s_active_port);
     pbuf_free(p);
@@ -2247,32 +2386,46 @@ void sidetnfs_send_mount_probe(void)
     // the actual server this request went to, so tnfs_recv_callback()
     // can validate the response's sender -- see that function's own
     // comment. Purely additive: does not change any byte sent or any
-    // existing state written by this function.
-    s_mount_expected_addr_slot0 = server_ip;
+    // existing state written by this function. Fase 13: stored in
+    // s_slot_contexts[0].expected_addr now (generic, plain uint32_t)
+    // instead of the old dedicated s_mount_expected_addr_slot0 variable.
+    s_slot_contexts[0].expected_addr = server_ip.addr;
 
     cyw43_arch_lwip_end();
 }
 
-// Fase 2 (mount pending-slot fix): sends slot 1's (O:) MOUNT request
-// over the SAME s_mount_pcb slot 0's own mount already created above --
-// never a second/parallel socket. Uses s_slot_contexts[1]'s
-// host/mount_path (populated by sidetnfs_probe_set_slot_context() before
-// this can ever be called) and the same protocol-conformant sequence
-// number 0 slot 0 uses -- tnfs_recv_callback() now tells the response
-// apart from slot 0's via s_mount_pending_slot, not via a distinct
-// sequence number (see that variable's own comment for why). A no-op
-// (s_slot1_mount_response_received stays false) if s_mount_pcb doesn't
-// exist yet or the host doesn't parse -- never touches s_state (slot 0)
-// either way.
-static void send_slot1_mount_request(void)
+// Fase 13 (generalized from Fase 2's send_slot1_mount_request()): sends
+// `slot`'s own MOUNT request over the SAME s_mount_pcb slot 0's own
+// mount already created above -- never a second/parallel socket. Uses
+// s_slot_contexts[slot]'s host/mount_path/port (populated by
+// sidetnfs_probe_set_slot_context() before this can ever be called) and
+// the same protocol-conformant sequence number 0 slot 0 uses --
+// tnfs_recv_callback() tells responses apart purely via
+// s_mount_pending_slot, not via a distinct sequence number (see that
+// variable's own comment for why). A no-op (response_received stays
+// false) if s_mount_pcb doesn't exist yet or the host doesn't parse --
+// never touches slot 0/s_state either way. Only ever called for slot >=
+// 1 -- slot 0 keeps using the unchanged sidetnfs_send_mount_probe()
+// above (see sidetnfs_probe_mount_runtime_slots()).
+static void send_slot_mount_request(int slot)
 {
-    s_slot1_mount_response_received = false;
-    s_slot1_mount_rc = 0xFF;
+    s_slot_contexts[slot].mount_pending = true;
+    s_slot_contexts[slot].response_received = false;
+    s_slot_contexts[slot].mount_result = 0xFF; // 0xFF: no response yet (not a real TNFS rc)
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-    sidetnfs_uart_diag()->slot1_mount_sent = true;
-    snprintf(sidetnfs_uart_diag()->slot1_host, SIDETNFS_HOST_LEN, "%s", s_slot_contexts[1].host);
-    snprintf(sidetnfs_uart_diag()->slot1_mount_path, SIDETNFS_MOUNTPATH_LEN, "%s", s_slot_contexts[1].mount_path);
-    sidetnfs_uart_diag()->slot1_port = s_slot_contexts[1].port;
+    // Fase 13: the existing SELECT-triggered diag snapshot's slot1_*
+    // fields predate this generalization and are still a fixed
+    // two-slot layout (see SidetnfsUartDiagSnapshot) -- out of scope to
+    // extend to N slots here, so only slot 1 still mirrors into it,
+    // exactly as before. Slots 2.. get the new compact boot-time
+    // logging instead (see sidetnfs_probe_mount_runtime_slots()).
+    if (slot == 1)
+    {
+        sidetnfs_uart_diag()->slot1_mount_sent = true;
+        snprintf(sidetnfs_uart_diag()->slot1_host, SIDETNFS_HOST_LEN, "%s", s_slot_contexts[1].host);
+        snprintf(sidetnfs_uart_diag()->slot1_mount_path, SIDETNFS_MOUNTPATH_LEN, "%s", s_slot_contexts[1].mount_path);
+        sidetnfs_uart_diag()->slot1_port = s_slot_contexts[1].port;
+    }
 #endif
 
     if (s_mount_pcb == NULL)
@@ -2281,18 +2434,21 @@ static void send_slot1_mount_request(void)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_slot_contexts[1].host, &server_ip))
+    if (!ipaddr_aton(s_slot_contexts[slot].host, &server_ip))
     {
+        // Fase 5 (virtual NET_ERR.TXT root): same capture as
+        // sidetnfs_send_mount_probe()'s own comment above.
+        s_slot_contexts[slot].host_unresolvable = true;
         return;
     }
 
     cyw43_arch_lwip_begin();
 
     // Same wire shape as slot 0's own MOUNT above (session=0x0000 --
-    // slot 1 is its own, brand-new TNFS session, never a continuation of
-    // slot 0's), only the sequence number and mount path differ.
+    // every slot is its own, brand-new TNFS session, never a
+    // continuation of another slot's), only the mount path differs.
     char canonical_mount_path[SIDETNFS_MOUNTPATH_LEN + 1];
-    build_canonical_mount_path(s_slot_contexts[1].mount_path, canonical_mount_path, sizeof(canonical_mount_path));
+    build_canonical_mount_path(s_slot_contexts[slot].mount_path, canonical_mount_path, sizeof(canonical_mount_path));
     size_t mount_path_len = strlen(canonical_mount_path) + 1;
     uint8_t buf[6 + SIDETNFS_MOUNTPATH_LEN + 1 + 2];
     buf[0] = 0x00;
@@ -2313,15 +2469,15 @@ static void send_slot1_mount_request(void)
         return;
     }
 
-    // Fase 2 (mount pending-slot fix): mark slot 1 as the pending MOUNT
-    // BEFORE the packet actually goes out -- same reasoning as slot 0's
-    // own send above.
-    s_mount_pending_slot = 1;
+    // Fase 2 (mount pending-slot fix): mark this slot as the pending
+    // MOUNT BEFORE the packet actually goes out -- same reasoning as
+    // slot 0's own send above.
+    s_mount_pending_slot = slot;
     memcpy(p->payload, buf, offset);
-    udp_sendto(s_mount_pcb, p, &server_ip, s_slot_contexts[1].port);
+    udp_sendto(s_mount_pcb, p, &server_ip, s_slot_contexts[slot].port);
     pbuf_free(p);
 
-    s_mount_expected_addr_slot1 = server_ip;
+    s_slot_contexts[slot].expected_addr = server_ip.addr;
 
     cyw43_arch_lwip_end();
 }
@@ -2346,15 +2502,18 @@ static bool wait_for_mount_response(const bool *response_flag)
 }
 
 // Fase 1 (multi-drive slot routing, TNFS mount sequencing): mounts every
-// valid TNFS/UDP runtime slot strictly one at a time -- slot 0 (N:, via
-// the existing, unchanged sidetnfs_send_mount_probe()) first, then,
-// only once its response has arrived or its wait has timed out, slot 1
-// (O:, if sidetnfs_probe_set_slot_context() marked it valid and
-// TNFS/UDP) over the SAME s_mount_pcb -- never in parallel, never a
-// second socket. A failed or timed-out slot 1 mount never touches slot
-// 0's own state (s_state is only ever written by the seq==0 branch of
-// tnfs_recv_callback()); a failed or timed-out slot 0 mount does not
-// skip the slot 1 attempt either -- each slot's outcome is independent.
+// every valid, TNFS/UDP runtime slot strictly one at a time -- slot 0
+// (via the existing, unchanged sidetnfs_send_mount_probe()) first, then,
+// only once its response has arrived or its wait has timed out, every
+// other valid TNFS/UDP slot in ascending slot order, over the SAME
+// s_mount_pcb -- never in parallel, never a second socket (the
+// underlying client still supports only one concurrent UDP round trip;
+// see send_slot_mount_request()'s own comment). SETTINGS/SD slots (or
+// any unpopulated slot) are silently skipped -- never mounted as TNFS. A
+// failed or timed-out mount of one slot never touches another slot's own
+// state (each slot's session fields live in its own s_slot_contexts[]
+// entry) and never skips the remaining slots -- every valid TNFS/UDP
+// slot always gets its own attempt regardless of earlier outcomes.
 //
 // Call this instead of sidetnfs_send_mount_probe() directly at the one
 // call site in gemdrvemul.c that starts network-dependent setup;
@@ -2363,35 +2522,53 @@ static bool wait_for_mount_response(const bool *response_flag)
 // scope for this phase).
 void sidetnfs_probe_mount_runtime_slots(void)
 {
-    sidetnfs_send_mount_probe();
-    bool slot0_ok = wait_for_mount_response(&s_state.mount_response_received);
-    // Fase 2 (mount pending-slot fix): clear the pending marker once this
-    // slot's bounded wait is over, whether it actually got a response or
-    // timed out -- an accepted response already cleared it to -1 inside
-    // tnfs_recv_callback(), so this is then a no-op; on a timeout it's
-    // the only place that clears it, so a late straggler arriving after
-    // we've moved on (e.g. once slot 1 becomes pending below) can never
-    // be mistaken for the slot that's pending next.
-    if (s_mount_pending_slot == 0)
+    if (s_slot_contexts[0].valid && s_slot_contexts[0].backend_type == SIDETNFS_DRIVE_TNFS &&
+        s_slot_contexts[0].transport == SIDETNFS_TRANSPORT_UDP)
     {
-        s_mount_pending_slot = -1;
-    }
-    DPRINTF("TNFS mount slot 0 (N:) path=%s: %s rc=%u sid=0x%04X\n",
-            s_active_mount_path, slot0_ok ? "responded" : "TIMED OUT",
-            s_state.mount_rc, s_state.sid);
-
-    if (s_slot_contexts[1].valid && s_slot_contexts[1].backend_type == SIDETNFS_DRIVE_TNFS &&
-        s_slot_contexts[1].transport == SIDETNFS_TRANSPORT_UDP)
-    {
-        send_slot1_mount_request();
-        bool slot1_ok = wait_for_mount_response(&s_slot1_mount_response_received);
-        if (s_mount_pending_slot == 1)
+        sidetnfs_send_mount_probe();
+        bool slot0_ok = wait_for_mount_response(&s_slot_contexts[0].response_received);
+        // Fase 2 (mount pending-slot fix): clear the pending marker once
+        // this slot's bounded wait is over, whether it actually got a
+        // response or timed out -- an accepted response already cleared
+        // it to -1 inside tnfs_recv_callback(), so this is then a no-op;
+        // on a timeout it's the only place that clears it, so a late
+        // straggler arriving after we've moved on to the next slot can
+        // never be mistaken for the slot that's pending next.
+        if (s_mount_pending_slot == 0)
         {
             s_mount_pending_slot = -1;
         }
-        DPRINTF("TNFS mount slot 1 (O:) path=%s: %s rc=%u sid=0x%04X\n",
-                s_slot_contexts[1].mount_path, slot1_ok ? "responded" : "TIMED OUT",
-                s_slot1_mount_rc, s_slot1_mount_sid);
+        DPRINTF("TNFS mount slot 0 (%s) path=%s: %s rc=%u sid=0x%04X\n",
+                s_slot_contexts[0].host, s_slot_contexts[0].mount_path,
+                slot0_ok ? "responded" : "TIMED OUT",
+                s_slot_contexts[0].mount_result, s_slot_contexts[0].session_id);
+#if SIDETNFS_ENABLE_DIAG_UART
+        printf("mount runtime 0: rc=%u sid=0x%04X %s\r\n", s_slot_contexts[0].mount_result,
+               s_slot_contexts[0].session_id, slot0_ok ? "responded" : "timeout");
+#endif
+    }
+
+    for (int slot = 1; slot < SIDETNFS_PROBE_MAX_RUNTIME_SLOTS; slot++)
+    {
+        if (!s_slot_contexts[slot].valid || s_slot_contexts[slot].backend_type != SIDETNFS_DRIVE_TNFS ||
+            s_slot_contexts[slot].transport != SIDETNFS_TRANSPORT_UDP)
+        {
+            continue; // SETTINGS/SD/unpopulated -- never mounted as TNFS
+        }
+        send_slot_mount_request(slot);
+        bool ok = wait_for_mount_response(&s_slot_contexts[slot].response_received);
+        if (s_mount_pending_slot == slot)
+        {
+            s_mount_pending_slot = -1;
+        }
+        DPRINTF("TNFS mount slot %d (%s) path=%s: %s rc=%u sid=0x%04X\n",
+                slot, s_slot_contexts[slot].host, s_slot_contexts[slot].mount_path,
+                ok ? "responded" : "TIMED OUT",
+                s_slot_contexts[slot].mount_result, s_slot_contexts[slot].session_id);
+#if SIDETNFS_ENABLE_DIAG_UART
+        printf("mount runtime %d: rc=%u sid=0x%04X %s\r\n", slot, s_slot_contexts[slot].mount_result,
+               s_slot_contexts[slot].session_id, ok ? "responded" : "timeout");
+#endif
     }
 }
 
@@ -3792,6 +3969,28 @@ void sidetnfs_tnfs_dta_release_all(void)
         }
     }
 }
+
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+// Fase 12B4 (SD-only slot diagnosis): read-only snapshot of one
+// s_tnfs_dta_searches[] registry slot, for SLOTDIAG.TXT. s_tnfs_dta_searches
+// is otherwise private to this file -- this is the only accessor. Never
+// mutates anything. Returns false (outputs untouched) if `index` is out
+// of range or that slot is not active.
+bool sidetnfs_tnfs_dta_search_snapshot(int index, uint32_t *out_ndta, int *out_runtime_slot)
+{
+    if (index < 0 || index >= (int)SIDETNFS_TNFS_DTA_SLOTS)
+    {
+        return false;
+    }
+    if (!s_tnfs_dta_searches[index].active)
+    {
+        return false;
+    }
+    if (out_ndta) *out_ndta = s_tnfs_dta_searches[index].ndta;
+    if (out_runtime_slot) *out_runtime_slot = s_tnfs_dta_searches[index].runtime_slot;
+    return true;
+}
+#endif // SIDETNFS_ENABLE_SD_SLOT_DUMP
 
 // Bounded-wait for a response matching expect_cmd+expect_seq. Any
 // stray/mismatched response is discarded (never misread as the answer to
@@ -5381,7 +5580,23 @@ static SidetnfsDirSearchResult fake_search_advance(SidetnfsFakeSearchSlot *searc
     search->next_index = 1;
     SidetnfsAtariDirEntry fake_entry;
     memset(&fake_entry, 0, sizeof(fake_entry));
-    strncpy(fake_entry.name, "NO_NETW.TXT", sizeof(fake_entry.name) - 1);
+    if (search->kind == SIDETNFS_FAKE_SEARCH_KIND_NET_ERR)
+    {
+        // Fase 5: correctly-sized (test E), per-slot, categorized
+        // virtual entry -- never the legacy fixed "NO_NETW.TXT"/size-0
+        // shape below, which stays exclusively for the non-TNFS/SD
+        // fallback (see sidetnfs_fake_search_start()/
+        // gemdrive_backend_fsfirst()'s own comment).
+        char net_err_text[SIDETNFS_NET_ERR_TEXT_MAX];
+        size_t net_err_len = sidetnfs_build_net_err_text(search->slot, search->driveletter, search->wifi_ok,
+                                                            net_err_text, sizeof(net_err_text));
+        strncpy(fake_entry.name, SIDETNFS_NET_ERR_NAME, sizeof(fake_entry.name) - 1);
+        fake_entry.size = (uint32_t)net_err_len;
+    }
+    else
+    {
+        strncpy(fake_entry.name, "NO_NETW.TXT", sizeof(fake_entry.name) - 1);
+    }
     fake_entry.attr = 0; // plain file
     fake_entry.valid = true;
     if (sidetnfs_gemdos_pattern_match(fake_entry.name, search->pattern) &&
@@ -5429,6 +5644,40 @@ SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *pa
     strncpy(search->pattern, pattern, sizeof(search->pattern) - 1);
     search->attribs = attribs;
     search->active = true;
+    // search->kind stays SIDETNFS_FAKE_SEARCH_KIND_LEGACY_NO_NETWORK (0,
+    // already zeroed by the memset above) -- this function's own
+    // behavior/output is otherwise completely unchanged by Fase 5.
+
+    return fake_search_advance(search, out_entry);
+}
+
+// Fase 5 (virtual NET_ERR.TXT root): sibling of sidetnfs_fake_search_start()
+// above for an ENABLED TNFS drive that isn't ready -- see this file's own
+// header comment in sidetnfs_probe.h. Shares find_search_slot()/
+// alloc_search_slot()/diag_log_search_overwrite_if_needed() with the
+// legacy path unchanged.
+SidetnfsDirSearchResult sidetnfs_net_err_search_start(uint32_t ndta, int slot, char driveletter, bool wifi_ok,
+                                                        const char *path, const char *pattern, uint8_t attribs,
+                                                        SidetnfsAtariDirEntry *out_entry)
+{
+    sidetnfs_diag_log(SIDETNFS_DIAG_FAKE_SEARCH_START, ndta, path, pattern, NULL, 0, 0, 0, attribs);
+
+    SidetnfsFakeSearchSlot *search = find_search_slot(ndta);
+    if (!search)
+    {
+        search = alloc_search_slot();
+    }
+    diag_log_search_overwrite_if_needed(search, ndta, path);
+    memset(search, 0, sizeof(*search));
+    search->ndta = ndta;
+    strncpy(search->path, path, sizeof(search->path) - 1);
+    strncpy(search->pattern, pattern, sizeof(search->pattern) - 1);
+    search->attribs = attribs;
+    search->active = true;
+    search->kind = SIDETNFS_FAKE_SEARCH_KIND_NET_ERR;
+    search->slot = slot;
+    search->driveletter = driveletter;
+    search->wifi_ok = wifi_ok;
 
     return fake_search_advance(search, out_entry);
 }
@@ -5992,6 +6241,10 @@ void sidetnfs_uart_diag_dump(void)
            d->ddelete_dta_close_requested_path, (unsigned)d->ddelete_dta_close_matches,
            (long)d->ddelete_dta_close_matched_slot, (unsigned)d->ddelete_dta_close_last_rc);
 
+    printf("SETTINGS disk: config_source=%s fallback_reason=%u drive_letter=%c runtime_slot=%ld\r\n",
+           d->settings_config_source == 0 ? "flash" : "default", (unsigned)d->settings_fallback_reason,
+           d->settings_drive_letter ? d->settings_drive_letter : '-', (long)d->settings_runtime_slot);
+
     printf("===== END SNAPSHOT =====\r\n");
 }
 
@@ -6322,6 +6575,14 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder)
                     (unsigned long)d->ddelete_dta_close_calls, (long)d->ddelete_dta_close_requested_slot,
                     d->ddelete_dta_close_requested_path, (unsigned)d->ddelete_dta_close_matches,
                     (long)d->ddelete_dta_close_matched_slot, (unsigned)d->ddelete_dta_close_last_rc);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+
+    len = snprintf(line, sizeof(line), "SETTINGS disk: config_source=%s fallback_reason=%u drive_letter=%c runtime_slot=%ld\r\n",
+                    d->settings_config_source == 0 ? "flash" : "default", (unsigned)d->settings_fallback_reason,
+                    d->settings_drive_letter ? d->settings_drive_letter : '-', (long)d->settings_runtime_slot);
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);

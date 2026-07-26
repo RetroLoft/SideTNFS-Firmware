@@ -186,6 +186,18 @@
 #define GEMDRVEMUL_DTA_EXIST_CALL (APP_GEMDRVEMUL << 8 | 0x8A)   // Check if the DTA exists in the rp2040 memory
 #define GEMDRVEMUL_DTA_RELEASE_CALL (APP_GEMDRVEMUL << 8 | 0x8B) // Release the DTA from the rp2040 memory
 
+// Fase 9A: controlled Pico reboot. Subcommand 0x1B, re-verified free in
+// both this file (highest used low code before this addition was
+// 0x1A/FSETDTA_CALL, next used is 0x36/DFREE_CALL -- 0x1B-0x35 free) and
+// the reference Atari driver (sidecart-gemdrive-atari/src/gemdrive.s
+// CMD_* table, highest used code there is 0x0C/0x8B; nothing defined at
+// 0x1B). No request payload, no SAVE of any kind (drive/network/RTC
+// config or flash defaults) -- only ever reads the already-persisted
+// configuration on the next boot, exactly like any other reset. Response:
+// the existing generic ACK (write_random_token()) only, written BEFORE a
+// short fixed delay and watchdog_reboot() -- see gemdrvemul.c's handler.
+#define GEMDRVEMUL_REBOOT_PICO (APP_GEMDRVEMUL << 8 | 0x1B) // Reboot the Pico (ACK first, no SAVE)
+
 typedef struct
 {
     unsigned int value;

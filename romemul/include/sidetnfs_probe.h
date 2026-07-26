@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h> // size_t -- sidetnfs_build_net_err_text()
 
 #include "sidetnfs_config.h" // sidetnfs_drive_config_t -- see sidetnfs_slot_tnfs_context_t below
 
@@ -277,50 +278,70 @@ char sidetnfs_probe_get_active_drive_letter(void);
 // report for the cross-check this relies on.
 #define SIDETNFS_PROBE_MAX_RUNTIME_SLOTS 9
 
-// Fase 1 (multi-drive slot routing): per-slot TNFS/backend identity --
+// Fase 13 (generic multi-slot runtime publication/mount, per the runtime-
+// drive-publication audit): per-slot TNFS/backend identity --
 // host/port/mount_path/sd_path/backend/transport, structurally mirrored
 // from a slot's persisted sidetnfs_drive_config_t (see
-// sidetnfs_probe_set_slot_context()). session_id/session_established are
-// the one piece of state this struct does NOT get from the config record
-// -- they only ever reflect a real, already-established TNFS session, set
-// by sidetnfs_probe_mount_runtime_slots() sequentially mounting each
-// valid slot (slot 0 via the existing single-session client state,
-// slot 1 via its own, separate MOUNT request/response over the same
-// PCB -- see that function). The underlying client still supports only
-// one *concurrent* session (see sidetnfs_probe_mount_runtime_slots()'s
-// own comment) -- slots 0 and 1 are mounted one after another, not at
-// the same time, but each keeps its own resulting session id afterward.
-// Slots 2.. are never populated in this phase.
+// sidetnfs_probe_set_slot_context()), PLUS this slot's own MOUNT session
+// administration -- replaces the old two hardcoded variable pairs
+// (s_slot1_mount_sid/rc/response_received and
+// s_mount_expected_addr_slot0/slot1 in sidetnfs_probe.c) with one set of
+// fields per slot, for every slot 0..SIDETNFS_PROBE_MAX_RUNTIME_SLOTS-1,
+// not just 0/1. Populated by sidetnfs_probe_mount_runtime_slots() (mount
+// send) and tnfs_recv_callback() (response attribution) -- see both.
+// Slot 0 additionally still mirrors into the legacy single-session
+// s_state fields for the handful of pre-existing, out-of-scope
+// subsystems that read those directly (status window, directory
+// browsing) -- see tnfs_recv_callback()'s own comment.
 typedef struct
 {
-    bool valid;                                    // true once sidetnfs_probe_set_slot_context() has populated this slot
+    bool valid;                                    // true once sidetnfs_probe_set_slot_context() has populated this slot ("configured")
     uint8_t backend_type;                           // sidetnfs_drive_type_t
     uint8_t transport;                               // sidetnfs_transport_t (TNFS only)
     char host[SIDETNFS_HOST_LEN];                    // TNFS only
     uint16_t port;                                   // TNFS only
     char mount_path[SIDETNFS_MOUNTPATH_LEN];         // TNFS only, e.g. "/Atari.ST" or "/DOS"
     char sd_path[SIDETNFS_SDPATH_LEN];               // SD only
-    uint16_t session_id;                             // meaningful only when session_established
-    bool session_established;                        // true once that slot's own MOUNT has actually succeeded
+
+    // --- per-slot MOUNT session administration (Fase 13) ---
+    bool mount_pending;        // true while this slot's own MOUNT request is outstanding
+    bool response_received;    // true once *a* MOUNT response (success or failure) has arrived for this slot
+    uint8_t mount_result;      // raw TNFS rc byte from that response; meaningful only if response_received
+    uint32_t expected_addr;    // raw IPv4 address (matches lwIP ip_addr_t.addr) this slot's outstanding MOUNT was sent to -- plain uint32_t, not ip_addr_t, so this header stays free of an lwIP dependency
+
+    uint16_t session_id;       // meaningful only when session_established
+    bool session_established;  // true once response_received && mount_result == TNFS_OK (TNFS_OK == 0)
+
+    // Fase 5 (virtual NET_ERR.TXT root): true once this slot's own MOUNT
+    // send ever found host[] did not parse as a dotted-decimal IP
+    // (ipaddr_aton() failure in send_slot_mount_request()/
+    // sidetnfs_send_mount_probe()) -- captures that existing, previously
+    // discarded check instead of inventing a new one; the closest honest
+    // equivalent to "DNS mislukt" this codebase has, since TNFS hosts are
+    // always raw IPs here and no real DNS resolution ever happens for a
+    // TNFS mount. Reset to false whenever this slot is repopulated (see
+    // sidetnfs_probe_set_slot_context()'s memset).
+    bool host_unresolvable;
 } sidetnfs_slot_tnfs_context_t;
 
 // Populates slot `slot`'s host/port/mount_path/sd_path/backend/transport
 // from *cfg (a full copy, not a reference -- *cfg may be a stack-local
 // the caller reuses/frees right after this call). No network/TNFS
-// activity of any kind -- pure data copy. Does not touch
-// session_id/session_established (see sidetnfs_probe_get_slot_context()).
-// No-op if slot is out of range or cfg is NULL.
+// activity of any kind -- pure data copy. Resets this slot's own MOUNT
+// session administration fields (mount_pending/response_received/
+// mount_result/session_id/session_established) to their not-yet-mounted
+// defaults -- callers repopulating a slot (e.g. GEMDRVEMUL_PING reinit)
+// must not carry a stale session forward. No-op if slot is out of range
+// or cfg is NULL.
 void sidetnfs_probe_set_slot_context(int slot, const sidetnfs_drive_config_t *cfg);
 
-// Fills *out with slot `slot`'s context; returns false (out untouched) if
-// the slot is out of range or was never populated via
-// sidetnfs_probe_set_slot_context(). session_id/session_established are
-// overlaid read-only at call time -- for slot 0, from the existing
-// single-session TNFS client state (s_state.sid/mount_response_received/
-// mount_rc); for slot 1, from its own MOUNT response state, set by
-// sidetnfs_probe_mount_runtime_slots(). Both are always the live value,
-// never stale. Every slot 2.. always reports session_established ==
-// false (never populated in this phase).
+// Fills *out with slot `slot`'s full context, including its own live
+// MOUNT session state; returns false (out untouched) if the slot is out
+// of range or was never populated via sidetnfs_probe_set_slot_context().
+// Fase 13: no longer special-cases slot 0/1 -- every valid TNFS slot's
+// session_id/session_established/mount_result/response_received/
+// mount_pending are read directly from *out's own stored fields, kept
+// live by sidetnfs_probe_mount_runtime_slots()/tnfs_recv_callback().
 bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out);
 
 // Fase 9E: re-activate the SideTNFS drive-list config at the proven
@@ -341,6 +362,14 @@ void sidetnfs_probe_reinit_active_server(bool wifi_connected);
 // used by sidetnfs_probe_reinit_active_server() so no directory handle
 // from the OLD server/session is left open across an Atari reset.
 void sidetnfs_tnfs_dta_release_all(void);
+
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+// Fase 12B4 (SD-only slot diagnosis, SLOTDIAG.TXT): read-only snapshot of
+// one s_tnfs_dta_searches[] registry slot (index 0..SIDETNFS_TNFS_DTA_SLOTS-1).
+// Returns false (outputs untouched) if index is out of range or that
+// slot isn't currently active. Never mutates anything.
+bool sidetnfs_tnfs_dta_search_snapshot(int index, uint32_t *out_ndta, int *out_runtime_slot);
+#endif
 
 // Fase 5B: create a UDP PCB and udp_connect() it to the TNFS server, then
 // immediately remove it again. Sends no payload at all -- udp_connect() is a
@@ -524,6 +553,71 @@ bool sidetnfs_tnfs_listing_ready(void);
 SidetnfsDirSearchResult sidetnfs_fake_search_start(uint32_t ndta, const char *path,
                                                      const char *pattern, uint8_t attribs,
                                                      SidetnfsAtariDirEntry *out_entry);
+
+// Fase 5 (virtual NET_ERR.TXT root): per-runtime-drive error status, for
+// an ENABLED TNFS drive whose backend is currently unusable. Every
+// ENABLED drive stays published; when it isn't ready this is what
+// distinguishes WHY, using only signals sidetnfs_slot_tnfs_context_t
+// already carries (see sidetnfs_probe_classify_slot_error() below) --
+// no invented TNFS error codes. SIDETNFS_DRIVE_ERR_NONE means the slot's
+// own TNFS session is live and the real directory should be served.
+typedef enum
+{
+    SIDETNFS_DRIVE_ERR_NONE = 0,
+    SIDETNFS_DRIVE_ERR_NO_WIFI,             // WiFi not connected this boot (global)
+    SIDETNFS_DRIVE_ERR_DNS_FAILED,          // host[] did not parse as an IP (ipaddr_aton() failure)
+    SIDETNFS_DRIVE_ERR_SERVER_UNREACHABLE,  // MOUNT sent, no response within the bounded wait (timeout)
+    SIDETNFS_DRIVE_ERR_MOUNT_FAILED,        // MOUNT response received, rc != TNFS_OK
+    SIDETNFS_DRIVE_ERR_NO_SESSION,          // slot has no valid session context at all (never populated)
+} SidetnfsDriveErrorCategory;
+
+// Classifies why runtime slot `slot`'s TNFS session isn't (yet) usable,
+// purely from wifi_ok (the caller's already-known, once-per-boot WiFi
+// state) and this slot's own sidetnfs_slot_tnfs_context_t -- never sends
+// network traffic, never blocks. Categories are checked in a fixed
+// priority order (no WiFi first, then DNS/host-parse, then timeout, then
+// mount-failed, then no-session-at-all) so exactly one category is ever
+// reported for a given state.
+SidetnfsDriveErrorCategory sidetnfs_probe_classify_slot_error(int slot, bool wifi_ok);
+
+// Short, fixed, human-readable label for a category (e.g. "NO WIFI"),
+// for NET_ERR.TXT's own body text -- never NULL, never allocates.
+const char *sidetnfs_drive_error_category_text(SidetnfsDriveErrorCategory category);
+
+// Fase 5: exact filename shown for a not-ready ENABLED TNFS drive's
+// virtual root -- Fsfirst/Fsnext ever produce exactly this one entry,
+// nothing else (no "."/".."), for such a drive.
+#define SIDETNFS_NET_ERR_NAME "NET_ERR.TXT"
+// Generous fixed upper bound for the generated NET_ERR.TXT body --
+// large enough for every field (host/port/mount path/category text)
+// with room to spare; sidetnfs_build_net_err_text() always
+// NUL-terminates and never writes past out_size.
+#define SIDETNFS_NET_ERR_TEXT_MAX 256
+
+// Builds NET_ERR.TXT's body text for runtime slot `slot` (driveletter/
+// wifi_ok supplied by the caller -- gemdrvemul.c already knows both
+// without a second lookup here) into out[0..out_size). Always
+// NUL-terminates. Returns the text length actually written (excluding
+// the NUL), which is also the exact file size Fsfirst/Fopen must report
+// -- the two must never disagree (see report, test E). Pure formatting,
+// no network/RAM-search side effects.
+size_t sidetnfs_build_net_err_text(int slot, char driveletter, bool wifi_ok, char *out, size_t out_size);
+
+// Fase 5: sibling of sidetnfs_fake_search_start() above, for an ENABLED
+// TNFS slot that isn't ready (see sidetnfs_probe_classify_slot_error())
+// rather than the legacy "no SD listing backend yet" fallback --
+// produces exactly one synthetic entry, SIDETNFS_NET_ERR_NAME, sized via
+// sidetnfs_build_net_err_text() for this specific slot/driveletter/
+// wifi_ok, instead of the fixed "NO_NETW.TXT"/size-0 entry
+// sidetnfs_fake_search_start() always produces. Shares the same
+// fixed-size search-slot table and every other consumer
+// (sidetnfs_fake_search_next()/is_active()/close()/close_all()/
+// count_active()) unchanged -- those are kind-agnostic, so
+// GEMDRVEMUL_FSNEXT_CALL/DTA_EXIST/DTA_RELEASE need no awareness of
+// which kind of synthetic listing is active for a given ndta.
+SidetnfsDirSearchResult sidetnfs_net_err_search_start(uint32_t ndta, int slot, char driveletter, bool wifi_ok,
+                                                        const char *path, const char *pattern, uint8_t attribs,
+                                                        SidetnfsAtariDirEntry *out_entry);
 
 // Fase 5Y: start a TNFS directory search for ndta -- OPENDIRX for path,
 // then a bounded READDIRX loop (SIDETNFS_READDIRX_MAX_ENTRIES entries per
@@ -1717,6 +1811,20 @@ typedef struct
     uint16_t ddelete_dta_close_matches;
     int32_t ddelete_dta_close_matched_slot; // -1 if no match this call
     uint8_t ddelete_dta_close_last_rc;
+
+    // Fase 12A (SETTINGS disk integration): recorded once, at boot/reinit,
+    // by sidetnfs_runtime_drives_init()/init_gemdrvemul(). config_source
+    // and fallback_reason mirror sidetnfs_config_loaded_from_flash()/
+    // sidetnfs_config_get_fallback_reason() (see sidetnfs_config.h) --
+    // 0 = flash, 1 = factory default in RAM for config_source;
+    // fallback_reason is the raw sidetnfs_config_fallback_reason_t value
+    // (0 = none). settings_slot is the runtime slot
+    // sidetnfs_runtime_drives_init() actually appended the SETTINGS disk
+    // at this boot -- never assumed to be a fixed index.
+    uint8_t settings_config_source; // 0 = flash, 1 = factory default
+    uint8_t settings_fallback_reason;
+    char settings_drive_letter;
+    int32_t settings_runtime_slot;
 } SidetnfsUartDiagSnapshot;
 
 // Returns a pointer to the single static instance -- callers in

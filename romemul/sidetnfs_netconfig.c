@@ -1,11 +1,11 @@
 /**
  * File: sidetnfs_netconfig.c
- * Description: Fase 11A -- see sidetnfs_netconfig.h. Reuses configData
- * (romemul/config.c) and the existing PARAM_WIFI_* entries/8KB CONFIG_FLASH
- * sector; never a second flash sector. GET/validate never touch flash;
- * SAVE is the only function here that does (via write_all_entries(),
- * itself fixed in this same phase for its own 256-byte program-length
- * requirement -- see config.c).
+ * Description: Fase 11A -- see sidetnfs_netconfig.h. Fase 2: storage
+ * backend switched from the old ConfigEntry store (romemul/config.c) to
+ * the independent sidetnfs_system_config module -- this file no longer
+ * includes config.h or calls find_entry()/put_string()/put_bool()/
+ * put_integer()/write_all_entries() at all. Wire-protocol struct,
+ * validation rules, and RAM staging are all unchanged from before.
  */
 #include "include/sidetnfs_netconfig.h"
 
@@ -13,54 +13,42 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "include/config.h"
+#include "include/sidetnfs_system_config.h"
 #include "lwip/ip_addr.h"
 
 static sidetnfs_network_config_t g_staging;
 static bool g_staged = false;
 
-static void get_string_field(const char *key, char *out, size_t out_size)
-{
-    ConfigEntry *e = find_entry(key);
-    if (e != NULL)
-    {
-        strncpy(out, e->value, out_size - 1);
-    }
-    out[out_size - 1] = '\0';
-}
-
 void sidetnfs_netconfig_get(sidetnfs_network_config_t *out)
 {
     memset(out, 0, sizeof(*out));
 
-    ConfigEntry *auth_entry = find_entry(PARAM_WIFI_AUTH);
-    out->auth_mode = (uint16_t)((auth_entry != NULL && strlen(auth_entry->value) > 0) ? atoi(auth_entry->value) : 0);
+    sidetnfs_system_settings_t sys;
+    sidetnfs_system_config_get(&sys);
 
-    ConfigEntry *dhcp_entry = find_entry(PARAM_WIFI_DHCP);
-    out->use_dhcp = (uint16_t)((dhcp_entry != NULL && (dhcp_entry->value[0] == 't' || dhcp_entry->value[0] == 'T')) ? 1 : 0);
+    out->auth_mode = sys.auth_mode;
+    out->use_dhcp = sys.use_dhcp;
+    strncpy(out->ssid, sys.ssid, sizeof(out->ssid) - 1);
+    strncpy(out->password, sys.password, sizeof(out->password) - 1);
 
-    get_string_field(PARAM_WIFI_SSID, out->ssid, sizeof(out->ssid));
-    get_string_field(PARAM_WIFI_PASSWORD, out->password, sizeof(out->password));
-
-    ConfigEntry *country_entry = find_entry(PARAM_WIFI_COUNTRY);
-    if (country_entry != NULL && strlen(country_entry->value) > 0)
+    // Fase 11A: an empty stored country means "never configured" --
+    // normalized to "XX" for display/editing (sidetnfs_system_config's
+    // own factory defaults already store "XX" for this same reason, so
+    // this only matters for a legacy-migrated value that happened to be
+    // empty).
+    if (strlen(sys.country) > 0)
     {
-        strncpy(out->country, country_entry->value, sizeof(out->country) - 1);
-        out->country[sizeof(out->country) - 1] = '\0';
+        strncpy(out->country, sys.country, sizeof(out->country) - 1);
     }
     else
     {
-        // Fase 11A: an empty stored country means "never configured" --
-        // normalized to "XX" for display/editing, same worldwide default
-        // get_country_code() itself falls back to. The flash entry itself
-        // is left untouched (this is a read-only command).
         strncpy(out->country, "XX", sizeof(out->country) - 1);
     }
 
-    get_string_field(PARAM_WIFI_IP, out->ip_address, sizeof(out->ip_address));
-    get_string_field(PARAM_WIFI_NETMASK, out->netmask, sizeof(out->netmask));
-    get_string_field(PARAM_WIFI_GATEWAY, out->gateway, sizeof(out->gateway));
-    get_string_field(PARAM_WIFI_DNS, out->primary_dns, sizeof(out->primary_dns));
+    strncpy(out->ip_address, sys.ip_address, sizeof(out->ip_address) - 1);
+    strncpy(out->netmask, sys.netmask, sizeof(out->netmask) - 1);
+    strncpy(out->gateway, sys.gateway, sizeof(out->gateway) - 1);
+    strncpy(out->primary_dns, sys.primary_dns, sizeof(out->primary_dns) - 1);
 }
 
 // True if the field's NUL terminator was found strictly within its buffer
@@ -167,28 +155,6 @@ bool sidetnfs_netconfig_is_staged(void)
     return g_staged;
 }
 
-// Linear lookup against an arbitrary ConfigData block (e.g. a flash
-// readback), not the live global configData -- find_entry() in config.c
-// only ever searches the live global, so SAVE's readback verification
-// needs its own copy of the same simple scan.
-static ConfigEntry *find_entry_in(ConfigData *data, const char *key)
-{
-    for (size_t i = 0; i < data->count; i++)
-    {
-        if (strncmp(data->entries[i].key, key, MAX_KEY_LENGTH) == 0)
-        {
-            return &data->entries[i];
-        }
-    }
-    return NULL;
-}
-
-static bool readback_field_matches(ConfigData *readback, const char *key, const char *expected)
-{
-    ConfigEntry *entry = find_entry_in(readback, key);
-    return entry != NULL && strcmp(entry->value, expected) == 0;
-}
-
 sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
 {
     if (!g_staged)
@@ -197,9 +163,9 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
     }
 
     // Fase 11A: re-validate the staged copy in full before touching
-    // configData/flash at all -- defense in depth, since stage() already
-    // validated it once, but nothing else in this module can have
-    // mutated g_staging in between.
+    // sidetnfs_system_config at all -- defense in depth, since stage()
+    // already validated it once, but nothing else in this module can
+    // have mutated g_staging in between.
     sidetnfs_netconfig_status_t result = sidetnfs_netconfig_validate(&g_staging);
     if (result != SIDETNFS_NETCONFIG_STATUS_OK)
     {
@@ -208,9 +174,7 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
 
     // Clean local copy: guarantees NUL-termination and uppercases country,
     // independent of what was already true of the (already-validated)
-    // staging copy -- same "build a clean temp before writing anything
-    // real" shape sidetnfs_config_save() uses for its own clean/candidate
-    // struct.
+    // staging copy.
     sidetnfs_network_config_t clean = g_staging;
     clean.ssid[sizeof(clean.ssid) - 1] = '\0';
     clean.password[sizeof(clean.password) - 1] = '\0';
@@ -222,49 +186,50 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
     clean.gateway[sizeof(clean.gateway) - 1] = '\0';
     clean.primary_dns[sizeof(clean.primary_dns) - 1] = '\0';
 
-    char auth_str[8];
-    snprintf(auth_str, sizeof(auth_str), "%d", (int)clean.auth_mode);
-    const char *dhcp_str = clean.use_dhcp ? "true" : "false";
+    // Fase 2: read the current full system settings first, so the RTC
+    // fields (owned by sidetnfs_rtcconfig.c, sharing the same underlying
+    // sidetnfs_system_flash_t) are preserved exactly as they were --
+    // this SAVE only ever touches the WiFi/Network fields.
+    sidetnfs_system_settings_t sys;
+    sidetnfs_system_config_get(&sys);
 
-    put_integer(PARAM_WIFI_AUTH, (int)clean.auth_mode);
-    put_bool(PARAM_WIFI_DHCP, clean.use_dhcp != 0);
-    put_string(PARAM_WIFI_SSID, clean.ssid);
-    put_string(PARAM_WIFI_PASSWORD, clean.password);
-    put_string(PARAM_WIFI_COUNTRY, clean.country);
-    put_string(PARAM_WIFI_IP, clean.ip_address);
-    put_string(PARAM_WIFI_NETMASK, clean.netmask);
-    put_string(PARAM_WIFI_GATEWAY, clean.gateway);
-    put_string(PARAM_WIFI_DNS, clean.primary_dns);
+    sys.auth_mode = clean.auth_mode;
+    sys.use_dhcp = clean.use_dhcp;
+    strncpy(sys.ssid, clean.ssid, sizeof(sys.ssid) - 1);
+    sys.ssid[sizeof(sys.ssid) - 1] = '\0';
+    strncpy(sys.password, clean.password, sizeof(sys.password) - 1);
+    sys.password[sizeof(sys.password) - 1] = '\0';
+    strncpy(sys.country, clean.country, sizeof(sys.country) - 1);
+    sys.country[sizeof(sys.country) - 1] = '\0';
+    strncpy(sys.ip_address, clean.ip_address, sizeof(sys.ip_address) - 1);
+    sys.ip_address[sizeof(sys.ip_address) - 1] = '\0';
+    strncpy(sys.netmask, clean.netmask, sizeof(sys.netmask) - 1);
+    sys.netmask[sizeof(sys.netmask) - 1] = '\0';
+    strncpy(sys.gateway, clean.gateway, sizeof(sys.gateway) - 1);
+    sys.gateway[sizeof(sys.gateway) - 1] = '\0';
+    strncpy(sys.primary_dns, clean.primary_dns, sizeof(sys.primary_dns) - 1);
+    sys.primary_dns[sizeof(sys.primary_dns) - 1] = '\0';
 
-    if (write_all_entries() != 0)
+    sidetnfs_system_config_status_t set_result = sidetnfs_system_config_set(&sys);
+    if (set_result != SIDETNFS_SYSCONFIG_STATUS_OK)
     {
+        // Structure validation inside sidetnfs_system_config_set() is
+        // deliberately light (see its own doc comment) -- this module
+        // already validated everything semantically above, so reaching
+        // this branch would indicate an internal inconsistency, not a
+        // user input error. Reported as a write failure rather than
+        // silently ignored.
         return SIDETNFS_NETCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
-    // Real XIP readback -- re-read the bytes actually committed to flash
-    // (not the live in-RAM configData, which trivially already matches
-    // what was just written) -- same proof-of-write sidetnfs_config_save()
-    // performs for its own, separate flash sector. static: sizeof(ConfigData)
-    // is far too large for the 4KB stack (see config.c's write_all_entries()
-    // report note for the same reasoning).
-    const uint8_t *flash_ptr = (const uint8_t *)(XIP_BASE + CONFIG_FLASH_OFFSET);
-    static ConfigData readback;
-    memcpy(&readback, flash_ptr, sizeof(readback));
-
-    bool ok = true;
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_AUTH, auth_str);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_DHCP, dhcp_str);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_SSID, clean.ssid);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_PASSWORD, clean.password);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_COUNTRY, clean.country);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_IP, clean.ip_address);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_NETMASK, clean.netmask);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_GATEWAY, clean.gateway);
-    ok = ok && readback_field_matches(&readback, PARAM_WIFI_DNS, clean.primary_dns);
-
-    if (!ok)
+    sidetnfs_system_config_status_t save_result = sidetnfs_system_config_save();
+    if (save_result == SIDETNFS_SYSCONFIG_STATUS_CRC_MISMATCH)
     {
         return SIDETNFS_NETCONFIG_STATUS_FLASH_VERIFY_FAILED;
+    }
+    if (save_result != SIDETNFS_SYSCONFIG_STATUS_OK)
+    {
+        return SIDETNFS_NETCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
     // Fase 11A: deliberately does NOT touch the active WiFi connection --

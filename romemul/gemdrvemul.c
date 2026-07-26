@@ -9,6 +9,7 @@
 #include "include/gemdrvemul.h"
 #include "include/sidetnfs_probe.h"
 #include "include/sidetnfs_config_drive_backend.h"
+#include "include/sidetnfs_sd_service.h"
 
 // Fase (TNFS Dfree fictitious-capacity fix): fixed, TOS-safe GEMDOS Dfree
 // geometry reported for TNFS-backed runtime drives only (see
@@ -85,9 +86,43 @@ typedef struct
     bool valid;
     uint32_t drive_number;          // GEMDOS 0-based drive number (0=A .. 25=Z), meaningful only if valid
     sidetnfs_drive_config_t config; // full persisted config record, meaningful only if valid
+    // Fase 12A (SETTINGS disk integration): which backend actually serves
+    // this slot -- GEMDRIVE_FILE_BACKEND_TNFS or GEMDRIVE_FILE_BACKEND_SD
+    // for a slot built from the persisted drives[] list (derived from
+    // that record's own .type, see sidetnfs_runtime_drives_init()), or
+    // GEMDRIVE_FILE_BACKEND_CONFIG_FLASH for the always-present, read-only
+    // local SETTINGS disk slot appended last by sidetnfs_runtime_drives_init().
+    // Every GEMDOS handler that resolves a slot must branch on this field
+    // instead of assuming "every runtime slot is a TNFS session" -- see
+    // report.
+    GemdriveFileBackend backend;
+    // Fase 13 (runtime-drive-publication audit follow-up): which of the
+    // SIDETNFS_MAX_DRIVES persisted config slots (0..7) this runtime
+    // entry's data came from -- -1 for the SETTINGS slot (never one of
+    // the eight) and for any slot without a real backing config record.
+    // runtime_slot, config_slot, and the TNFS session index
+    // (s_slot_contexts[] in sidetnfs_probe.c, indexed by runtime_slot,
+    // never by config_slot) are three independently meaningful numbers
+    // that must never be assumed equal -- this field is the explicit,
+    // persisted record of the runtime_slot -> config_slot mapping; see
+    // report.
+    int config_slot;
 } sidetnfs_runtime_drive_t;
 
 static sidetnfs_runtime_drive_t g_runtime_drives[GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES];
+
+// Fase 12A: true iff `slot` is valid and its backend is the local SETTINGS
+// disk -- the one helper every routing call site below uses instead of
+// re-deriving this from g_runtime_drives directly, so the "which field
+// means what" decision lives in exactly one place.
+static bool sidetnfs_runtime_slot_is_settings(int slot)
+{
+    if (slot < 0 || slot >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
+    {
+        return false;
+    }
+    return g_runtime_drives[slot].valid && g_runtime_drives[slot].backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH;
+}
 
 // Fase 1 (multi-drive slot routing, TNFS runtime context): sidetnfs_probe.h
 // cannot include gemdrvemul.h (the dependency already goes the other way),
@@ -117,12 +152,33 @@ static FileDescriptors *fdescriptors = NULL; // Initialize the head of the list 
 static PD *pexec_pd = NULL;
 static ExecHeader *pexec_exec_header = NULL;
 
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+// Fase 12B4 (SD-only slot diagnosis, SLOTDIAG.TXT): call counters and
+// last-seen state for the three SideTNFS config-protocol commands most
+// relevant to the "did a toggle silently touch the firmware" question
+// (see report). Incremented only at each command's own case handler,
+// never read/reset anywhere else in this build.
+static uint32_t g_get_drive_calls = 0;
+static uint32_t g_get_drive_last_index = 0xFFFFFFFF;
+static uint32_t g_get_drive_last_status = 0xFFFFFFFF;
+static uint32_t g_set_drive_calls = 0;
+static uint32_t g_save_config_calls = 0;
+#endif
+
 // Y2K patch
 static bool y2k_patch_enabled = false;
 
 // XBIOS vector
 static uint32_t xbios_trap_address_old = 0;
 static bool xbios_reentry_locked = false;
+
+// Fase 9A (Pico-resetcommando): guards GEMDRVEMUL_REBOOT_PICO against a
+// second concurrent request -- the delay/watchdog_reboot() sequence below
+// never returns to the command loop, so in practice this only matters if
+// a duplicate request is already queued at the moment the first one is
+// dispatched.
+#define SIDETNFS_REBOOT_PICO_DELAY_MS 1500
+static bool sidetnfs_reboot_pico_pending = false;
 
 static inline void __not_in_flash_func(generate_random_token_seed)(const TransmissionProtocol *protocol)
 {
@@ -653,6 +709,30 @@ static void __not_in_flash_func(add_tnfs_file)(FileDescriptors **head, FileDescr
     DPRINTF("TNFS file %s added with fd %i, tnfs handle %u, writable %d\n", fpath, new_fd, tnfs_handle, (int)writable);
 }
 
+// Fase 7 (SD-mounts als volledige runtime-backend): parallel to
+// add_tnfs_file() above, for a real, per-runtime-slot SD/FatFS open file.
+// fpath is the full FatFS path (e.g. "0:/hd/GAMES/TEST.PRG", already
+// built by sidetnfs_sd_build_fatfs_path()) -- scfs_stat()/f_utime() calls
+// elsewhere (Fattrib/Fdatime) read it back directly, same contract the
+// pre-existing single-drive SD/FatFS code already relied on. Unlike
+// add_tnfs_file(), fobject is a REAL FIL already opened by the caller via
+// f_open() -- this only registers the bookkeeping entry.
+static void __not_in_flash_func(add_sd_file)(FileDescriptors **head, FileDescriptors *newFDescriptor,
+                                               const char *fpath, FIL fobject, uint16_t new_fd, int runtime_slot)
+{
+    memset(newFDescriptor, 0, sizeof(*newFDescriptor));
+    strncpy(newFDescriptor->fpath, fpath, 127);
+    newFDescriptor->fpath[127] = '\0';
+    newFDescriptor->fobject = fobject;
+    newFDescriptor->fd = new_fd;
+    newFDescriptor->offset = 0;
+    newFDescriptor->backend = GEMDRIVE_FILE_BACKEND_SD;
+    newFDescriptor->runtime_slot = runtime_slot;
+    newFDescriptor->next = *head;
+    *head = newFDescriptor;
+    DPRINTF("SD file %s added with fd %i, runtime_slot %d\n", fpath, new_fd, runtime_slot);
+}
+
 // Fase 10B: parallel to add_file()/add_tnfs_file() above, for the
 // read-only config-flash drive. Stores a direct pointer into the existing
 // Fase 10A const array -- never a copy -- plus its length; offset starts
@@ -1020,15 +1100,15 @@ static void __not_in_flash_func(close_all_files)(FileDescriptors **head)
             sidetnfs_tnfs_file_close(current->fd, current->tnfs_handle, current->runtime_slot);
             DPRINTF("TNFS file %s closed\n", current->fpath);
         }
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-        else if (current->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+        else if (current->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH ||
+                  current->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                  current->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR)
         {
-            // Fase 10B: never opened via f_open() -- current->fobject is
-            // never initialized for this backend, so f_close() on it below
-            // would be undefined behavior. Nothing to release.
-            DPRINTF("Config-flash file %s closed (no-op)\n", current->fpath);
+            // Fase 10B/12A/5/6: never opened via f_open() -- current->fobject
+            // is never initialized for any of these backends, so f_close()
+            // on it below would be undefined behavior. Nothing to release.
+            DPRINTF("Config-flash/NET_ERR/SD_ERROR file %s closed (no-op)\n", current->fpath);
         }
-#endif
         else
 #endif
         {
@@ -1272,6 +1352,66 @@ static void __not_in_flash_func(get_tnfs_relative_pathname_for_slot)(char *tnfs_
     DPRINTF("tnfs_path: %s (rom_slot %d, prefix_slot %d)\n", tnfs_path, rom_slot, *out_prefix_slot);
 }
 
+// Fase 7 (SD-mounts als volledige runtime-backend): true if runtime slot
+// `slot` is a real, published, ENABLED SD-backend drive -- never SETTINGS
+// (CONFIG_FLASH) or TNFS. Bounds-checked; never indexes g_runtime_drives
+// with an out-of-range value.
+static bool __not_in_flash_func(sidetnfs_slot_backend_is_sd)(int slot)
+{
+    return slot >= 0 && slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES && g_runtime_drives[slot].valid &&
+           g_runtime_drives[slot].backend == GEMDRIVE_FILE_BACKEND_SD;
+}
+
+// Fase 7: true only once sidetnfs_sd_get_drive_status() reports this slot
+// itself READY (card mounted AND this slot's own sd_path exists and is a
+// directory) -- false for any not-yet-checked or not-ready slot, never a
+// crash on an unregistered slot.
+static bool __not_in_flash_func(sidetnfs_sd_slot_ready)(int slot)
+{
+    sidetnfs_sd_drive_status_t st;
+    return sidetnfs_sd_get_drive_status(slot, &st) && st.status == SIDETNFS_SD_STATUS_READY;
+}
+
+// Fase 7: the one central, bounded path function requirement 2 asks for --
+// combines runtime slot `slot`'s own configured config.sd_path with an
+// already GEMDOS-resolved (drive-letter/backslash/CWD already handled --
+// see get_tnfs_relative_pathname_for_slot()) path into a real FatFS path,
+// e.g. sd_path "/hd" + gemdos_path "/GAMES/TEST.PRG" ->
+// "0:/hd/GAMES/TEST.PRG".
+//
+// Root safety: normalize_gemdos_path() (Fase 3) is the ONLY thing ever
+// applied to gemdos_path here -- it collapses "."/".." and, per its own
+// contract, "at root, '..' is a no-op -- normalization never produces
+// anything above root". Since the result is always a '/'-rooted string
+// relative to THIS drive's own root, and it is only ever concatenated
+// AFTER sd_path (never before, never spliced in the middle), the
+// combined FatFS path can never resolve outside sd_path -- there is no
+// separate escape/allow-list check because the normalizer already makes
+// "above root" unrepresentable. This mirrors Dsetpath's own use of the
+// same function for the exact same reason.
+//
+// Returns false (out untouched) if normalization fails (path too long)
+// or the combined FatFS path would not fit out_size -- caller must then
+// report a GEMDOS path error and touch nothing further, same contract
+// normalize_gemdos_path() itself already documents.
+static bool __not_in_flash_func(sidetnfs_sd_build_fatfs_path)(int slot, const char *gemdos_path, char *out, size_t out_size)
+{
+    if (!sidetnfs_slot_backend_is_sd(slot) || gemdos_path == NULL || out == NULL)
+    {
+        return false;
+    }
+    char normalized[MAX_FOLDER_LENGTH];
+    if (!normalize_gemdos_path(gemdos_path, normalized, sizeof(normalized)))
+    {
+        return false;
+    }
+    int n = snprintf(out, out_size, "0:%s%s", g_runtime_drives[slot].config.sd_path, normalized);
+    if (n < 0 || (size_t)n >= out_size)
+    {
+        return false;
+    }
+    return true;
+}
 
 inline const char *__not_in_flash_func(get_command_name)(unsigned int value)
 {
@@ -1334,36 +1474,47 @@ static bool gemdrive_backend_dta_exists(uint32_t ndta)
     sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     bool ndta_exists;
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    // Fase 10B2: the config drive has its own, separate search registry
-    // (sidetnfs_config_drive_backend.c) -- never falls through to the TNFS
-    // DTA registry, the fake no-network listing, or the FatFS DTA table,
-    // none of which Fsfirst ever populates in this build.
-    ndta_exists = sidetnfs_config_drive_search_is_active(ndta);
-#else
-    // Fase 5Z: DTA_EXIST must recognize TNFS (and fake no-network)
-    // search state too -- the 68k side queries this between
-    // Fsfirst and Fsnext to decide whether to issue a real Fsnext
-    // at all (see report: the SD-baseline log showed COMMAND_ENTER
-    // DTA_EXIST immediately before FSNEXT_ENTER). Never touches the
-    // FatFS DTA table while this switch is on -- Fsfirst never
-    // populates it in this mode.
+    // Fase 5Z/12A: DTA_EXIST must recognize TNFS, fake no-network, AND the
+    // local SETTINGS disk's own search registry -- the 68k side queries
+    // this between Fsfirst and Fsnext to decide whether to issue a real
+    // Fsnext at all (see report: the SD-baseline log showed COMMAND_ENTER
+    // DTA_EXIST immediately before FSNEXT_ENTER). Never touches the FatFS
+    // DTA table while this switch is on -- Fsfirst never populates it in
+    // this mode. ndta is unique per active search regardless of which
+    // registry holds it (it's the Atari-side DTA memory address, not a
+    // registry-scoped index), so checking all three registries here is
+    // always safe -- at most one can ever report it active.
+    bool settings_active = sidetnfs_config_drive_search_is_active(ndta);
     bool fake_active = sidetnfs_fake_search_is_active(ndta);
     bool tnfs_active = sidetnfs_tnfs_dta_is_active(ndta);
-    ndta_exists = tnfs_active || fake_active;
-    if (tnfs_active)
+    // Fase 6 (SD-service): a fourth, entirely separate registry -- see
+    // sidetnfs_sd_error_search_start()'s own comment.
+    bool sd_error_active = sidetnfs_sd_error_search_is_active(ndta);
+    // Fase 7 (SD-mounts als volledige runtime-backend): a fifth registry --
+    // the real FatFS DTA hash table, now reachable from a READY SD slot's
+    // own Fsfirst (see gemdrive_backend_fsfirst()'s SD branch).
+    bool sd_fatfs_active = lookupDTA(ndta) ? true : false;
+    ndta_exists = tnfs_active || fake_active || settings_active || sd_error_active || sd_fatfs_active;
+    if (sd_fatfs_active)
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FATFS_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+    }
+    else if (tnfs_active)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_TNFS_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
-    else if (fake_active)
+    else if (fake_active || sd_error_active)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAKE_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+    }
+    else if (settings_active)
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_TNFS_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
     else
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     ndta_exists = lookupDTA(ndta) ? true : false;
     sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_EXIST_FATFS_OK : SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta,
@@ -1381,34 +1532,46 @@ static uint32_t gemdrive_backend_dta_release(uint32_t ndta, uint32_t memory_shar
 {
     uint32_t release_count;
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    // Fase 10B2: release only the config drive's own search registry --
-    // never the TNFS DTA registry, the fake no-network listing, or the
-    // FatFS DTA table, none of which Fsfirst ever populates in this build.
-    sidetnfs_config_drive_search_close(ndta);
-    release_count = sidetnfs_config_drive_search_count_active();
-    nullify_dta(memory_shared_address);
-#else
-    // Fase 5Z: release whichever backend actually holds ndta's
-    // search state -- TNFS DTA registry and/or the fake no-network
-    // search table (never the FatFS DTA table, which Fsfirst never
-    // populated in this mode). Each release is a no-op if ndta
-    // isn't active in that particular table.
+    // Fase 5Z/12A: release whichever backend actually holds ndta's search
+    // state -- TNFS DTA registry, the fake no-network search table, AND
+    // the local SETTINGS disk's own search registry (never the FatFS DTA
+    // table, which Fsfirst never populates in this mode). Each release is
+    // a no-op if ndta isn't active in that particular table.
     bool was_tnfs_active = sidetnfs_tnfs_dta_is_active(ndta);
     sidetnfs_tnfs_dta_release(ndta);
     bool was_fake_active = sidetnfs_fake_search_is_active(ndta);
     sidetnfs_fake_search_close(ndta);
+    bool was_settings_active = sidetnfs_config_drive_search_is_active(ndta);
+    sidetnfs_config_drive_search_close(ndta);
+    // Fase 6 (SD-service): a fourth, entirely separate registry -- see
+    // sidetnfs_sd_error_search_start()'s own comment.
+    bool was_sd_error_active = sidetnfs_sd_error_search_is_active(ndta);
+    sidetnfs_sd_error_search_close(ndta);
+    // Fase 7 (SD-mounts als volledige runtime-backend): a fifth registry --
+    // the real FatFS DTA hash table, now reachable from a READY SD slot.
+    DTANode *sd_release_dtaNode = lookupDTA(ndta);
+    bool was_sd_fatfs_active = sd_release_dtaNode != NULL;
+    if (was_sd_fatfs_active)
+    {
+        releaseDTA(ndta);
+        sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_FATFS, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+    }
     if (was_tnfs_active)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_TNFS, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
-    if (was_fake_active)
+    if (was_fake_active || was_sd_error_active)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_FAKE, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
-    release_count = sidetnfs_tnfs_dta_count_active() + sidetnfs_fake_search_count_active();
+    if (was_settings_active)
+    {
+        sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_TNFS, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+    }
+    release_count = sidetnfs_tnfs_dta_count_active() + sidetnfs_fake_search_count_active() +
+                     sidetnfs_config_drive_search_count_active() + sidetnfs_sd_error_search_count_active() +
+                     countDTA();
     nullify_dta(memory_shared_address);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     DTANode *dtaNode = lookupDTA(ndta);
     if (dtaNode != NULL)
@@ -1435,38 +1598,42 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, int fsfirst_slot, const char
 {
 #if SIDETNFS_USE_TNFS_LISTING
     (void)internal_path; // only used by the SD/FatFS backend below
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    (void)sidetnfs_network_ok; // unused this phase -- always RAM-only
-    (void)fsfirst_slot;        // Fase 1: config-drive-only backend has no runtime-slot routing yet
-    // Fase 10B: root-only, read-only drive. Same trailing-slash
-    // normalization as the real-TNFS path below, so "/" and "" both reach
-    // sidetnfs_config_drive_search_start() identically; anything else
-    // (a subdirectory reference) is a clean GEMDOS "not found", never a
-    // fictitious/skipped entry.
-    char config_path[MAX_FOLDER_LENGTH];
-    snprintf(config_path, sizeof(config_path), "%s", path_forwardslash);
-    size_t config_path_len = strlen(config_path);
-    if (config_path_len > 1 && config_path[config_path_len - 1] == '/')
+    // Fase 12A: the local SETTINGS disk is routed by its own runtime slot
+    // (appended by sidetnfs_runtime_drives_init(), never a build-time
+    // #if) -- checked first, before any TNFS/fake-listing logic, so a
+    // search on S: never touches sidetnfs_network_ok/TNFS state at all.
+    if (sidetnfs_runtime_slot_is_settings(fsfirst_slot))
     {
-        config_path[config_path_len - 1] = '\0';
+        (void)sidetnfs_network_ok; // unused for this backend -- always RAM-only
+        // Fase 10B/12A: root-only, read-only drive. Same trailing-slash
+        // normalization as the real-TNFS path below, so "/" and "" both
+        // reach sidetnfs_config_drive_search_start() identically; anything
+        // else (a subdirectory reference) is a clean GEMDOS "not found",
+        // never a fictitious/skipped entry.
+        char config_path[MAX_FOLDER_LENGTH];
+        snprintf(config_path, sizeof(config_path), "%s", path_forwardslash);
+        size_t config_path_len = strlen(config_path);
+        if (config_path_len > 1 && config_path[config_path_len - 1] == '/')
+        {
+            config_path[config_path_len - 1] = '\0';
+        }
+        SidetnfsDirSearchResult config_result = SIDETNFS_DIR_SEARCH_NOT_FOUND;
+        SidetnfsAtariDirEntry config_entry;
+        if (config_path[0] == '\0' || strcmp(config_path, "/") == 0)
+        {
+            config_result = sidetnfs_config_drive_search_start(ndta, pattern, (uint8_t)attribs, &config_entry);
+        }
+        if (config_result == SIDETNFS_DIR_SEARCH_FOUND)
+        {
+            populate_dta_from_sidetnfs_entry(memory_shared_address, &config_entry);
+        }
+        else
+        {
+            nullify_dta(memory_shared_address);
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
+        }
+        return;
     }
-    SidetnfsDirSearchResult config_result = SIDETNFS_DIR_SEARCH_NOT_FOUND;
-    SidetnfsAtariDirEntry config_entry;
-    if (config_path[0] == '\0' || strcmp(config_path, "/") == 0)
-    {
-        config_result = sidetnfs_config_drive_search_start(ndta, pattern, (uint8_t)attribs, &config_entry);
-    }
-    if (config_result == SIDETNFS_DIR_SEARCH_FOUND)
-    {
-        populate_dta_from_sidetnfs_entry(memory_shared_address, &config_entry);
-    }
-    else
-    {
-        nullify_dta(memory_shared_address);
-        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
-    }
-    return;
-#else
     sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_ATTR_PREP, ndta, NULL, NULL, NULL, 0, 0, 0, (uint8_t)attribs);
 
     // Fase 5Q: directory listing is now UNCONDITIONALLY served from
@@ -1482,7 +1649,31 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, int fsfirst_slot, const char
 
     SidetnfsAtariDirEntry sidetnfs_entry;
     SidetnfsDirSearchResult sidetnfs_result;
-    if (sidetnfs_network_ok && sidetnfs_tnfs_listing_ready())
+    // Fase 13 (runtime-drive-publication audit follow-up): this used to
+    // be an implicit "not SETTINGS (already handled above) => must be
+    // TNFS" assumption -- harmless while GEMDRIVE_FILE_BACKEND_SD never
+    // populated g_runtime_drives at all, but now that ordinary slots can
+    // carry a real SD-derived backend tag (see
+    // sidetnfs_runtime_backend_for_config_type()), an explicit check is
+    // needed so a real SD slot is never mistaken for a TNFS one here. No
+    // SD listing backend exists yet (out of scope this phase) -- a
+    // non-TNFS ordinary slot falls through to the same fake/offline
+    // listing path a not-yet-ready TNFS slot already used, never treated
+    // as TNFS.
+    // sidetnfs_runtime_drive_get() is declared further down in this file
+    // (after gemdrvemul.c's other slot-table helpers) -- bounds-checked
+    // access inline here instead, same pattern
+    // sidetnfs_runtime_slot_is_settings() above already uses.
+    bool fsfirst_backend_is_tnfs = (fsfirst_slot >= 0 && fsfirst_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES &&
+                                      g_runtime_drives[fsfirst_slot].valid &&
+                                      g_runtime_drives[fsfirst_slot].backend == GEMDRIVE_FILE_BACKEND_TNFS);
+    // Fase 5 (virtual NET_ERR.TXT root): per-slot readiness, replacing the
+    // old global sidetnfs_network_ok && sidetnfs_tnfs_listing_ready()
+    // gate -- see sidetnfs_probe_classify_slot_error()'s own comment. A
+    // slot with its own live session takes the real TNFS DTA-registry
+    // search below, exactly as before.
+    if (fsfirst_backend_is_tnfs &&
+        sidetnfs_probe_classify_slot_error(fsfirst_slot, sidetnfs_network_ok) == SIDETNFS_DRIVE_ERR_NONE)
     {
         // Fase 5Y/6B: TNFS DTA-registry search (OPENDIRX +
         // one-entry-at-a-time READDIRX, registered under ndta
@@ -1490,14 +1681,143 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, int fsfirst_slot, const char
         // Never SD.
         sidetnfs_result = sidetnfs_tnfs_dta_start(ndta, fsfirst_slot, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
     }
+    else if (fsfirst_backend_is_tnfs)
+    {
+        // Fase 5: this ENABLED TNFS slot isn't ready right now (no WiFi,
+        // DNS/host-parse failure, server unreachable/timeout, mount
+        // failed, or no session at all) -- serve the single virtual
+        // NET_ERR.TXT entry instead, never a hard directory error and
+        // never SD. This NEVER touches cyw43/lwIP itself (which may
+        // already be torn down in this case, see Fase 5H) --
+        // sidetnfs_probe_classify_slot_error()/sidetnfs_build_net_err_text()
+        // are pure RAM/formatting.
+        char fsfirst_driveletter = (char)('A' + g_drive_number_table[fsfirst_slot]);
+        sidetnfs_result = sidetnfs_net_err_search_start(ndta, fsfirst_slot, fsfirst_driveletter, sidetnfs_network_ok,
+                                                          tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+    }
     else
     {
-        // Fase 5Q: TNFS never became available this boot (no
-        // WiFi, ESC-skip, or MOUNT never succeeded). Serve a
-        // fake, memory-only listing instead of any SD fallback
-        // -- this NEVER touches cyw43/lwIP (which may already be
-        // torn down in this case, see Fase 5H).
-        sidetnfs_result = sidetnfs_fake_search_start(ndta, tnfs_path, pattern, (uint8_t)attribs, &sidetnfs_entry);
+        // Fase 6 (SD-service): a non-TNFS ordinary slot is, in this
+        // codebase, always the SD backend (SETTINGS is excluded above
+        // already). Never routed through the TNFS fake-listing/NET_ERR
+        // mechanism -- SD gets its own status and its own virtual
+        // SD_ERROR.TXT root (sidetnfs_sd_error_search_start()).
+        sidetnfs_sd_drive_status_t sd_status;
+        bool sd_status_known = sidetnfs_sd_get_drive_status(fsfirst_slot, &sd_status);
+        if (sd_status_known && sd_status.status == SIDETNFS_SD_STATUS_READY)
+        {
+            // Fase 7 (SD-mounts als volledige runtime-backend): real,
+            // per-runtime-slot FatFS directory listing -- the exact same
+            // f_findfirst()/insertDTA()/populate_dta() sequence the
+            // pre-existing single-drive SD/FatFS route always used
+            // (including its dotfile-skip loop and 8.3 name filtering),
+            // just rooted at THIS slot's own config.sd_path via
+            // sidetnfs_sd_build_fatfs_path() instead of the global
+            // hd_folder, and reachable from the modern
+            // (SIDETNFS_USE_TNFS_LISTING) dispatch. Bypasses this
+            // function's generic SidetnfsAtariDirEntry tail below
+            // entirely -- populate_dta() already writes the DTA transfer
+            // area directly, same as it always did.
+            char sd_fsfirst_path[MAX_FOLDER_LENGTH * 2];
+            if (!sidetnfs_sd_build_fatfs_path(fsfirst_slot, tnfs_path, sd_fsfirst_path, sizeof(sd_fsfirst_path)))
+            {
+                nullify_dta(memory_shared_address);
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EPTHNF;
+                return;
+            }
+            bool sd_ndta_exists = lookupDTA(ndta) ? true : false;
+            FRESULT sd_fr;
+            DIR *sd_dj = (DIR *)malloc(sizeof(DIR));
+            FILINFO *sd_fno = (FILINFO *)malloc(sizeof(FILINFO));
+            char sd_raw_filename[2] = "._";
+            sd_fr = FR_OK;
+            bool sd_first_time = true;
+            while (sd_fr == FR_OK && ((sd_raw_filename[0] == '.') || (sd_raw_filename[0] == '.' && sd_raw_filename[1] == '_')))
+            {
+                if (sd_first_time)
+                {
+                    sd_first_time = false;
+                    sd_fr = f_findfirst(sd_dj, sd_fno, sd_fsfirst_path, pattern);
+                }
+                else
+                {
+                    sd_fr = f_findnext(sd_dj, sd_fno);
+                }
+                if (sd_fno->fname[0])
+                {
+                    if (attribs & attribs_fat2st(sd_fno->fattrib))
+                    {
+                        if (sd_fr == FR_OK)
+                        {
+                            sd_raw_filename[0] = sd_fno->fname[0];
+                            sd_raw_filename[1] = sd_fno->fname[1];
+                        }
+                    }
+                }
+                else
+                {
+                    sd_raw_filename[0] = 'x'; // Force exit, no more elements
+                    sd_raw_filename[1] = 'x'; // Force exit, no more elements
+                }
+            }
+            if (sd_fr == FR_OK && sd_fno->fname[0])
+            {
+                uint8_t sd_attribs_conv_st = attribs_fat2st(sd_fno->fattrib);
+                char sd_shorten_filename[14];
+                char sd_upper_filename[14];
+                char sd_filtered_filename[14];
+                filter_fname(sd_fno->fname, sd_filtered_filename);
+                upper_fname(sd_filtered_filename, sd_upper_filename);
+                shorten_fname(sd_upper_filename, sd_shorten_filename);
+                strcpy(sd_fno->fname, sd_shorten_filename);
+                if (sd_attribs_conv_st & attribs)
+                {
+                    if (sd_ndta_exists)
+                    {
+                        releaseDTA(ndta);
+                        nullify_dta(memory_shared_address);
+                    }
+                    DTA sd_dta_data = {"filename.typ", 0, 0, 0, 0, 0, 0, 0, 0, "filename.typ"};
+                    insertDTA(ndta, sd_dta_data, sd_dj, sd_fno, attribs);
+                    populate_dta(memory_shared_address, ndta, GEMDOS_EFILNF);
+                    sd_dj = NULL;
+                    sd_fno = NULL;
+                }
+                else
+                {
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
+                    if (sd_ndta_exists)
+                    {
+                        releaseDTA(ndta);
+                        nullify_dta(memory_shared_address);
+                    }
+                }
+            }
+            else
+            {
+                if (sd_ndta_exists)
+                {
+                    releaseDTA(ndta);
+                }
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_EFILNF;
+                nullify_dta(memory_shared_address);
+            }
+            if (sd_dj != NULL)
+            {
+                free(sd_dj);
+            }
+            if (sd_fno != NULL)
+            {
+                free(sd_fno);
+            }
+            return;
+        }
+        else
+        {
+            char fsfirst_driveletter = (char)('A' + g_drive_number_table[fsfirst_slot]);
+            sidetnfs_result = sidetnfs_sd_error_search_start(ndta, fsfirst_slot, fsfirst_driveletter, tnfs_path,
+                                                               pattern, (uint8_t)attribs, &sidetnfs_entry);
+        }
     }
 
     if (sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND)
@@ -1536,7 +1856,6 @@ static void gemdrive_backend_fsfirst(uint32_t ndta, int fsfirst_slot, const char
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FSFIRST_RETURN, ndta, NULL, NULL, NULL, 0, 0,
                        (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_EFILNF), 0);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     (void)path_forwardslash;   // only used by the TNFS backend above
     (void)sidetnfs_network_ok; // only used by the TNFS backend above
@@ -1690,10 +2009,12 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
 #endif
 
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    // Fase 10B: root-only, read-only drive -- continue the ndta search
-    // started by gemdrive_backend_fsfirst()'s own SIDETNFS_CONFIG_DRIVE_ONLY
-    // branch. No TNFS DTA registry, no fake no-network listing, no SD.
+    // Fase 10B/12A: continue the ndta search if it belongs to the local
+    // SETTINGS disk's own registry -- checked first, before any TNFS/fake
+    // listing logic. ndta is unique per active search regardless of which
+    // registry holds it (it's the Atari-side DTA memory address, not a
+    // registry-scoped index), so this check is always safe.
+    if (sidetnfs_config_drive_search_is_active(ndta))
     {
         SidetnfsAtariDirEntry config_entry;
         SidetnfsDirSearchResult config_result = sidetnfs_config_drive_search_next(ndta, &config_entry);
@@ -1706,9 +2027,64 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
             nullify_dta(memory_shared_address);
             *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_ENMFIL;
         }
+        return;
     }
-    return;
-#else
+    // Fase 7 (SD-mounts als volledige runtime-backend): continue the ndta
+    // search if it belongs to the real FatFS DTA hash table (a real,
+    // per-runtime-slot SD listing started by gemdrive_backend_fsfirst()'s
+    // own SD branch) -- same f_findnext()/populate_dta() sequence the
+    // pre-existing single-drive SD/FatFS route always used. Checked here,
+    // before the fake/SD_ERROR/TNFS registries below (ndta is unique per
+    // active search regardless of which registry holds it, so this is
+    // always safe).
+    {
+        DTANode *sd_fsnext_dtaNode = lookupDTA(ndta);
+        if (sd_fsnext_dtaNode != NULL && sd_fsnext_dtaNode->dj != NULL && sd_fsnext_dtaNode->fno != NULL)
+        {
+            uint32_t sd_fsnext_attribs = sd_fsnext_dtaNode->attribs;
+            FRESULT sd_fsnext_fr = FR_OK;
+            char sd_fsnext_raw_filename[2] = "._";
+            while (sd_fsnext_fr == FR_OK &&
+                   ((sd_fsnext_raw_filename[0] == '.') || (sd_fsnext_raw_filename[0] == '.' && sd_fsnext_raw_filename[1] == '_')))
+            {
+                sd_fsnext_fr = f_findnext(sd_fsnext_dtaNode->dj, sd_fsnext_dtaNode->fno);
+                if (sd_fsnext_dtaNode->fno->fname[0])
+                {
+                    if (sd_fsnext_attribs & attribs_fat2st(sd_fsnext_dtaNode->fno->fattrib))
+                    {
+                        if (sd_fsnext_fr == FR_OK)
+                        {
+                            sd_fsnext_raw_filename[0] = sd_fsnext_dtaNode->fno->fname[0];
+                            sd_fsnext_raw_filename[1] = sd_fsnext_dtaNode->fno->fname[1];
+                        }
+                    }
+                }
+                else
+                {
+                    sd_fsnext_raw_filename[0] = 'X'; // Force exit, no more elements
+                    sd_fsnext_raw_filename[1] = 'X'; // Force exit, no more elements
+                }
+            }
+            if (sd_fsnext_fr == FR_OK && sd_fsnext_dtaNode->fno->fname[0])
+            {
+                char sd_fsnext_shorten_filename[14];
+                char sd_fsnext_upper_filename[14];
+                char sd_fsnext_filtered_filename[14];
+                filter_fname(sd_fsnext_dtaNode->fno->fname, sd_fsnext_filtered_filename);
+                upper_fname(sd_fsnext_filtered_filename, sd_fsnext_upper_filename);
+                shorten_fname(sd_fsnext_upper_filename, sd_fsnext_shorten_filename);
+                strcpy(sd_fsnext_dtaNode->fno->fname, sd_fsnext_shorten_filename);
+                populate_dta(memory_shared_address, ndta, GEMDOS_ENMFIL);
+            }
+            else
+            {
+                releaseDTA(ndta);
+                nullify_dta(memory_shared_address);
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_ENMFIL;
+            }
+            return;
+        }
+    }
     // Fase 5U: log both events at the absolute top of this case,
     // before any other logic, so there is no ambiguity about
     // whether GEMDRVEMUL_FSNEXT_CALL was ever dispatched to at all
@@ -1732,6 +2108,12 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
     {
         sidetnfs_search_was_active = true;
         sidetnfs_result = sidetnfs_fake_search_next(ndta, &sidetnfs_entry);
+    }
+    else if (sidetnfs_sd_error_search_is_active(ndta))
+    {
+        // Fase 6 (SD-service): a fourth, entirely separate registry.
+        sidetnfs_search_was_active = true;
+        sidetnfs_result = sidetnfs_sd_error_search_next(ndta, &sidetnfs_entry);
     }
     else if (sidetnfs_tnfs_dta_is_active(ndta))
     {
@@ -1770,8 +2152,9 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
         // NOT_FOUND (listing exhausted) or ERROR (no/invalidated
         // search state): end cleanly with GEMDOS_ENMFIL either
         // way -- no SD fallback.
-        sidetnfs_fake_search_close(ndta); // no-op if this was a real TNFS search, not the fake listing
-        sidetnfs_tnfs_dta_release(ndta);  // no-op if this was the fake listing, not a real TNFS search
+        sidetnfs_fake_search_close(ndta);     // no-op unless this was the legacy fake listing
+        sidetnfs_sd_error_search_close(ndta); // no-op unless this was the SD_ERROR.TXT listing
+        sidetnfs_tnfs_dta_release(ndta);      // no-op unless this was a real TNFS search
         nullify_dta(memory_shared_address);
         *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DTA_F_FOUND)) = (uint16_t)GEMDOS_ENMFIL;
         if (sidetnfs_result == SIDETNFS_DIR_SEARCH_ERROR)
@@ -1787,7 +2170,6 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FSNEXT_RETURN, ndta, NULL, NULL, NULL, 0, 0,
                        (uint8_t)(sidetnfs_result == SIDETNFS_DIR_SEARCH_FOUND ? 0 : GEMDOS_ENMFIL), 0);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     FRESULT fr; /* Return value */
     DTANode *dtaNode = lookupDTA(ndta);
@@ -1892,13 +2274,14 @@ static void gemdrive_backend_fsnext(uint32_t ndta, uint32_t memory_shared_addres
 #endif
 }
 
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-// Fase 10B: tmp_filepath at this point is the TNFS-relative, forward-slash,
-// root-anchored shape get_tnfs_relative_pathname() always produces (e.g.
-// "/SIDETNFS.PRG"). This drive is root-only, so accept exactly one path
-// component after the leading slash -- reject an empty name and reject
-// any further slash (a subdirectory reference) rather than silently
-// truncating it to something that could accidentally match a real file.
+// Fase 10B/12A: tmp_filepath at this point is the TNFS-relative,
+// forward-slash, root-anchored shape get_tnfs_relative_pathname()/
+// get_tnfs_relative_pathname_for_slot() always produces (e.g.
+// "/SIDETNFS.PRG"). The SETTINGS disk is root-only, so accept exactly one
+// path component after the leading slash -- reject an empty name and
+// reject any further slash (a subdirectory reference) rather than
+// silently truncating it to something that could accidentally match a
+// real file.
 static bool config_flash_root_name(const char *tmp_filepath, char *out83, size_t out83_size)
 {
     if (tmp_filepath == NULL || tmp_filepath[0] != '/')
@@ -1914,44 +2297,197 @@ static bool config_flash_root_name(const char *tmp_filepath, char *out83, size_t
     out83[out83_size - 1] = '\0';
     return true;
 }
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 
 // Fase 7D: GEMDRVEMUL_FOPEN_CALL backend routing. tmp_filepath is already
 // the correct shape for the active backend (TNFS-relative forward-slash
 // path, or SD-local hd_folder-prefixed path -- built by the caller before
 // this is called, see get_tnfs_relative_pathname()/get_local_full_pathname()
 // at the GEMDRVEMUL_FOPEN_CALL call site).
-static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath, uint32_t memory_shared_address, int runtime_slot)
+static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath, uint32_t memory_shared_address, int runtime_slot, bool sidetnfs_network_ok)
 {
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    (void)runtime_slot; // config-flash backend has no slot concept
-    // Fase 10B: read-only drive -- only mode 0 (read-only) is ever valid.
-    if (fopen_mode != 0)
+    // Fase 12A: the local SETTINGS disk is routed by its own runtime slot
+    // -- checked first, before any TNFS-specific logic below.
+    if (sidetnfs_runtime_slot_is_settings(runtime_slot))
     {
-        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+        // Fase 10B/12A: read-only drive -- only mode 0 (read-only) is ever valid.
+        if (fopen_mode != 0)
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+            return;
+        }
+        char name83[32];
+        const uint8_t *data;
+        uint32_t size;
+        if (!config_flash_root_name(tmp_filepath, name83, sizeof(name83)) ||
+            !sidetnfs_config_drive_lookup(name83, &data, &size))
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+            return;
+        }
+        uint16_t fd_counter = get_first_available_fd(fdescriptors);
+        FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
+        if (newFDescriptor == NULL)
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+            return;
+        }
+        add_config_flash_file(&fdescriptors, newFDescriptor, tmp_filepath, data, size, fd_counter);
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
         return;
     }
-    char name83[32];
-    const uint8_t *data;
-    uint32_t size;
-    if (!config_flash_root_name(tmp_filepath, name83, sizeof(name83)) ||
-        !sidetnfs_config_drive_lookup(name83, &data, &size))
+    // Fase 5 (virtual NET_ERR.TXT root): an ENABLED TNFS slot that isn't
+    // ready right now (see sidetnfs_probe_classify_slot_error()) serves
+    // exactly one read-only file, SIDETNFS_NET_ERR_NAME, instead of ever
+    // attempting a real TNFS open over a session that doesn't exist.
+    // SETTINGS is excluded above already; a non-TNFS ordinary/SD slot
+    // never matches this check and falls through unchanged.
+    bool fopen_is_tnfs_backend = (runtime_slot >= 0 && runtime_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES &&
+                                    g_runtime_drives[runtime_slot].valid &&
+                                    g_runtime_drives[runtime_slot].backend == GEMDRIVE_FILE_BACKEND_TNFS);
+    if (fopen_is_tnfs_backend &&
+        sidetnfs_probe_classify_slot_error(runtime_slot, sidetnfs_network_ok) != SIDETNFS_DRIVE_ERR_NONE)
     {
-        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+        // Read-only drive -- only mode 0 is ever valid, same as SETTINGS.
+        if (fopen_mode != 0)
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+            return;
+        }
+        char net_err_name83[32];
+        if (!config_flash_root_name(tmp_filepath, net_err_name83, sizeof(net_err_name83)) ||
+            strcmp(net_err_name83, SIDETNFS_NET_ERR_NAME) != 0)
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+            return;
+        }
+        uint16_t fd_counter = get_first_available_fd(fdescriptors);
+        FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
+        if (newFDescriptor == NULL)
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+            return;
+        }
+        memset(newFDescriptor, 0, sizeof(*newFDescriptor));
+        strncpy(newFDescriptor->fpath, tmp_filepath, sizeof(newFDescriptor->fpath) - 1);
+        char net_err_driveletter = (char)('A' + g_drive_number_table[runtime_slot]);
+        size_t net_err_len = sidetnfs_build_net_err_text(runtime_slot, net_err_driveletter, sidetnfs_network_ok,
+                                                           newFDescriptor->net_err_text,
+                                                           sizeof(newFDescriptor->net_err_text));
+        newFDescriptor->fd = fd_counter;
+        newFDescriptor->offset = 0;
+        newFDescriptor->backend = GEMDRIVE_FILE_BACKEND_NET_ERR;
+        newFDescriptor->config_flash_data = (const uint8_t *)newFDescriptor->net_err_text;
+        newFDescriptor->config_flash_size = (uint32_t)net_err_len;
+        newFDescriptor->next = fdescriptors;
+        fdescriptors = newFDescriptor;
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
         return;
     }
-    uint16_t fd_counter = get_first_available_fd(fdescriptors);
-    FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
-    if (newFDescriptor == NULL)
+    // Fase 6 (SD-service/SD_ERROR.TXT): an ENABLED SD slot that isn't
+    // READY right now serves exactly one read-only file,
+    // SIDETNFS_SD_ERROR_NAME, instead of ever attempting a real SD/FatFS
+    // open (that per-slot backend is Fase 7). A READY SD slot falls
+    // through unchanged -- Fase 6 builds no real SD file backend yet, so
+    // Fopen for it below reaches exactly the same (pre-existing,
+    // untouched) code path this function already had before this phase.
+    bool fopen_is_sd_backend = (runtime_slot >= 0 && runtime_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES &&
+                                  g_runtime_drives[runtime_slot].valid &&
+                                  g_runtime_drives[runtime_slot].backend == GEMDRIVE_FILE_BACKEND_SD);
+    if (fopen_is_sd_backend)
     {
-        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+        sidetnfs_sd_drive_status_t sd_status;
+        bool sd_status_known = sidetnfs_sd_get_drive_status(runtime_slot, &sd_status);
+        bool sd_ready = sd_status_known && sd_status.status == SIDETNFS_SD_STATUS_READY;
+        if (!sd_ready)
+        {
+            if (fopen_mode != 0)
+            {
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+                return;
+            }
+            char sd_error_name83[32];
+            if (!config_flash_root_name(tmp_filepath, sd_error_name83, sizeof(sd_error_name83)) ||
+                strcmp(sd_error_name83, SIDETNFS_SD_ERROR_NAME) != 0)
+            {
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+                return;
+            }
+            uint16_t fd_counter = get_first_available_fd(fdescriptors);
+            FileDescriptors *newFDescriptor = malloc(sizeof(FileDescriptors));
+            if (newFDescriptor == NULL)
+            {
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+                return;
+            }
+            memset(newFDescriptor, 0, sizeof(*newFDescriptor));
+            strncpy(newFDescriptor->fpath, tmp_filepath, sizeof(newFDescriptor->fpath) - 1);
+            char sd_error_driveletter = (char)('A' + g_drive_number_table[runtime_slot]);
+            size_t sd_error_len = sidetnfs_build_sd_error_text(runtime_slot, sd_error_driveletter,
+                                                                 newFDescriptor->sd_error_text,
+                                                                 sizeof(newFDescriptor->sd_error_text));
+            newFDescriptor->fd = fd_counter;
+            newFDescriptor->offset = 0;
+            newFDescriptor->backend = GEMDRIVE_FILE_BACKEND_SD_ERROR;
+            newFDescriptor->config_flash_data = (const uint8_t *)newFDescriptor->sd_error_text;
+            newFDescriptor->config_flash_size = (uint32_t)sd_error_len;
+            newFDescriptor->next = fdescriptors;
+            fdescriptors = newFDescriptor;
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
+            return;
+        }
+        // Fase 7 (SD-mounts als volledige runtime-backend): sd_ready ==
+        // true -- real, per-runtime-slot FatFS open. tmp_filepath is
+        // already the GEMDOS-resolved (drive-letter/backslash/CWD)
+        // relative path (see get_tnfs_relative_pathname_for_slot() at the
+        // FOPEN_CALL call site) -- sidetnfs_sd_build_fatfs_path() turns it
+        // into this slot's own real FatFS path, rooted at its own
+        // config.sd_path (never able to resolve outside it -- see that
+        // function's own comment).
+        char sd_fopen_path[MAX_FOLDER_LENGTH * 2];
+        if (!sidetnfs_sd_build_fatfs_path(runtime_slot, tmp_filepath, sd_fopen_path, sizeof(sd_fopen_path)))
+        {
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EPTHNF);
+            return;
+        }
+        BYTE sd_fopen_mode = 0;
+        switch (fopen_mode)
+        {
+        case 0:
+            sd_fopen_mode = FA_READ;
+            break;
+        case 1:
+            sd_fopen_mode = FA_WRITE;
+            break;
+        case 2:
+            sd_fopen_mode = FA_READ | FA_WRITE;
+            break;
+        default:
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EACCDN);
+            return;
+        }
+        FIL sd_fopen_file_object;
+        FRESULT sd_fopen_fr = f_open(&sd_fopen_file_object, sd_fopen_path, sd_fopen_mode);
+        if (sd_fopen_fr != FR_OK)
+        {
+            DPRINTF("ERROR: Could not open SD file %s (FRESULT %d)\n", sd_fopen_path, (int)sd_fopen_fr);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EFILNF);
+            return;
+        }
+        uint16_t sd_fopen_fd_counter = get_first_available_fd(fdescriptors);
+        FileDescriptors *sd_newFDescriptor = malloc(sizeof(FileDescriptors));
+        if (sd_newFDescriptor == NULL)
+        {
+            f_close(&sd_fopen_file_object);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, GEMDOS_EINTRN);
+            return;
+        }
+        add_sd_file(&fdescriptors, sd_newFDescriptor, sd_fopen_path, sd_fopen_file_object, sd_fopen_fd_counter,
+                     runtime_slot);
+        DPRINTF("SD file opened with file descriptor: %d\n", sd_fopen_fd_counter);
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, sd_fopen_fd_counter);
         return;
     }
-    add_config_flash_file(&fdescriptors, newFDescriptor, tmp_filepath, data, size, fd_counter);
-    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
-    return;
-#else
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_ENTER, 0, tmp_filepath, NULL, NULL, fopen_mode, 0, 0, 0);
     if (fopen_mode > 2)
     {
@@ -2007,9 +2543,9 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
     sidetnfs_uart_diag()->fopen_last_result = (uint16_t)GEMDOS_EOK;
 #endif
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
-    (void)runtime_slot; // SD/FatFS backend has no slot concept
+    (void)runtime_slot;         // SD/FatFS backend has no slot concept
+    (void)sidetnfs_network_ok; // only used by the TNFS/NET_ERR backend above
     DPRINTF("Fopen mode: %x\n", fopen_mode);
     BYTE fatfs_open_mode = 0;
     switch (fopen_mode)
@@ -2070,19 +2606,42 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
 #if SIDETNFS_USE_TNFS_LISTING
     sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_ENTER, fclose_fd, NULL, NULL, NULL, 0, 0, 0, 0);
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, fclose_fd);
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    // Fase 10B: flash reads need no close call at all -- just release the
-    // local tracking entry, same "always release, never leak/hang" intent
-    // as the TNFS path below.
-    if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+    // Fase 10B/12A: the local SETTINGS disk needs no close call at all --
+    // just release the local tracking entry, same "always release, never
+    // leak/hang" intent as the TNFS path below. Checked first, before the
+    // TNFS-specific not-found/backend logic below, so it never touches
+    // any TNFS-only field on this descriptor.
+    // Fase 5/6: NET_ERR.TXT/SD_ERROR.TXT share CONFIG_FLASH's "nothing was
+    // ever really opened, just release the local tracking entry" contract
+    // -- see GEMDRIVE_FILE_BACKEND_NET_ERR/_SD_ERROR's own comment in
+    // gemdrvemul.h.
+    if (file != NULL && (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH ||
+                          file->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                          file->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR))
     {
-        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EIHNDL;
+        delete_file_by_fdesc(&fdescriptors, fclose_fd);
+        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
         return;
     }
-    delete_file_by_fdesc(&fdescriptors, fclose_fd);
-    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
-    return;
-#else
+    // Fase 7 (SD-mounts als volledige runtime-backend): a real per-slot
+    // SD/FatFS handle -- same FatFS f_close() the pre-existing
+    // single-drive SD/FatFS route already used, just reached from the
+    // modern (SIDETNFS_USE_TNFS_LISTING) dispatch now too.
+    if (file != NULL && file->backend == GEMDRIVE_FILE_BACKEND_SD)
+    {
+        FRESULT sd_fclose_fr = f_close(&file->fobject);
+        delete_file_by_fdesc(&fdescriptors, fclose_fd);
+        if (sd_fclose_fr != FR_OK && sd_fclose_fr != FR_INVALID_OBJECT)
+        {
+            DPRINTF("ERROR: Could not close SD file (%d)\r\n", sd_fclose_fr);
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EINTRN;
+        }
+        else
+        {
+            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
+        }
+        return;
+    }
     if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_TNFS)
     {
         DPRINTF("ERROR: File descriptor not found or not TNFS-backed\n");
@@ -2151,7 +2710,6 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
     fclose_diag->fclose_last_result = (uint16_t)GEMDOS_EOK;
 #endif
     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, fclose_fd);
     if (file == NULL)
@@ -2193,12 +2751,16 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
                        (uint16_t)(readbuff_pending_bytes_to_read > 0xFFFFu ? 0xFFFFu : readbuff_pending_bytes_to_read), 0, 0);
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_ENTER, readbuff_fd, NULL, NULL, NULL, 0, 0, 0, 0);
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, readbuff_fd);
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-    if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+    // Fase 10B/12A: the local SETTINGS disk is checked first, before the
+    // TNFS-specific not-found/backend logic below, so it never touches
+    // any TNFS-only field on this descriptor.
+    // Fase 5/6: NET_ERR.TXT/SD_ERROR.TXT reuse this exact same generic
+    // offset/size buffer read (see GEMDRIVE_FILE_BACKEND_NET_ERR/
+    // _SD_ERROR's own comment).
+    if (file != NULL && (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH ||
+                          file->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                          file->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR))
     {
-        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
-        return;
-    }
     // Fase 10B: bound every read to the real array length. file->offset can
     // be anywhere in [0, config_flash_size] -- Fseek, not just linear
     // growth (Pexec's own PRG loader may not read strictly sequentially) --
@@ -2226,7 +2788,42 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
     CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF, buff_size + (buff_size % 2));
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)buff_size);
     return;
-#else
+    }
+    // Fase 7 (SD-mounts als volledige runtime-backend): a real per-slot
+    // SD/FatFS handle -- same f_lseek()+f_read() the pre-existing
+    // single-drive SD/FatFS route already used.
+    if (file != NULL && file->backend == GEMDRIVE_FILE_BACKEND_SD)
+    {
+        uint32_t sd_fread_offset = file->offset;
+        FRESULT sd_fread_fr = f_lseek(&file->fobject, sd_fread_offset);
+        if (sd_fread_fr != FR_OK)
+        {
+            DPRINTF("ERROR: Could not change SD read offset (%d)\r\n", sd_fread_fr);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EINTRN);
+            return;
+        }
+        uint16_t sd_fread_buff_size = readbuff_pending_bytes_to_read > DEFAULT_FOPEN_READ_BUFFER_SIZE
+                                           ? DEFAULT_FOPEN_READ_BUFFER_SIZE
+                                           : (uint16_t)readbuff_pending_bytes_to_read;
+        if (sd_fread_buff_size < DEFAULT_FOPEN_READ_BUFFER_SIZE)
+        {
+            memset((void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), 0, DEFAULT_FOPEN_READ_BUFFER_SIZE);
+        }
+        UINT sd_fread_bytes_read = 0;
+        sd_fread_fr = f_read(&file->fobject, (void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), sd_fread_buff_size,
+                              &sd_fread_bytes_read);
+        if (sd_fread_fr != FR_OK)
+        {
+            DPRINTF("ERROR: Could not read SD file (%d)\r\n", sd_fread_fr);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EINTRN);
+            return;
+        }
+        file->offset += sd_fread_bytes_read;
+        CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF,
+                                   sd_fread_buff_size + (sd_fread_buff_size % 2));
+        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)sd_fread_bytes_read);
+        return;
+    }
     if (file == NULL || file->backend != GEMDRIVE_FILE_BACKEND_TNFS)
     {
         DPRINTF("ERROR: File descriptor not found or not TNFS-backed\n");
@@ -2320,7 +2917,6 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 #endif
     CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF, actual + (actual % 2));
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)actual);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
     // Obtain the file descriptor
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, readbuff_fd);
@@ -2386,27 +2982,64 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 // via sidetnfs_config_get_drive() over every fixed slot
 // 0..SIDETNFS_MAX_DRIVES-1 (never assumed compact/ordered by
 // sidetnfs_config_get_drive_count()) -- never a hardcoded slot index.
-// Returns false (*out untouched) if no used drive with that letter
+// Returns false (*out untouched) if no ENABLED drive with that letter
 // exists. The one and only drive-config lookup in this file -- both
 // slot 0 and slot 1 of g_runtime_drives are populated through this same
 // function (sidetnfs_runtime_drives_init() below), never a second,
 // parallel lookup.
-static bool sidetnfs_config_find_drive_by_letter(char letter, sidetnfs_drive_config_t *out)
+//
+// Fase 12B: sidetnfs_config_get_drive() now returns OK for an EMPTY slot
+// too (see its own doc comment), so this loop can no longer rely on a
+// non-OK status to skip unusable slots -- it must also skip DISABLED
+// records explicitly. Without this, a DISABLED N:/O: record (a state that
+// could not exist before this phase) would get silently mounted anyway,
+// which is exactly the unintended runtime-behavior change the report's
+// "runtime gedrag ongewijzigd" requirement forbids. Every pre-existing
+// (migrated) configuration only ever produces EMPTY/ENABLED records, so
+// this is a no-op for any config that existed before Fase 12B.
+// Fase 13: extended with an optional out_config_slot so the one caller
+// that still needs it (sidetnfs_runtime_drives_init(), resolving the
+// active/boot drive) can record which of the 8 persisted slots supplied
+// it, without a second, separate scan -- see report,
+// "runtime_slot/config_slot/contextmapping". NULL-safe: pass NULL to
+// keep the old "letter only" behavior.
+static bool sidetnfs_config_find_drive_by_letter(char letter, sidetnfs_drive_config_t *out, int *out_config_slot)
 {
     for (uint8_t i = 0; i < SIDETNFS_MAX_DRIVES; i++)
     {
         sidetnfs_drive_config_t cfg;
         if (sidetnfs_config_get_drive(i, &cfg) != SIDETNFS_CONFIG_STATUS_OK)
         {
-            continue; // INVALID_INDEX/EMPTY_SLOT -- not a used drive
+            continue; // INVALID_INDEX -- structurally unreachable here, defensive only
+        }
+        if (!sidetnfs_drive_slot_is_enabled(&cfg))
+        {
+            continue; // EMPTY or DISABLED -- not eligible to be mounted
         }
         if (cfg.drive_letter == (uint8_t)letter)
         {
             *out = cfg;
+            if (out_config_slot != NULL)
+            {
+                *out_config_slot = (int)i;
+            }
             return true;
         }
     }
     return false;
+}
+
+// Fase 13: backend derived from a persisted config record's own .type --
+// GEMDRIVE_FILE_BACKEND_SD for SIDETNFS_DRIVE_SD, GEMDRIVE_FILE_BACKEND_TNFS
+// otherwise. Used for every ordinary (non-SETTINGS) runtime slot instead
+// of the old hardcoded GEMDRIVE_FILE_BACKEND_TNFS, so a persisted SD-type
+// record is tagged correctly and sidetnfs_probe_mount_runtime_slots()'s
+// explicit backend_type check correctly never tries to TNFS-mount it (no
+// SD backend I/O is implemented by this phase -- this is purely correct
+// tagging, see report).
+static GemdriveFileBackend sidetnfs_runtime_backend_for_config_type(uint8_t type)
+{
+    return (type == SIDETNFS_DRIVE_SD) ? GEMDRIVE_FILE_BACKEND_SD : GEMDRIVE_FILE_BACKEND_TNFS;
 }
 
 // Fase 1 (multi-drive slot routing): slot -> runtime-config helper.
@@ -2425,70 +3058,269 @@ static const sidetnfs_runtime_drive_t *sidetnfs_runtime_drive_get(int slot)
     return &g_runtime_drives[slot];
 }
 
-// Fase 1 (multi-drive slot routing): the single place g_runtime_drives
-// (and, derived from it, g_drive_number_table/g_drive_count and the
-// shared-memory drive table) is ever built. Called once at Pico boot and
-// again on every GEMDRVEMUL_PING reinit (see both call sites), each time
-// with whatever select_gemdrive_drive_letter() just resolved -- never a
-// second, independent drive-0 resolution.
+// Fase 13 (runtime-drive-publication audit follow-up): the single place
+// g_runtime_drives (and, derived from it, g_drive_number_table/
+// g_drive_count and the shared-memory drive table) is ever built. Called
+// once at Pico boot and again on every GEMDRVEMUL_PING reinit (see both
+// call sites), each time with whatever select_gemdrive_drive_letter()
+// just resolved -- never a second, independent drive-0 resolution.
 //
-// Slot 0 always mirrors the already-active N: drive: `active_drive_letter`/
-// `active_drive_number` are trusted as-is (the same values already
-// published via the existing scalar SHARED_VARIABLE_DRIVE_LETTER/
-// _DRIVE_NUMBER), but its full config record is looked up fresh via
-// sidetnfs_config_find_drive_by_letter() so slot 0 carries real
-// type/transport/host/mount_path/sd_path data, not just a bare number.
-// SIDETNFS_CONFIG_DRIVE_ONLY builds (or any other backend whose active
-// drive has no drives[] record, e.g. the config drive itself) get a
-// minimal synthesized record instead (used=1, correct letter, everything
-// else zeroed -- those fields are unused for that backend anyway).
-//
-// Slot 1 is the persisted 'O' config record -- this phase's fixed
-// two-drive publish/proof target (see report), not a general "find any
-// second drive" search. Validated before being published: letter must be
-// A-Z (sidetnfs_config_find_drive_by_letter() only ever returns records
-// whose stored letter came from SET_DRIVE's own A-Z validation, but
-// re-checked here too, defensively, since this function's own invariants
-// must hold regardless of caller), and its drive number must differ from
-// slot 0's (no duplicates, mirroring the 68k ROM's own
-// validate_drive_table check). A failed O: lookup, an invalid letter, or
-// a collision with slot 0 all safely fall back to publishing exactly one
-// drive (slot 0 only) -- never a malformed table.
-//
-// Slots 2..GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-1 are always cleared/
-// invalid in this phase.
+// Publication rule (replaces the old fixed "slot 0 = active, slot 1 =
+// hardcoded 'O'" model -- see report):
+//   1. Runtime slot 0 always mirrors the already-active/boot drive:
+//      `active_drive_letter`/`active_drive_number` are trusted as-is
+//      (the same values already published via the existing scalar
+//      SHARED_VARIABLE_DRIVE_LETTER/_DRIVE_NUMBER just before this
+//      function is called) -- this invariant is load-bearing, the 68k
+//      ROM's own boot-drive scalar and this table's slot 0 must never
+//      disagree. Two sub-cases:
+//        a. active_drive_letter IS the SETTINGS letter (the
+//           SIDETNFS_CONFIG_DRIVE_ONLY=1 legacy build's
+//           select_gemdrive_drive_letter() always returns it) -- SETTINGS
+//           is placed at slot 0 directly, detected by comparing letters,
+//           never a build-time #if.
+//        b. Otherwise, if a real ENABLED persisted record with that
+//           letter exists (sidetnfs_config_find_drive_by_letter()), it is
+//           placed at slot 0 and its config_slot is remembered so step 2
+//           below never publishes it a second time. If no real record
+//           matches (nothing configured at all -- e.g. only the ancient
+//           PARAM_GEMDRIVE_DRIVE ConfigEntry fallback resolved a letter),
+//           nothing ordinary is placed at slot 0 here; SETTINGS ends up
+//           there via step 3 below once step 2 also finds nothing ENABLED
+//           (see report, host test A).
+//   2. Every OTHER ENABLED ordinary config slot (0..SIDETNFS_MAX_DRIVES-1,
+//      skipping whichever config_slot step 1 already placed, if any) is
+//      published to the next free runtime slot, in ascending config_slot
+//      order -- DISABLED and EMPTY are skipped. Backend is derived from
+//      that record's own .type (SD or TNFS), never hardcoded.
+//   3. The always-present, read-only local SETTINGS disk (letter from
+//      sidetnfs_config_get_config_drive_letter(), backend
+//      GEMDRIVE_FILE_BACKEND_CONFIG_FLASH) is appended as the LAST
+//      runtime entry -- unless step 1a already placed it at slot 0.
+// Runtime capacity is exactly tight for the worst case (8 ENABLED
+// ordinary drives + SETTINGS): GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES ==
+// SIDETNFS_MAX_DRIVES + 1, so step 2 is still bounded defensively against
+// GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES - 1 (reserving the last index
+// for SETTINGS) even though it can never actually overflow by
+// construction.
 static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t active_drive_number, uint32_t memory_shared_address)
 {
     for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
     {
         g_runtime_drives[i].valid = false;
         g_runtime_drives[i].drive_number = 0xFFFFFFFF;
+        g_runtime_drives[i].config_slot = -1;
         memset(&g_runtime_drives[i].config, 0, sizeof(g_runtime_drives[i].config));
     }
 
-    if (active_drive_letter >= 'A' && active_drive_letter <= 'Z')
+    uint8_t settings_letter = sidetnfs_config_get_config_drive_letter();
+    if (settings_letter == 0)
     {
-        g_runtime_drives[0].valid = true;
-        g_runtime_drives[0].drive_number = active_drive_number;
-        if (!sidetnfs_config_find_drive_by_letter(active_drive_letter, &g_runtime_drives[0].config))
-        {
-            g_runtime_drives[0].config.used = 1;
-            g_runtime_drives[0].config.drive_letter = (uint8_t)active_drive_letter;
-        }
+        settings_letter = 'S'; // sidetnfs_config_init() not yet run -- should not happen this late, defensive only
     }
 
-    sidetnfs_drive_config_t o_config;
-    bool o_found = g_runtime_drives[0].valid && sidetnfs_config_find_drive_by_letter('O', &o_config);
-    uint32_t o_drive_number = (uint32_t)('O' - 'A');
-    bool o_valid = o_found && (o_drive_number != g_runtime_drives[0].drive_number);
-    if (o_valid)
+    bool active_is_settings = (active_drive_letter != '\0') && ((uint8_t)active_drive_letter == settings_letter);
+    int active_config_slot = -1; // which of the 8 persisted slots (if any) supplied runtime slot 0
+    int next_runtime_slot = 0;
+    bool settings_placed = false;
+    int settings_runtime_slot_for_diag = -1;
+
+    if (active_is_settings)
     {
-        g_runtime_drives[1].valid = true;
-        g_runtime_drives[1].drive_number = o_drive_number;
-        g_runtime_drives[1].config = o_config;
+        // Step 1a: SETTINGS goes to slot 0 directly -- see this
+        // function's own doc comment.
+        g_runtime_drives[0].valid = true;
+        g_runtime_drives[0].drive_number = (uint32_t)(settings_letter - 'A');
+        g_runtime_drives[0].backend = GEMDRIVE_FILE_BACKEND_CONFIG_FLASH;
+        g_runtime_drives[0].config.state = SIDETNFS_DRIVE_SLOT_ENABLED;
+        g_runtime_drives[0].config.drive_letter = settings_letter;
+        g_runtime_drives[0].config.type = SIDETNFS_DRIVE_SD; // see GEMDRVEMUL_FSFIRST_CALL's backend_type check, unchanged meaning
+        g_runtime_drives[0].config_slot = -1;
+        settings_placed = true;
+        settings_runtime_slot_for_diag = 0;
+        next_runtime_slot = 1;
+#if SIDETNFS_ENABLE_DIAG_UART
+        printf("settings %c -> runtime 0\r\n", (char)settings_letter);
+#endif
     }
-    DPRINTF("Runtime drive table: slot 0 valid=%d drive=%d, slot 1 (O:) valid=%d\n",
-            g_runtime_drives[0].valid, (int)g_runtime_drives[0].drive_number, o_valid);
+    else if (active_drive_letter >= 'A' && active_drive_letter <= 'Z')
+    {
+        sidetnfs_drive_config_t active_cfg;
+        int found_slot = -1;
+        if (sidetnfs_config_find_drive_by_letter(active_drive_letter, &active_cfg, &found_slot))
+        {
+            // Step 1b (real record found): slot 0 = the active/boot
+            // drive, carrying its real type/transport/host/mount_path/
+            // sd_path data.
+            g_runtime_drives[0].valid = true;
+            g_runtime_drives[0].drive_number = active_drive_number;
+            g_runtime_drives[0].config = active_cfg;
+            g_runtime_drives[0].backend = sidetnfs_runtime_backend_for_config_type(active_cfg.type);
+            g_runtime_drives[0].config_slot = found_slot;
+            active_config_slot = found_slot;
+            next_runtime_slot = 1;
+        }
+        // else: active_drive_letter resolved to nothing real (nothing
+        // configured at all) -- next_runtime_slot stays 0; step 2 below
+        // will also find nothing ENABLED in this exact scenario, so
+        // SETTINGS ends up at slot 0 via step 3 (host test A).
+    }
+
+    // Step 2: every other ENABLED ordinary config slot, ascending,
+    // skipping whichever one step 1 already placed (if any).
+    for (uint8_t config_slot = 0; config_slot < SIDETNFS_MAX_DRIVES; config_slot++)
+    {
+        if ((int)config_slot == active_config_slot)
+        {
+            continue; // already published at runtime slot 0 above
+        }
+        sidetnfs_drive_config_t cfg;
+        if (sidetnfs_config_get_drive(config_slot, &cfg) != SIDETNFS_CONFIG_STATUS_OK)
+        {
+            continue; // INVALID_INDEX -- structurally unreachable here, defensive only
+        }
+        if (!sidetnfs_drive_slot_is_enabled(&cfg))
+        {
+#if SIDETNFS_ENABLE_DIAG_UART
+            if (!sidetnfs_drive_slot_is_empty(&cfg))
+            {
+                printf("config %u %c %s DISABLED -> skipped\r\n", (unsigned)config_slot, (char)cfg.drive_letter,
+                       cfg.type == SIDETNFS_DRIVE_SD ? "SD" : "TNFS");
+            }
+            else
+            {
+                printf("config %u - - EMPTY -> skipped\r\n", (unsigned)config_slot);
+            }
+#endif
+            continue; // DISABLED or EMPTY -- never published
+        }
+        if (next_runtime_slot >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES - 1)
+        {
+            // Defensive only -- see this function's own doc comment on
+            // why this can never actually trigger given the current
+            // SIDETNFS_MAX_DRIVES/GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES
+            // sizing.
+            break;
+        }
+        g_runtime_drives[next_runtime_slot].valid = true;
+        g_runtime_drives[next_runtime_slot].drive_number = (uint32_t)(cfg.drive_letter - 'A');
+        g_runtime_drives[next_runtime_slot].config = cfg;
+        g_runtime_drives[next_runtime_slot].backend = sidetnfs_runtime_backend_for_config_type(cfg.type);
+        g_runtime_drives[next_runtime_slot].config_slot = (int)config_slot;
+#if SIDETNFS_ENABLE_DIAG_UART
+        printf("config %u %c %s ENABLED -> runtime %d\r\n", (unsigned)config_slot, (char)cfg.drive_letter,
+               cfg.type == SIDETNFS_DRIVE_SD ? "SD" : "TNFS", next_runtime_slot);
+#endif
+        next_runtime_slot++;
+    }
+    DPRINTF("Runtime drive table: slot 0 valid=%d drive=%d, %d ordinary slot(s) published\n",
+            g_runtime_drives[0].valid, (int)g_runtime_drives[0].drive_number, next_runtime_slot);
+
+    // Step 3: SETTINGS always last, unless step 1a already placed it at
+    // slot 0.
+    if (!settings_placed)
+    {
+        int settings_slot = next_runtime_slot;
+        g_runtime_drives[settings_slot].valid = true;
+        g_runtime_drives[settings_slot].drive_number = (uint32_t)(settings_letter - 'A');
+        g_runtime_drives[settings_slot].backend = GEMDRIVE_FILE_BACKEND_CONFIG_FLASH;
+        // Fase 12B: the SETTINGS disk is explicitly outside the eight-slot
+        // DISABLED/EMPTY/ENABLED model (see report, section 21/"Naamgeving
+        // SETTINGS-disk") -- it has no EMPTY or DISABLED state of its own,
+        // it's simply always present. This synthetic record still needs a
+        // syntactically valid `state` value since it reuses
+        // sidetnfs_drive_config_t; ENABLED matches its actual runtime
+        // meaning (it IS always published), never treat this as slot 8 of
+        // the ordinary drive list.
+        g_runtime_drives[settings_slot].config.state = SIDETNFS_DRIVE_SLOT_ENABLED;
+        g_runtime_drives[settings_slot].config.drive_letter = settings_letter;
+        // config.type deliberately set to SIDETNFS_DRIVE_SD, never
+        // SIDETNFS_DRIVE_TNFS -- this is NOT a claim that the SETTINGS
+        // disk is SD-backed (it never touches the SD/FatFS backend); it
+        // is the one field GEMDRVEMUL_FSFIRST_CALL's existing slot
+        // validation already reads to decide "does this slot need a live
+        // TNFS session" (see its own
+        // `backend_type != SIDETNFS_DRIVE_TNFS` check) -- reusing it here
+        // means that check needs no change at all to already treat a
+        // SETTINGS slot as never requiring a session.
+        g_runtime_drives[settings_slot].config.type = SIDETNFS_DRIVE_SD;
+        g_runtime_drives[settings_slot].config_slot = -1;
+        DPRINTF("Runtime drive table: slot %d (SETTINGS %c:) valid\n", settings_slot, settings_letter);
+#if SIDETNFS_ENABLE_DIAG_UART
+        printf("settings %c -> runtime %d\r\n", (char)settings_letter, settings_slot);
+#endif
+        settings_runtime_slot_for_diag = settings_slot;
+    }
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+    {
+        SidetnfsUartDiagSnapshot *settings_diag = sidetnfs_uart_diag();
+        settings_diag->settings_config_source = sidetnfs_config_loaded_from_flash() ? 0 : 1;
+        settings_diag->settings_fallback_reason = (uint8_t)sidetnfs_config_get_fallback_reason();
+        settings_diag->settings_drive_letter = (char)settings_letter;
+        settings_diag->settings_runtime_slot = settings_runtime_slot_for_diag;
+    }
+#endif
+
+#if SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
+    // Fase 12B4: requires SIDETNFS_ENABLE_DIAG_UART explicitly too -- see
+    // Dump A's own comment in main.c.
+    //
+    // Fase 12B3/12B4, Dump B -- compact runtime-drive-table summary.
+    // cslot is an informational back-lookup only (which of the 8 config
+    // slots, if any, supplied this entry's letter); ctxslot (Fase 12B4:
+    // renamed from "tslot", which was ambiguous) is only meaningful for
+    // backend TNFS, where it is definitionally the SAME number as the
+    // runtime slot itself (sidetnfs_probe_get_slot_context()/
+    // s_slot_contexts[] are indexed directly by runtime slot -- see
+    // report, there is no separate TNFS-slot index space in this
+    // codebase). Fase 12B4 bugfix: this print previously hardcoded the
+    // literal string "0" here regardless of the entry's actual runtime
+    // slot -- a diagnostic-output bug only (confirmed via source trace
+    // that sidetnfs_probe_get_slot_context(runtime_slot, ...) itself was
+    // always called with the correct, non-hardcoded slot number; nothing
+    // in the production I/O path was ever wrong). Now prints the real
+    // slot index (== _sd_i). SETTINGS never has a ctxslot.
+    printf("\r\n--- SLOTDIAG B: runtime drive table ---\r\n");
+    int _sd_count = 0;
+    for (int _sd_i = 0; _sd_i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; _sd_i++)
+    {
+        if (g_runtime_drives[_sd_i].valid) _sd_count++;
+    }
+    printf("RUN count=%d\r\n", _sd_count);
+    for (int _sd_i = 0; _sd_i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; _sd_i++)
+    {
+        if (!g_runtime_drives[_sd_i].valid)
+        {
+            continue;
+        }
+        bool _sd_is_settings = (g_runtime_drives[_sd_i].backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH);
+        int _sd_cslot = -1;
+        for (uint8_t _sd_s = 0; _sd_s < SIDETNFS_MAX_DRIVES; _sd_s++)
+        {
+            sidetnfs_drive_config_t _sd_probe;
+            if (sidetnfs_config_get_drive(_sd_s, &_sd_probe) == SIDETNFS_CONFIG_STATUS_OK &&
+                sidetnfs_drive_slot_is_configured(&_sd_probe) &&
+                _sd_probe.drive_letter == g_runtime_drives[_sd_i].config.drive_letter)
+            {
+                _sd_cslot = (int)_sd_s;
+                break;
+            }
+        }
+        if (_sd_is_settings)
+        {
+            printf("RUN rslot=%d letter=%c dnum=%lu backend=SETTINGS cslot=%d ctxslot=- valid=1\r\n",
+                   _sd_i, (char)g_runtime_drives[_sd_i].config.drive_letter,
+                   (unsigned long)g_runtime_drives[_sd_i].drive_number, _sd_cslot);
+        }
+        else
+        {
+            printf("RUN rslot=%d letter=%c dnum=%lu backend=TNFS cslot=%d ctxslot=%d valid=1\r\n",
+                   _sd_i, (char)g_runtime_drives[_sd_i].config.drive_letter,
+                   (unsigned long)g_runtime_drives[_sd_i].drive_number, _sd_cslot, _sd_i);
+        }
+    }
+    printf("--- END SLOTDIAG B ---\r\n\r\n");
+#endif // SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
 
     // Fase 1 (multi-drive slot routing, TNFS runtime context): mirrors
     // each valid slot's persisted host/port/mount_path/sd_path/backend/
@@ -2504,24 +3336,82 @@ static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t acti
         if (g_runtime_drives[i].valid)
         {
             sidetnfs_probe_set_slot_context(i, &g_runtime_drives[i].config);
+            // Fase 6 (SD-service): register every ENABLED SD-backend
+            // slot's driveletter/sd_path -- pure bookkeeping, no SD/FatFS
+            // access here. sidetnfs_sd_service_run() (called once, right
+            // after sidetnfs_runtime_drives_init() returns) does the
+            // actual one-shot check.
+            if (g_runtime_drives[i].backend == GEMDRIVE_FILE_BACKEND_SD)
+            {
+                sidetnfs_sd_service_set_slot_path(i, (char)g_runtime_drives[i].config.drive_letter,
+                                                    g_runtime_drives[i].config.sd_path);
+            }
         }
     }
 
     // Derive g_drive_number_table/g_drive_count from g_runtime_drives --
     // relies on validity being contiguous from slot 0 (guaranteed by
     // construction above: slot 1 can only be valid if slot 0 is).
+    //
+    // Fase 12B3: under SIDETNFS_ENABLE_SLOT_DIAG only, validate the
+    // invariants this construction is supposed to already guarantee
+    // (duplicate letters/drive_numbers, a settings slot masquerading as
+    // TNFS, an out-of-range drive_number) before publishing each entry --
+    // logs one line and skips publishing that specific entry rather than
+    // looping/blinking or writing a bad shared-memory value. Diagnostic
+    // only: production behavior (no SIDETNFS_ENABLE_SLOT_DIAG) is
+    // unchanged, still trusts the construction above unconditionally.
     g_drive_count = 0;
     for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
     {
-        if (g_runtime_drives[i].valid)
-        {
-            g_drive_number_table[i] = g_runtime_drives[i].drive_number;
-            g_drive_count = (uint32_t)(i + 1);
-        }
-        else
+        if (!g_runtime_drives[i].valid)
         {
             g_drive_number_table[i] = 0xFFFFFFFF;
+            continue;
         }
+
+#if SIDETNFS_ENABLE_SLOT_DIAG
+        // Fase 12B4: the reject/skip DECISION here never depends on
+        // UART -- only the log lines do (nested #if below), so this
+        // guard's actual safety value is preserved even in a
+        // SIDETNFS_ENABLE_DIAG_UART=0 build (e.g. SIDETNFS_ENABLE_SD_SLOT_DUMP).
+        bool _sd_reject = false;
+        if (g_runtime_drives[i].drive_number > 25)
+        {
+#if SIDETNFS_ENABLE_DIAG_UART
+            printf("SLOTDIAG GUARD: rslot=%d drive_number=%lu out of range 0..25 -- not published\r\n",
+                   i, (unsigned long)g_runtime_drives[i].drive_number);
+#endif
+            _sd_reject = true;
+        }
+        for (int j = 0; j < i && !_sd_reject; j++)
+        {
+            if (g_runtime_drives[j].valid && g_runtime_drives[j].drive_number == g_runtime_drives[i].drive_number)
+            {
+#if SIDETNFS_ENABLE_DIAG_UART
+                printf("SLOTDIAG GUARD: rslot=%d duplicates drive_number 0x%lx already published at rslot=%d -- not published\r\n",
+                       i, (unsigned long)g_runtime_drives[i].drive_number, j);
+#endif
+                _sd_reject = true;
+            }
+            if (g_runtime_drives[j].valid && g_runtime_drives[j].config.drive_letter == g_runtime_drives[i].config.drive_letter)
+            {
+#if SIDETNFS_ENABLE_DIAG_UART
+                printf("SLOTDIAG GUARD: rslot=%d duplicates letter %c already published at rslot=%d -- not published\r\n",
+                       i, (char)g_runtime_drives[i].config.drive_letter, j);
+#endif
+                _sd_reject = true;
+            }
+        }
+        if (_sd_reject)
+        {
+            g_drive_number_table[i] = 0xFFFFFFFF;
+            continue;
+        }
+#endif // SIDETNFS_ENABLE_SLOT_DIAG
+
+        g_drive_number_table[i] = g_runtime_drives[i].drive_number;
+        g_drive_count = (uint32_t)(i + 1);
     }
 
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
@@ -2534,6 +3424,26 @@ static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t acti
         }
     }
 #endif
+
+#if SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
+    // Fase 12B3/12B4, Dump C -- exactly what is about to be published to
+    // shared memory for the 68k ROM to read. Requires DIAG_UART too (see
+    // Dump A/B's own comments) -- _sd_count is only declared inside
+    // Dump B's block above, which is gated the same way.
+    printf("\r\n--- SLOTDIAG C: publication table ---\r\n");
+    printf("runtime_count=%d published_count=%lu table_bounds=0..%d\r\n",
+           _sd_count, (unsigned long)g_drive_count, GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES - 1);
+    for (int _sd_i = 0; _sd_i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; _sd_i++)
+    {
+        if (g_drive_number_table[_sd_i] == 0xFFFFFFFF)
+        {
+            continue;
+        }
+        printf("PUB index=%d drive_number=%lu runtime_slot=%d\r\n",
+               _sd_i, (unsigned long)g_drive_number_table[_sd_i], _sd_i);
+    }
+    printf("--- END SLOTDIAG C ---\r\n\r\n");
+#endif // SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
 
     // Publish to shared memory -- the exact same table the 68k ROM's
     // validate_drive_table/create_virtual_hard_disk (gemdrive.s) reads
@@ -2566,6 +3476,204 @@ static char select_gemdrive_drive_letter(void)
 #endif
 }
 
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+// Fase 12B4 (SD-only slot diagnosis): writes <hd_folder>/SLOTDIAG.TXT.
+// Read-only over the config/runtime state -- never mutates g_config,
+// g_runtime_drives, flash, or any counter (the call counters above are
+// only ever incremented at their own command handlers, never here).
+// Same FatFS write pattern as the existing DEBUG.TXT dumps
+// (sidetnfs_diag_dump_on_select()/sidetnfs_uart_diag_dump_to_file() in
+// sidetnfs_probe.c): f_open/CREATE_ALWAYS, snprintf into a line buffer,
+// f_write, f_close. Called only from the SELECT-press edge-handler in
+// the normal command-dispatch loop (never from boot, never from the
+// 10s factory-reset long-press, never from timing-critical bus code).
+static void sidetnfs_slot_diag_dump_to_file(const char *hd_folder)
+{
+    if (hd_folder == NULL)
+    {
+        // Fase 6 (SD-service requirement 10: "duidelijke foutmelding
+        // wanneer SD niet READY is"): the SD card itself is where this
+        // dump would be written, so there is nowhere else to surface a
+        // visible message -- report clearly via the debug console
+        // instead of a silent no-op. Never retries/forces a mount here.
+        DPRINTF("SLOTDIAG.TXT: SD not ready (no folder to write to) -- skipping dump\n");
+        return;
+    }
+    char path[160];
+    int n = snprintf(path, sizeof(path), "%s/SLOTDIAG.TXT", hd_folder);
+    if (n <= 0 || (size_t)n >= sizeof(path))
+    {
+        return;
+    }
+
+    FIL file;
+    FRESULT fr = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK)
+    {
+        DPRINTF("SLOTDIAG.TXT: could not open %s for writing (FRESULT %d) -- skipping dump\n", path, (int)fr);
+        return; // stay silent to the user, no crash -- just a clear debug-console message
+    }
+
+    char line[256];
+    UINT written;
+#define SLOTDIAG_WRITE(...)                                     \
+    do                                                          \
+    {                                                           \
+        int _sd_len = snprintf(line, sizeof(line), __VA_ARGS__); \
+        if (_sd_len > 0)                                        \
+        {                                                       \
+            f_write(&file, line, (UINT)_sd_len, &written);       \
+        }                                                       \
+    } while (0)
+
+    SLOTDIAG_WRITE("===== SLOTDIAG (SD-only) =====\r\n");
+
+    // --- config source/version/status ---
+    const char *load_status;
+    uint32_t migrated_from = sidetnfs_config_migrated_from_version();
+    if (migrated_from != 0)
+    {
+        load_status = "MIGRATED";
+    }
+    else if (sidetnfs_config_loaded_from_flash())
+    {
+        load_status = "NATIVE";
+    }
+    else
+    {
+        load_status = "FACTORY_FALLBACK";
+    }
+    SLOTDIAG_WRITE("config: status=%s migrated_from=%lu fallback_reason=%d version=%lu settings_letter=%c\r\n",
+                   load_status, (unsigned long)migrated_from, (int)sidetnfs_config_get_fallback_reason(),
+                   (unsigned long)SIDETNFS_CONFIG_FLASH_VERSION, (char)sidetnfs_config_get_config_drive_letter());
+    SLOTDIAG_WRITE("config: drive_count(configured)=%u enabled_count=%u\r\n",
+                   (unsigned)sidetnfs_config_get_drive_count(), (unsigned)sidetnfs_config_get_enabled_drive_count());
+
+    // --- 8 config slots: state, letter, type ---
+    for (uint8_t i = 0; i < SIDETNFS_MAX_DRIVES; i++)
+    {
+        sidetnfs_drive_config_t d;
+        sidetnfs_config_get_drive(i, &d);
+        if (sidetnfs_drive_slot_is_empty(&d))
+        {
+            SLOTDIAG_WRITE("CFG slot=%u state=EMPTY\r\n", (unsigned)i);
+        }
+        else
+        {
+            SLOTDIAG_WRITE("CFG slot=%u state=%s letter=%c type=%u\r\n", (unsigned)i,
+                           sidetnfs_drive_slot_is_enabled(&d) ? "ENABLED" : "DISABLED",
+                           (char)d.drive_letter, (unsigned)d.type);
+        }
+    }
+
+    // --- runtime table + TNFS contexts + publication table ---
+    int runtime_count = 0;
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (g_runtime_drives[i].valid) runtime_count++;
+    }
+    SLOTDIAG_WRITE("runtime_count=%d\r\n", runtime_count);
+
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (!g_runtime_drives[i].valid)
+        {
+            continue;
+        }
+        bool is_settings = (g_runtime_drives[i].backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH);
+        int cslot = -1;
+        for (uint8_t s = 0; s < SIDETNFS_MAX_DRIVES; s++)
+        {
+            sidetnfs_drive_config_t probe;
+            if (sidetnfs_config_get_drive(s, &probe) == SIDETNFS_CONFIG_STATUS_OK &&
+                sidetnfs_drive_slot_is_configured(&probe) &&
+                probe.drive_letter == g_runtime_drives[i].config.drive_letter)
+            {
+                cslot = (int)s;
+                break;
+            }
+        }
+        if (is_settings)
+        {
+            SLOTDIAG_WRITE("RUN rslot=%d letter=%c dnum=%lu backend=SETTINGS cslot=%d ctxslot=-\r\n",
+                           i, (char)g_runtime_drives[i].config.drive_letter,
+                           (unsigned long)g_runtime_drives[i].drive_number, cslot);
+        }
+        else
+        {
+            SLOTDIAG_WRITE("RUN rslot=%d letter=%c dnum=%lu backend=TNFS cslot=%d ctxslot=%d\r\n",
+                           i, (char)g_runtime_drives[i].config.drive_letter,
+                           (unsigned long)g_runtime_drives[i].drive_number, cslot, i);
+
+            sidetnfs_slot_tnfs_context_t ctx;
+            if (sidetnfs_probe_get_slot_context(i, &ctx))
+            {
+                char host_safe[32];
+                strncpy(host_safe, ctx.host, sizeof(host_safe) - 1);
+                host_safe[sizeof(host_safe) - 1] = '\0';
+                SLOTDIAG_WRITE("CTX ctxslot=%d host=%s port=%u session_id=0x%04x established=%d\r\n",
+                               i, host_safe, (unsigned)ctx.port, (unsigned)ctx.session_id,
+                               (int)ctx.session_established);
+            }
+        }
+    }
+
+    SLOTDIAG_WRITE("published_count=%lu table_bounds=0..%d\r\n",
+                   (unsigned long)g_drive_count, GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES - 1);
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (g_drive_number_table[i] == 0xFFFFFFFF)
+        {
+            continue;
+        }
+        SLOTDIAG_WRITE("PUB index=%d drive_number=%lu runtime_slot=%d\r\n", i, (unsigned long)g_drive_number_table[i], i);
+    }
+
+    // --- active file handles ---
+    int handle_count = 0;
+    for (FileDescriptors *cur = fdescriptors; cur != NULL; cur = cur->next)
+    {
+        handle_count++;
+    }
+    SLOTDIAG_WRITE("filehandles_active=%d\r\n", handle_count);
+    for (FileDescriptors *cur = fdescriptors; cur != NULL; cur = cur->next)
+    {
+        const char *backend_name =
+            (cur->backend == GEMDRIVE_FILE_BACKEND_TNFS) ? "TNFS" :
+            (cur->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH) ? "SETTINGS" :
+            (cur->backend == GEMDRIVE_FILE_BACKEND_NET_ERR) ? "NET_ERR" :
+            (cur->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR) ? "SD_ERROR" : "SD";
+        SLOTDIAG_WRITE("FH fd=%d backend=%s runtime_slot=%d\r\n", cur->fd, backend_name, cur->runtime_slot);
+    }
+
+    // --- active DTA searches ---
+    int dta_count = 0;
+    for (int i = 0; i < SIDETNFS_TNFS_DTA_SLOTS; i++)
+    {
+        uint32_t ndta;
+        int rslot;
+        if (sidetnfs_tnfs_dta_search_snapshot(i, &ndta, &rslot))
+        {
+            dta_count++;
+            SLOTDIAG_WRITE("DTA index=%d ndta=0x%08lx runtime_slot=%d\r\n", i, (unsigned long)ndta, rslot);
+        }
+    }
+    SLOTDIAG_WRITE("dta_searches_active=%d\r\n", dta_count);
+
+    // --- protocol call counters ---
+    SLOTDIAG_WRITE("GET_DRIVE: calls=%lu last_index=%lu last_status=%lu\r\n",
+                   (unsigned long)g_get_drive_calls, (unsigned long)g_get_drive_last_index,
+                   (unsigned long)g_get_drive_last_status);
+    SLOTDIAG_WRITE("SET_DRIVE: calls=%lu\r\n", (unsigned long)g_set_drive_calls);
+    SLOTDIAG_WRITE("SAVE_CONFIG: calls=%lu\r\n", (unsigned long)g_save_config_calls);
+
+    SLOTDIAG_WRITE("===== END SLOTDIAG =====\r\n");
+#undef SLOTDIAG_WRITE
+
+    f_close(&file);
+}
+#endif // SIDETNFS_ENABLE_SD_SLOT_DUMP
+
 // Fase 4 (CYW43-initialisatie en WiFi-timeouts): exactly three
 // WiFi-connect attempts, each bounded to five seconds -- replaces the old
 // single PARAM_GEMDRIVE_TIMEOUT_SEC-bounded (default 45s) wait. Pico-side
@@ -2574,6 +3682,16 @@ static char select_gemdrive_drive_letter(void)
 // unaffected -- see init_gemdrvemul()'s own WiFi-connect block.
 #define SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS 3
 #define SIDETNFS_WIFI_CONNECT_ATTEMPT_TIMEOUT_MS 5000
+
+// Fase 8 (boot-time NTP met korte timeout): the one, single initial NTP
+// attempt at boot is now bounded to this fixed timeout instead of the old
+// PARAM_GEMDRIVE_TIMEOUT_SEC-bounded (default 45s) wait -- a failed/slow
+// NTP sync no longer holds up the Atari/GEMDRIVE handshake. No background
+// retry, no generation mechanism: on timeout GEMDRVEMUL_RTC_STATUS simply
+// stays 0 (unchanged meaning), exactly as when RTC/NTP was never enabled;
+// the existing 68k-side wait_rtc timeout (gemdrive.s, untouched) already
+// handles that case as before.
+#define SIDETNFS_NTP_INITIAL_TIMEOUT_MS 3000
 
 void init_gemdrvemul(bool safe_config_reboot)
 {
@@ -2725,6 +3843,72 @@ void init_gemdrvemul(bool safe_config_reboot)
     // to it yet; everything below this call still operates on slot 0/N:
     // exactly as before.
     sidetnfs_runtime_drives_init((char)drive_letter_num, drive_number, memory_shared_address);
+
+    // Fase 6 (SD-service): the one boot-time SD detect/mount/per-slot
+    // directory check -- runs exactly once (sidetnfs_sd_service_run()'s
+    // own guard), unconditionally, independent of WiFi/RTC/TNFS below.
+    // Never blocks: a missing/failed card only ever affects an ENABLED
+    // SD-backend drive's own status (see sidetnfs_sd_get_drive_status()),
+    // never WiFi, TNFS, SETTINGS, or this function's own command loop.
+    sidetnfs_sd_service_run();
+
+#if SIDETNFS_ENABLE_DIAG_UART && !SIDETNFS_ENABLE_SLOT_DIAG
+    // Fase 12B3: automatically suppressed when SIDETNFS_ENABLE_SLOT_DIAG
+    // is on -- see that build option's own CMake comment; Dump B/C inside
+    // sidetnfs_runtime_drives_init() itself replace this for that build.
+    // Fase 12B2: second half of the boot-time config diagnosis (first
+    // half is sidetnfs_config_dump_uart(), called from main.c right after
+    // sidetnfs_config_init() -- before this function ever ran). Shows
+    // whether the flash config was translated correctly into the runtime
+    // table: a DISABLED/EMPTY slot appearing here as a valid runtime
+    // drive, a wrong config-slot match, or a duplicated SETTINGS entry
+    // would all be visible directly below. Read-only -- only prints
+    // g_runtime_drives/g_drive_number_table/g_drive_count, never mutates
+    // them.
+    printf("\r\n===== SIDETNFS RUNTIME DRIVE TABLE (after sidetnfs_runtime_drives_init) =====\r\n");
+    printf("g_drive_count: %lu\r\n", (unsigned long)g_drive_count);
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        if (!g_runtime_drives[i].valid)
+        {
+            printf("runtime slot %d: (invalid/unused)\r\n", i);
+            continue;
+        }
+        const char *backend_name =
+            (g_runtime_drives[i].backend == GEMDRIVE_FILE_BACKEND_TNFS) ? "TNFS" :
+            (g_runtime_drives[i].backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH) ? "CONFIG_FLASH" :
+            (g_runtime_drives[i].backend == GEMDRIVE_FILE_BACKEND_SD) ? "SD" : "UNKNOWN";
+
+        // Informational only: which of the 8 persisted config slots (if
+        // any) actually supplied this runtime entry's letter -- -1 if
+        // none matches (e.g. the legacy no-TNFS-configured fallback
+        // letter, or the SETTINGS disk, which has no slot index at all).
+        int matching_config_slot = -1;
+        for (uint8_t s = 0; s < SIDETNFS_MAX_DRIVES; s++)
+        {
+            sidetnfs_drive_config_t probe;
+            if (sidetnfs_config_get_drive(s, &probe) == SIDETNFS_CONFIG_STATUS_OK &&
+                sidetnfs_drive_slot_is_configured(&probe) &&
+                probe.drive_letter == g_runtime_drives[i].config.drive_letter)
+            {
+                matching_config_slot = (int)s;
+                break;
+            }
+        }
+
+        printf("runtime slot %d: letter=%c backend=%s config_slot=%d drive_number=0x%08lx enabled=%s state=%u\r\n",
+               i, (char)g_runtime_drives[i].config.drive_letter, backend_name, matching_config_slot,
+               (unsigned long)g_runtime_drives[i].drive_number,
+               sidetnfs_drive_slot_is_enabled(&g_runtime_drives[i].config) ? "yes" : "no",
+               (unsigned)g_runtime_drives[i].config.state);
+    }
+    printf("g_drive_number_table:");
+    for (int i = 0; i < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES; i++)
+    {
+        printf(" [%d]=0x%08lx", i, (unsigned long)g_drive_number_table[i]);
+    }
+    printf("\r\n===== END RUNTIME DRIVE TABLE =====\r\n\r\n");
+#endif // SIDETNFS_ENABLE_DIAG_UART
 
     for (int i = 0; i < SHARED_VARIABLES_SIZE; i++)
     {
@@ -2924,35 +4108,17 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             bool dns_query_done = false;
 
-            // Fase 8C: this loop previously had NO bound at all -- only
-            // `while (get_rtc_time()->year == 0)`, with no timeout
-            // decrement anywhere in its body. The "Timeout reached. RTC
-            // not set." DPRINTF in the else-branch right after this loop
-            // (unchanged below) already implies a timeout was intended,
-            // but nothing ever produced one: a DNS failure or unreachable
-            // NTP server would spin here forever, and since this all runs
-            // *before* the main GEMDRVEMUL command-dispatch loop further
-            // down, the Atari's PING (and the entire GEMDRIVE handshake)
-            // would never be answered -- exactly the unbounded-network-wait
-            // class of bug this phase requires eliminating. Bounded here
-            // the same way the WiFi-connect wait above it already is:
-            // reuses the same configured PARAM_GEMDRIVE_TIMEOUT_SEC value
-            // (gemdrive_timeout_sec, default 45s), decremented once per
-            // second. On expiry, falls through to the existing (already
-            // correct) "RTC not set" else-branch below -- no other
-            // behavior change.
-            uint32_t ntp_timeout_sec = gemdrive_timeout_sec;
-            absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(ntp_second_t, 0);
+            // Fase 8 (boot-time NTP met korte timeout): a single, short
+            // (~3s) attempt -- replaces the old, up-to-45s
+            // PARAM_GEMDRIVE_TIMEOUT_SEC-bounded wait. On timeout, boot
+            // continues immediately below regardless (see the RTC-status
+            // handling and the unconditional WiFi/TNFS readiness further
+            // down) -- no background retry.
+            absolute_time_t ntp_deadline = make_timeout_time_ms(SIDETNFS_NTP_INITIAL_TIMEOUT_MS);
 
             // Wait until the RTC is set by the NTP server, or the timeout expires
-            while (get_rtc_time()->year == 0 && ntp_timeout_sec > 0)
+            while (get_rtc_time()->year == 0 && !time_reached(ntp_deadline))
             {
-                if (time_passed(&ntp_second_t, 1000) == 1)
-                {
-                    ntp_timeout_sec--;
-                    ntp_second_t = make_timeout_time_ms(0);
-                }
-
 #if PICO_CYW43_ARCH_POLL
                 network_safe_poll();
 #endif
@@ -3021,34 +4187,46 @@ void init_gemdrvemul(bool safe_config_reboot)
                         GEMDRVEMUL_RTC_DATETIME_MSDOS,
                         (int16_t)gemdos_version,
                         y2k_patch_enabled);
-                        
-                // If set then set the RTC and network status to 1, otherwise set it to 0
-                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RTC_STATUS)) = 0xFFFFFFFF;
-                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0xFFFFFFFF;
 
-                // Fase 5C: TNFS MOUNT probe. This is the last point in
-                // network setup where WiFi is still known to be up (every
-                // other path below this falls back to cyw43_arch_deinit()),
-                // and it runs before the main command loop below ever sees
-                // a real Atari/GEMDRIVE handshake.
-                //
-                // Fase 1 (multi-drive slot routing, TNFS mount sequencing):
-                // now mounts slot 0 (N:) exactly as sidetnfs_send_mount_probe()
-                // always did, then, strictly afterward, slot 1 (O:) if
-                // valid -- see sidetnfs_probe_mount_runtime_slots(). Bounded
-                // (~200ms per slot actually attempted) rather than the old
-                // pure fire-and-forget call; slot 0's own request/response
-                // handling is unchanged.
-                sidetnfs_network_ok = true;
-                sidetnfs_probe_mount_runtime_slots();
+                // RTC/date-time published -- mark ready.
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RTC_STATUS)) = 0xFFFFFFFF;
             }
             else
             {
-                DPRINTF("Timeout reached. RTC not set.\n");
-                cyw43_arch_deinit();
-                DPRINTF("No wifi configured. Skipping network initialization.\n");
-                sidetnfs_mark_network_skipped();
+                // Fase 8 (boot-time NTP met korte timeout): the ~3s
+                // attempt above timed out (or an invalid/erroring NTP
+                // response never set get_rtc_time()->year) --
+                // GEMDRVEMUL_RTC_STATUS simply stays 0 (unchanged
+                // meaning), and boot continues below exactly as it does
+                // when RTC/NTP was never enabled. No cyw43_arch_deinit()
+                // here anymore -- an NTP failure must never affect
+                // WiFi/TNFS (see below).
+                DPRINTF("NTP timeout reached. RTC not set -- continuing boot regardless.\n");
             }
+
+            // Fase 8 (boot-time NTP met korte timeout): WiFi/TNFS
+            // readiness no longer depends on NTP/RTC success -- this used
+            // to be gated inside the RTC-success branch above, with a
+            // cyw43_arch_deinit() fallback on failure (breaking WiFi/TNFS
+            // on every NTP timeout). Both are removed: NETWORK_STATUS and
+            // the TNFS mount probe below now always run once WiFi is up,
+            // independent of the NTP outcome above.
+            //
+            // Fase 5C: TNFS MOUNT probe. This is the last point in
+            // network setup where WiFi is still known to be up, and it
+            // runs before the main command loop below ever sees a real
+            // Atari/GEMDRIVE handshake.
+            //
+            // Fase 1 (multi-drive slot routing, TNFS mount sequencing):
+            // mounts slot 0 (N:) exactly as sidetnfs_send_mount_probe()
+            // always did, then, strictly afterward, every other valid
+            // slot -- see sidetnfs_probe_mount_runtime_slots(). Bounded
+            // (~200ms per slot actually attempted) rather than the old
+            // pure fire-and-forget call; slot 0's own request/response
+            // handling is unchanged.
+            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0xFFFFFFFF;
+            sidetnfs_network_ok = true;
+            sidetnfs_probe_mount_runtime_slots();
         }
     }
     else
@@ -3142,6 +4320,47 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_REBOOT_PICO:
+        {
+            // Fase 9A (Pico-resetcommando): no request payload accepted.
+            // Never accept a second, concurrent reboot request -- reject
+            // (still ACK, so the Atari-side send_sync doesn't hang, but
+            // no additional watchdog_reboot()/delay is armed) if one is
+            // already pending.
+            if (sidetnfs_reboot_pico_pending)
+            {
+                DPRINTF("REBOOT_PICO: reboot already pending -- ignoring duplicate request.\n");
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            sidetnfs_reboot_pico_pending = true;
+
+            // No SAVE of any kind here -- drive/network/RTC config and
+            // flash defaults are untouched; only the already-persisted
+            // configuration is (re)loaded on the next boot, exactly like
+            // any other reset.
+            DPRINTF("REBOOT_PICO: ACK, rebooting in %d ms.\n", SIDETNFS_REBOOT_PICO_DELAY_MS);
+
+            // Write the ACK (random token) BEFORE the delay/reboot below,
+            // so the cartridge-bus transaction and this shared-memory
+            // response are fully visible to the Atari before the reset
+            // begins.
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+
+            // Short fixed delay (not a long-running/blocking wait loop --
+            // a single bounded sleep) so the ACK write above has time to
+            // actually land before the reboot below. Same
+            // sleep_ms()+watchdog_reboot(0,0,0)+spin pattern already used
+            // by the existing factory-reset/recovery reboots in main.c.
+            sleep_ms(SIDETNFS_REBOOT_PICO_DELAY_MS);
+            watchdog_reboot(0, 0, 0);
+            while (true)
+            {
+                tight_loop_contents();
+            }
+        }
         case GEMDRVEMUL_SAVE_VECTORS:
         {
             DPRINTF("Saving vectors\n");
@@ -3222,7 +4441,27 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // readiness. No FatFS file/directory operation beyond the
                 // mount itself is ever attempted in this branch.
 #if SIDETNFS_ENABLE_SD_SUPPORT
-                if (!sd_init_driver())
+                // Fase 7 (SD-mounts als volledige runtime-backend): if the
+                // Fase 6 SD-service already mounted "0:" successfully
+                // (READY), this legacy diagnostics-only re-mount is
+                // skipped entirely -- f_mount() always unregisters the
+                // CURRENTLY-registered FatFS object for a volume before
+                // attempting the new one (see ff.c), even when the new
+                // attempt then fails, so a second, redundant f_mount()
+                // here could silently break every real per-slot SD file
+                // operation Fase 7 now performs, for no benefit (the
+                // volume is already known-good). Only reached when the
+                // SD-service itself reports anything other than READY --
+                // exactly its original "best-effort, give a card a second
+                // chance by first PING" behavior, unchanged.
+                if (sidetnfs_sd_service_has_run() && sidetnfs_sd_global_status() == SIDETNFS_SD_STATUS_READY)
+                {
+                    hd_folder = find_entry(PARAM_GEMDRIVE_FOLDERS)->value;
+                    sd_available = true;
+                    DPRINTF("SD card already mounted by the SD-service -- reusing it for diagnostics, folder: %s\n",
+                             hd_folder);
+                }
+                else if (!sd_init_driver())
                 {
                     DPRINTF("INFO: No SD card detected -- TNFS-only, DEBUG.TXT snapshot unavailable\r\n");
                 }
@@ -3252,12 +4491,11 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // mounted above.
                 close_all_files(&fdescriptors);
                 cleanDTAHashTable();
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-                // Fase 10B2: a config-drive search slot from a previous
-                // Atari session (before a Pico reboot, or a stale ndta
-                // otherwise) must never survive into this fresh boot.
+                // Fase 10B2/12A: a SETTINGS-disk search slot from a
+                // previous Atari session (before a Pico reboot, or a stale
+                // ndta otherwise) must never survive into this fresh boot.
+                // Harmless no-op if nothing was active.
                 sidetnfs_config_drive_search_close_all();
-#endif
                 delete_all_files(&fdescriptors);
                 DPRINTF("DTA table elements: %d\n", countDTA());
                 DPRINTF("File descriptors: %d\n", count_fdesc(fdescriptors));
@@ -3326,12 +4564,10 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // backend, since no TNFS session/handles would exist there.
                 close_all_files(&fdescriptors);
                 cleanDTAHashTable();
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-                // Fase 10B2: same as the first-PING cleanup above -- a
-                // config-drive search slot from before this reinit must
-                // never survive it.
+                // Fase 10B2/12A: same as the first-PING cleanup above -- a
+                // SETTINGS-disk search slot from before this reinit must
+                // never survive it. Harmless no-op if nothing was active.
                 sidetnfs_config_drive_search_close_all();
-#endif
                 delete_all_files(&fdescriptors);
                 DPRINTF("Fase 9E reinit -- DTA table elements: %d\n", countDTA());
                 DPRINTF("Fase 9E reinit -- File descriptors: %d\n", count_fdesc(fdescriptors));
@@ -3453,15 +4689,24 @@ void init_gemdrvemul(bool safe_config_reboot)
             // the RAM drive list. No SD/WiFi/TNFS/flash access, no
             // handle/session changes. Request: one uint32_t index (same
             // d3-register convention as GEMDRVEMUL_DFREE_CALL/
-            // shared-variable reads above). See
+            // shared-variable reads above). Fase 12B: status is OK for
+            // EMPTY as much as for DISABLED/ENABLED -- only an
+            // out-of-range index is ever a non-OK status now; the caller
+            // reads DRIVE_STATE to tell the three apart. See
             // docs/sidetnfs-config-protocol.md for the exact wire layout.
             uint32_t drive_index = GET_PAYLOAD_PARAM32(payloadPtr);
 
             sidetnfs_drive_config_t drive;
             sidetnfs_config_status_t result = sidetnfs_config_get_drive((uint8_t)drive_index, &drive);
 
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+            g_get_drive_calls++;
+            g_get_drive_last_index = drive_index;
+            g_get_drive_last_status = (uint32_t)result;
+#endif
+
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_USED, (uint16_t)drive.used);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATE, (uint16_t)drive.state);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_LETTER, (uint16_t)drive.drive_letter);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_TYPE, (uint16_t)drive.type);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_TRANSPORT, (uint16_t)drive.transport);
@@ -3501,11 +4746,13 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Fase 9C: RAM-only write of one ordinary drive record. No
             // flash access. Request payload mirrors GET_DRIVE's response
             // field order (minus status): index, then the same
-            // used/drive_letter/type/transport/port/nickname/host/
+            // state/drive_letter/type/transport/port/nickname/host/
             // mount_path/sd_path fields, read sequentially from
             // payloadPtr -- the same word-by-word/COPY_AND_CHANGE_ENDIANESS_BLOCK16
             // convention GEMDRVEMUL_FOPEN_CALL/DSETPATH_CALL already use to
-            // read Atari->Pico string arguments. See
+            // read Atari->Pico string arguments. Fase 12B:
+            // sidetnfs_config_set_drive() now dispatches on state
+            // (EMPTY/DISABLED/ENABLED) -- see its own doc comment. See
             // docs/sidetnfs-config-protocol.md.
             uint32_t drive_index = GET_PAYLOAD_PARAM32(payloadPtr);
             payloadPtr += 2;
@@ -3513,7 +4760,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_drive_config_t drive;
             memset(&drive, 0, sizeof(drive));
 
-            drive.used = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            drive.state = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
             payloadPtr += 1;
             drive.drive_letter = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
             payloadPtr += 1;
@@ -3534,6 +4781,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             payloadPtr += SIDETNFS_SDPATH_LEN / 2;
 
             sidetnfs_config_status_t result = sidetnfs_config_set_drive((uint8_t)drive_index, &drive);
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+            g_set_drive_calls++;
+#endif
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -3574,6 +4824,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             // runtime code uses the saved list. Request: none. Response:
             // status only.
             sidetnfs_config_status_t result = sidetnfs_config_save();
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+            g_save_config_calls++;
+#endif
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_DRIVE_STATUS, (uint32_t)result);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -3803,14 +5056,30 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             // Check the free space
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: fixed 256 KiB virtual capacity, reported entirely
-            // full (read-only drive -- see sidetnfs_config_drive_get_disk_info()).
             ScFsDiskInfo disk_info;
-            sidetnfs_config_drive_get_disk_info(&disk_info.total_clusters, &disk_info.free_clusters,
-                                                  &disk_info.bytes_per_sector, &disk_info.sectors_per_cluster);
-            bool disk_info_ok = true;
-#else
+            bool disk_info_ok;
+            if (sidetnfs_runtime_slot_is_settings(dfree_slot))
+            {
+                // Fase 10B/12A: fixed 256 KiB virtual capacity, reported
+                // entirely full (read-only drive -- see
+                // sidetnfs_config_drive_get_disk_info()).
+                sidetnfs_config_drive_get_disk_info(&disk_info.total_clusters, &disk_info.free_clusters,
+                                                      &disk_info.bytes_per_sector, &disk_info.sectors_per_cluster);
+                disk_info_ok = true;
+            }
+            else if (sidetnfs_slot_backend_is_sd(dfree_slot))
+            {
+                // Fase 7 (SD-mounts als volledige runtime-backend): real
+                // FatFS volume info -- "0:" identifies the physical
+                // volume, not a specific sd_path, so every SD drive on
+                // this card reports the SAME real capacity regardless of
+                // its own root (explicitly allowed by the task). Not
+                // READY reports a plain Dfree error -- there is no real
+                // capacity to report while the card/mount itself isn't up.
+                disk_info_ok = sidetnfs_sd_slot_ready(dfree_slot) && scfs_get_disk_info("0:", &disk_info);
+            }
+            else
+            {
             // Fase 7N: tnfsd 24.0522.1 has no TNFS command for free/total
             // disk space -- no SIZE/FREE/SIZEBYTES/FREEBYTES-equivalent
             // opcode, and no statvfs()/statfs() call anywhere in its
@@ -3829,13 +5098,12 @@ void init_gemdrvemul(bool safe_config_reboot)
             // "Bytes available = 0" in Show Information on real hardware
             // (see report).
             sidetnfs_diag_log(SIDETNFS_DIAG_DFREE_SYNTHETIC, 0, NULL, NULL, NULL, 0, 0, 0, 0);
-            ScFsDiskInfo disk_info;
             disk_info.free_clusters = SIDETNFS_DFREE_TNFS_FREE_CLUSTERS;
             disk_info.total_clusters = SIDETNFS_DFREE_TNFS_TOTAL_CLUSTERS;
             disk_info.bytes_per_sector = SIDETNFS_DFREE_TNFS_BYTES_PER_SECTOR;
             disk_info.sectors_per_cluster = SIDETNFS_DFREE_TNFS_SECTORS_PER_CLUSTER;
-            bool disk_info_ok = true;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
+            disk_info_ok = true;
+            }
 #else
             ScFsDiskInfo disk_info;
             bool disk_info_ok = scfs_get_disk_info(hd_folder, &disk_info);
@@ -4097,19 +5365,36 @@ void init_gemdrvemul(bool safe_config_reboot)
 #endif
 
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: root-only drive -- Dsetpath only succeeds for the
-            // root itself ("" or "/"); any subdirectory reference is a
-            // clean GEMDOS_EPTHNF, since this backend has no directories.
-            char dsetpath_config_path[MAX_FOLDER_LENGTH];
-            snprintf(dsetpath_config_path, sizeof(dsetpath_config_path), "%s", dpath_tmp);
-            size_t dsetpath_config_path_len = strlen(dsetpath_config_path);
-            if (dsetpath_config_path_len > 1 && dsetpath_config_path[dsetpath_config_path_len - 1] == '/')
+            bool dsetpath_exists;
+            if (sidetnfs_runtime_slot_is_settings(dsetpath_slot))
             {
-                dsetpath_config_path[dsetpath_config_path_len - 1] = '\0';
+                // Fase 10B/12A: root-only drive -- Dsetpath only succeeds
+                // for the root itself ("" or "/"); any subdirectory
+                // reference is a clean GEMDOS_EPTHNF, since this backend
+                // has no directories.
+                char dsetpath_config_path[MAX_FOLDER_LENGTH];
+                snprintf(dsetpath_config_path, sizeof(dsetpath_config_path), "%s", dpath_tmp);
+                size_t dsetpath_config_path_len = strlen(dsetpath_config_path);
+                if (dsetpath_config_path_len > 1 && dsetpath_config_path[dsetpath_config_path_len - 1] == '/')
+                {
+                    dsetpath_config_path[dsetpath_config_path_len - 1] = '\0';
+                }
+                dsetpath_exists = (dsetpath_config_path[0] == '\0' || strcmp(dsetpath_config_path, "/") == 0);
             }
-            bool dsetpath_exists = (dsetpath_config_path[0] == '\0' || strcmp(dsetpath_config_path, "/") == 0);
-#else
+            else if (sidetnfs_slot_backend_is_sd(dsetpath_slot))
+            {
+                // Fase 7 (SD-mounts als volledige runtime-backend): real
+                // per-slot FatFS existence check, root-safe via
+                // sidetnfs_sd_build_fatfs_path() (dpath_tmp is already the
+                // normalized, GEMDOS-rooted target path -- see
+                // normalize_gemdos_path() above).
+                char dsetpath_sd_path[MAX_FOLDER_LENGTH * 2];
+                dsetpath_exists = sidetnfs_sd_build_fatfs_path(dsetpath_slot, dpath_tmp, dsetpath_sd_path,
+                                                                 sizeof(dsetpath_sd_path)) &&
+                                   scfs_directory_exists(dsetpath_sd_path);
+            }
+            else
+            {
             // Fase 8A: the old unconditional scfs_directory_exists(tmp_path)
             // "SD_CHECK" (comparison-only, never affecting dsetpath_exists
             // under this backend) touched the physical SD card via FatFS
@@ -4139,10 +5424,10 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_PATH, 0, dsetpath_tnfs_path, NULL, NULL, 0, 0, 0, 0);
             uint8_t dsetpath_tnfs_rc = 0;
-            bool dsetpath_exists = sidetnfs_tnfs_directory_exists(dsetpath_slot, dsetpath_tnfs_path, &dsetpath_tnfs_rc);
+            dsetpath_exists = sidetnfs_tnfs_directory_exists(dsetpath_slot, dsetpath_tnfs_path, &dsetpath_tnfs_rc);
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_EXISTS_RC, 0, dsetpath_tnfs_path, NULL, NULL, 0, 0,
                                dsetpath_tnfs_rc, 0);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
+            }
 #else
             char tmp_path[MAX_FOLDER_LENGTH] = {0};
             // Concatenate the path with the hd_folder
@@ -4166,15 +5451,24 @@ void init_gemdrvemul(bool safe_config_reboot)
                 sidetnfs_uart_diag()->dsetpath_last_result = (uint16_t)GEMDOS_EPTHNF;
 #endif
             }
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B-afronding: a failed Dsetpath (any non-root reference,
-            // since this drive has no subdirectories) must never mutate
-            // dpath_string_table[dsetpath_slot] -- the existing CWD (always
-            // root) stays exactly as it was. The unconditional strcpy()
-            // below is the TNFS/SD-backend behavior, unchanged and out of
-            // scope here.
-            if (dsetpath_exists)
+#if SIDETNFS_USE_TNFS_LISTING
+            if (sidetnfs_runtime_slot_is_settings(dsetpath_slot))
             {
+                // Fase 10B-afronding/12A: a failed Dsetpath (any non-root
+                // reference, since this drive has no subdirectories) must
+                // never mutate dpath_string_table[dsetpath_slot] -- the
+                // existing CWD (always root) stays exactly as it was. The
+                // unconditional strcpy() below is the TNFS/SD-backend
+                // behavior, unchanged and out of scope here.
+                if (dsetpath_exists)
+                {
+                    strcpy(dpath_string_table[dsetpath_slot], dpath_tmp);
+                    DPRINTF("The new default path is: %s\n", dpath_string_table[dsetpath_slot]);
+                }
+            }
+            else
+            {
+                // Copy dpath_tmp to dpath_string_table[dsetpath_slot]
                 strcpy(dpath_string_table[dsetpath_slot], dpath_tmp);
                 DPRINTF("The new default path is: %s\n", dpath_string_table[dsetpath_slot]);
             }
@@ -4182,7 +5476,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Copy dpath_tmp to dpath_string_table[dsetpath_slot]
             strcpy(dpath_string_table[dsetpath_slot], dpath_tmp);
             DPRINTF("The new default path is: %s\n", dpath_string_table[dsetpath_slot]);
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
+#endif
 #if SIDETNFS_USE_TNFS_LISTING
             sidetnfs_diag_log(SIDETNFS_DIAG_DSETPATH_TNFS_CWD_SET, 0, dpath_string_table[dsetpath_slot], NULL, NULL, 0, 0,
                                (uint8_t)(dsetpath_exists ? GEMDOS_EOK : GEMDOS_EPTHNF), 0);
@@ -4210,11 +5504,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_uart_diag()->dcreate_calls++;
             sidetnfs_uart_diag()->dcreate_last_rom_slot = dcreate_rom_slot;
 #endif
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: read-only drive -- Dcreate is always denied, never
-            // even parses the target path (this drive has no subdirectories).
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EACCDN;
-#else
             // Fase 11B: hard slot-bounds check before ANY slot/context/table
             // access below -- never a fallback to slot 0. An out-of-range
             // slot from the wire reports GEMDOS_EDRIVE here and touches
@@ -4226,6 +5515,19 @@ void init_gemdrvemul(bool safe_config_reboot)
                 sidetnfs_uart_diag()->dcreate_last_result = (uint16_t)GEMDOS_EDRIVE;
 #endif
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EDRIVE;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            if (sidetnfs_runtime_slot_is_settings(dcreate_rom_slot))
+            {
+                // Fase 10B/12A: read-only drive -- Dcreate is always
+                // denied, never even parses the target path (this drive
+                // has no subdirectories).
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->dcreate_last_result = (uint16_t)GEMDOS_EACCDN;
+#endif
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EACCDN;
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -4256,6 +5558,46 @@ void init_gemdrvemul(bool safe_config_reboot)
                 sidetnfs_uart_diag()->dcreate_last_result = (uint16_t)GEMDOS_EDRIVE;
 #endif
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EDRIVE;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
+            // Fase 7 (SD-mounts als volledige runtime-backend): an ENABLED
+            // SD slot creates the directory via real FatFS f_mkdir()
+            // instead of ever sending a TNFS MKDIR. tnfs_dcreate_path is
+            // already the GEMDOS-resolved relative path (computed above,
+            // generic).
+            if (sidetnfs_slot_backend_is_sd(dcreate_rom_slot))
+            {
+                char sd_dcreate_path[MAX_FOLDER_LENGTH * 2];
+                if (!sidetnfs_sd_build_fatfs_path(dcreate_rom_slot, tnfs_dcreate_path, sd_dcreate_path,
+                                                    sizeof(sd_dcreate_path)))
+                {
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = GEMDOS_EPTHNF;
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                FRESULT sd_dcreate_fr = f_mkdir(sd_dcreate_path);
+                uint16_t sd_dcreate_status;
+                if (sd_dcreate_fr == FR_OK)
+                {
+                    sd_dcreate_status = GEMDOS_EOK;
+                }
+                else if (sd_dcreate_fr == FR_NO_PATH)
+                {
+                    sd_dcreate_status = GEMDOS_EPTHNF;
+                }
+                else if (sd_dcreate_fr == FR_EXIST || sd_dcreate_fr == FR_DENIED)
+                {
+                    sd_dcreate_status = GEMDOS_EACCDN;
+                }
+                else
+                {
+                    sd_dcreate_status = GEMDOS_EINTRN;
+                }
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = sd_dcreate_status;
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -4294,7 +5636,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             // for why this differs from the uint32_t+SWAP_LONGWORD pattern
             // used by Fdelete/Frename/Fseek's status fields.
             *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DCREATE_STATUS)) = tnfs_dcreate_status;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
@@ -4343,11 +5684,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_uart_diag()->ddelete_calls++;
             sidetnfs_uart_diag()->ddelete_last_rom_slot = ddelete_rom_slot;
 #endif
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: read-only drive -- Ddelete is always denied, never
-            // even parses the target path (this drive has no subdirectories).
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
-#else
             // Fase 11B: hard slot-bounds check before ANY slot/context/table
             // access below -- never a fallback to slot 0.
             if (ddelete_rom_slot < 0 || (uint32_t)ddelete_rom_slot >= g_drive_count ||
@@ -4357,6 +5693,19 @@ void init_gemdrvemul(bool safe_config_reboot)
                 sidetnfs_uart_diag()->ddelete_last_result = (uint16_t)GEMDOS_EDRIVE;
 #endif
                 *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EDRIVE;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            if (sidetnfs_runtime_slot_is_settings(ddelete_rom_slot))
+            {
+                // Fase 10B/12A: read-only drive -- Ddelete is always
+                // denied, never even parses the target path (this drive
+                // has no subdirectories).
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->ddelete_last_result = (uint16_t)GEMDOS_EACCDN;
+#endif
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -4392,6 +5741,65 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_ENTER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
             sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_RAW_PATH, 0, tnfs_ddelete_raw_path, NULL, NULL, 0, 0, 0, 0);
             sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_TNFS_PATH, 0, tnfs_ddelete_path, NULL, NULL, 0, 0, 0, 0);
+
+            // Fase 7 (SD-mounts als volledige runtime-backend): an ENABLED
+            // SD slot removes the directory via real FatFS f_unlink()
+            // (FatFS has no separate rmdir -- f_unlink() removes an empty
+            // directory too) instead of ever sending a TNFS RMDIR.
+            // tnfs_ddelete_path is already the GEMDOS-resolved relative
+            // path (computed above, generic). Root removal is denied
+            // locally first, same rule as the TNFS route below.
+            if (sidetnfs_slot_backend_is_sd(ddelete_rom_slot))
+            {
+                if (strcmp(tnfs_ddelete_path, "/") == 0)
+                {
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EACCDN;
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                char sd_ddelete_path[MAX_FOLDER_LENGTH * 2];
+                if (!sidetnfs_sd_build_fatfs_path(ddelete_rom_slot, tnfs_ddelete_path, sd_ddelete_path,
+                                                    sizeof(sd_ddelete_path)))
+                {
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = GEMDOS_EPTHNF;
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                FRESULT sd_ddelete_fr = f_unlink(sd_ddelete_path);
+                uint16_t sd_ddelete_status;
+                if (sd_ddelete_fr == FR_OK)
+                {
+                    sd_ddelete_status = GEMDOS_EOK;
+                    if (strcmp(tnfs_ddelete_path, dpath_string_table[ddelete_rom_slot]) == 0)
+                    {
+                        // Same "the CWD we just removed must become its
+                        // own parent" rule the TNFS route below applies.
+                        char sd_ddelete_new_cwd[MAX_FOLDER_LENGTH];
+                        tnfs_ddelete_parent_path(tnfs_ddelete_path, sd_ddelete_new_cwd, sizeof(sd_ddelete_new_cwd));
+                        strcpy(dpath_string_table[ddelete_rom_slot], sd_ddelete_new_cwd);
+                    }
+                }
+                else if (sd_ddelete_fr == FR_NO_FILE || sd_ddelete_fr == FR_NO_PATH)
+                {
+                    sd_ddelete_status = GEMDOS_EPTHNF;
+                }
+                else if (sd_ddelete_fr == FR_DENIED)
+                {
+                    // Non-empty directory, or permission -- either way,
+                    // never treated as success.
+                    sd_ddelete_status = GEMDOS_EACCDN;
+                }
+                else
+                {
+                    sd_ddelete_status = GEMDOS_EINTRN;
+                }
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = sd_ddelete_status;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
 
             uint16_t tnfs_ddelete_status;
             // Fase 7J-correctie2: root removal must still never succeed, and
@@ -4514,7 +5922,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             // uint16_t write for this status field -- same convention as
             // Dcreate's GEMDRVEMUL_DCREATE_STATUS (see Fase 7I report).
             *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_DDELETE_STATUS)) = tnfs_ddelete_status;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             char tmp_pathname[MAX_FOLDER_LENGTH] = {0};
             scfs_get_local_full_pathname(tmp_pathname);
@@ -4685,19 +6092,19 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             sidetnfs_uart_diag()->fsfirst_last_validation_phase = fsfirst_diag_phase;
 #endif
+            // Fase 5 (virtual NET_ERR.TXT root): a TNFS slot without an
+            // established session is no longer rejected here with a hard
+            // GEMDOS_EDRIVE -- every ENABLED drive stays published, so
+            // this now only requires a real, published runtime-drive
+            // record at this slot (range already checked above). A
+            // not-ready TNFS slot instead falls all the way through to
+            // gemdrive_backend_fsfirst() below, which serves the single
+            // virtual NET_ERR.TXT entry for exactly this case (see that
+            // function's own comment) instead of a real TNFS search.
             if (fsfirst_slot >= 0 && (uint32_t)fsfirst_slot < g_drive_count &&
                 fsfirst_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES)
             {
-                const sidetnfs_runtime_drive_t *fsfirst_runtime = sidetnfs_runtime_drive_get(fsfirst_slot);
-                if (fsfirst_runtime != NULL)
-                {
-                    sidetnfs_slot_tnfs_context_t fsfirst_ctx;
-                    if (sidetnfs_probe_get_slot_context(fsfirst_slot, &fsfirst_ctx))
-                    {
-                        fsfirst_slot_ok = (fsfirst_ctx.backend_type != SIDETNFS_DRIVE_TNFS) ||
-                                          fsfirst_ctx.session_established;
-                    }
-                }
+                fsfirst_slot_ok = (sidetnfs_runtime_drive_get(fsfirst_slot) != NULL);
             }
             if (!fsfirst_slot_ok)
             {
@@ -4946,7 +6353,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             int fopen_rom_slot = 0; // SD/FatFS build: single instance, no slot concept
 #endif
             DPRINTF("Opening file: %s with mode: %x\n", tmp_filepath, fopen_mode);
-            gemdrive_backend_fopen(fopen_mode, tmp_filepath, memory_shared_address, fopen_rom_slot);
+            gemdrive_backend_fopen(fopen_mode, tmp_filepath, memory_shared_address, fopen_rom_slot, sidetnfs_network_ok);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -4964,15 +6371,6 @@ void init_gemdrvemul(bool safe_config_reboot)
         case GEMDRVEMUL_FCREATE_CALL:
         {
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: read-only drive -- Fcreate is always denied, never
-            // even parses the target path (nothing to create/truncate).
-            payloadPtr += 6; // Skip six words (fcreate_mode/path, same shape as below)
-            *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EACCDN;
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#else
             // Fase 7K: real TNFS create+truncate (Fcreate always creates a
             // new file or truncates an existing one -- see
             // sidetnfs_tnfs_file_create()). fcreate_mode is the Atari
@@ -5007,6 +6405,19 @@ void init_gemdrvemul(bool safe_config_reboot)
                 break;
             }
             payloadPtr += 6; // Skip six words
+            if (sidetnfs_runtime_slot_is_settings(fcreate_rom_slot))
+            {
+                // Fase 10B/12A: read-only drive -- Fcreate is always
+                // denied, never even parses the target path (nothing to
+                // create/truncate).
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->fcreate_last_result = (uint16_t)GEMDOS_EACCDN;
+#endif
+                *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EACCDN;
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
             char tnfs_fcreate_raw_path[MAX_FOLDER_LENGTH] = {0};
             char tnfs_fcreate_path[MAX_FOLDER_LENGTH] = {0};
             int fcreate_prefix_slot = -1;
@@ -5035,6 +6446,54 @@ void init_gemdrvemul(bool safe_config_reboot)
 #if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
             sidetnfs_uart_diag()->fcreate_last_consistency_ok = 1;
 #endif
+
+            // Fase 7 (SD-mounts als volledige runtime-backend): an ENABLED
+            // SD slot creates/truncates via real FatFS instead of ever
+            // sending a TNFS CREATE. tnfs_fcreate_path is already the
+            // GEMDOS-resolved relative path (computed above, generic for
+            // every backend) -- sidetnfs_sd_build_fatfs_path() turns it
+            // into this slot's own real, root-safe FatFS path.
+            if (sidetnfs_slot_backend_is_sd(fcreate_rom_slot))
+            {
+                char sd_fcreate_path[MAX_FOLDER_LENGTH * 2];
+                if (!sidetnfs_sd_build_fatfs_path(fcreate_rom_slot, tnfs_fcreate_path, sd_fcreate_path,
+                                                    sizeof(sd_fcreate_path)))
+                {
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EPTHNF;
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                FIL sd_fcreate_file_object;
+                FRESULT sd_fcreate_fr =
+                    f_open(&sd_fcreate_file_object, sd_fcreate_path, FA_READ | FA_WRITE | FA_CREATE_ALWAYS);
+                if (sd_fcreate_fr != FR_OK)
+                {
+                    DPRINTF("ERROR: Could not create SD file %s (FRESULT %d)\n", sd_fcreate_path, (int)sd_fcreate_fr);
+                    *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EPTHNF;
+                }
+                else
+                {
+                    uint16_t sd_fcreate_fd_counter = get_first_available_fd(fdescriptors);
+                    FileDescriptors *sd_newFDescriptor = malloc(sizeof(FileDescriptors));
+                    if (sd_newFDescriptor == NULL)
+                    {
+                        f_close(&sd_fcreate_file_object);
+                        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) = GEMDOS_EINTRN;
+                    }
+                    else
+                    {
+                        add_sd_file(&fdescriptors, sd_newFDescriptor, sd_fcreate_path, sd_fcreate_file_object,
+                                     sd_fcreate_fd_counter, fcreate_rom_slot);
+                        DPRINTF("SD file created with file descriptor: %d\n", sd_fcreate_fd_counter);
+                        *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCREATE_HANDLE)) =
+                            sd_fcreate_fd_counter;
+                    }
+                }
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
 
             uint8_t tnfs_fcreate_handle = 0;
             SidetnfsFileOpenResult tnfs_fcreate_result =
@@ -5082,7 +6541,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             fcreate_mode = payloadPtr[0]; // d3 register
             payloadPtr += 6;              // Skip six words
@@ -5148,14 +6606,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_uart_diag()->fdelete_calls++;
             sidetnfs_uart_diag()->fdelete_last_rom_slot = fdelete_rom_slot;
 #endif
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: read-only drive -- Fdelete is always denied, never
-            // even parses the target path (nothing to delete).
-            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) = SWAP_LONGWORD(GEMDOS_EACCDN);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-#else
             // Fase 11B: hard slot-bounds check before ANY slot/context/table
             // access below -- never a fallback to slot 0.
             if (fdelete_rom_slot < 0 || (uint32_t)fdelete_rom_slot >= g_drive_count ||
@@ -5166,6 +6616,20 @@ void init_gemdrvemul(bool safe_config_reboot)
 #endif
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) =
                     SWAP_LONGWORD(GEMDOS_EDRIVE);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            if (sidetnfs_runtime_slot_is_settings(fdelete_rom_slot))
+            {
+                // Fase 10B/12A: read-only drive -- Fdelete is always
+                // denied, never even parses the target path (nothing to
+                // delete).
+#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+                sidetnfs_uart_diag()->fdelete_last_result = (uint16_t)GEMDOS_EACCDN;
+#endif
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) =
+                    SWAP_LONGWORD(GEMDOS_EACCDN);
                 write_random_token(memory_shared_address);
                 active_command_id = 0xFFFF;
                 break;
@@ -5218,6 +6682,55 @@ void init_gemdrvemul(bool safe_config_reboot)
                 delete_file_by_fdesc(&fdescriptors, tnfs_delete_file->fd);
             }
 
+            // Fase 7 (SD-mounts als volledige runtime-backend): an ENABLED
+            // SD slot deletes via real FatFS f_unlink() instead of ever
+            // sending a TNFS DELETE. tnfs_delete_path is already the
+            // GEMDOS-resolved relative path (computed above, generic).
+            if (sidetnfs_slot_backend_is_sd(fdelete_rom_slot))
+            {
+                char sd_delete_path[MAX_FOLDER_LENGTH * 2];
+                if (!sidetnfs_sd_build_fatfs_path(fdelete_rom_slot, tnfs_delete_path, sd_delete_path,
+                                                    sizeof(sd_delete_path)))
+                {
+                    *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) =
+                        SWAP_LONGWORD(GEMDOS_EPTHNF);
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                // Same "close it first" step as the TNFS route above, in
+                // case this exact SD file is currently open.
+                FileDescriptors *sd_delete_open_file = get_file_by_fpath(fdescriptors, sd_delete_path);
+                if (sd_delete_open_file != NULL && sd_delete_open_file->backend == GEMDRIVE_FILE_BACKEND_SD)
+                {
+                    f_close(&sd_delete_open_file->fobject);
+                    delete_file_by_fdesc(&fdescriptors, sd_delete_open_file->fd);
+                }
+                FRESULT sd_delete_fr = f_unlink(sd_delete_path);
+                uint32_t sd_delete_status;
+                if (sd_delete_fr == FR_OK)
+                {
+                    sd_delete_status = GEMDOS_EOK;
+                }
+                else if (sd_delete_fr == FR_NO_FILE || sd_delete_fr == FR_NO_PATH)
+                {
+                    sd_delete_status = GEMDOS_EFILNF;
+                }
+                else if (sd_delete_fr == FR_DENIED)
+                {
+                    sd_delete_status = GEMDOS_EACCDN;
+                }
+                else
+                {
+                    sd_delete_status = GEMDOS_EINTRN;
+                }
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FDELETE_STATUS)) =
+                    SWAP_LONGWORD(sd_delete_status);
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+
             uint8_t tnfs_delete_rc = 0xFFu;
             SidetnfsFileDeleteResult tnfs_delete_result =
                 sidetnfs_tnfs_file_delete(fdelete_rom_slot, tnfs_delete_path, &tnfs_delete_rc);
@@ -5256,7 +6769,6 @@ void init_gemdrvemul(bool safe_config_reboot)
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
@@ -5461,10 +6973,11 @@ void init_gemdrvemul(bool safe_config_reboot)
                 }
             }
 #endif
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH ||
+                      file->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                      file->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR)
             {
-                // Fase 10B: pure RAM offset arithmetic -- no I/O, no
+                // Fase 10B/12A/5/6: pure RAM offset arithmetic -- no I/O, no
                 // interrupts disabled. SEEK_END uses the known flash-array
                 // length instead of f_size() (there is no FIL object for
                 // this backend). Clamped to [0, config_flash_size] so a
@@ -5499,7 +7012,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                 file->offset = (uint32_t)new_offset;
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FSEEK_STATUS, file->offset);
             }
-#endif
             else
             {
                 switch (fseek_mode)
@@ -5554,41 +7066,182 @@ void init_gemdrvemul(bool safe_config_reboot)
             int fattrib_rom_slot = (int16_t)payloadPtr[4]; // d5 register (low word)
             payloadPtr += 6;                               // Skip six words (d3+d4+d5)
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            // Fase 10B: root-only, read-only drive. Inquire returns the
-            // fixed READONLY|ARCH attribute for the two known files (see
-            // sidetnfs_config_drive_backend.c's SIDETNFS_CONFIG_DRIVE_ATTR);
-            // Fattrib SET is always rejected -- there is nothing to change,
-            // and no flash write ever happens from this backend.
-            char config_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
-            char config_fattrib_path[MAX_FOLDER_LENGTH] = {0};
-            get_tnfs_relative_pathname(config_fattrib_path, config_fattrib_raw_path, NULL);
-            char config_fattrib_name83[14];
-            const uint8_t *config_fattrib_data;
-            uint32_t config_fattrib_size;
-            bool config_fattrib_found = config_flash_root_name(config_fattrib_path, config_fattrib_name83,
-                                                                  sizeof(config_fattrib_name83)) &&
-                                         sidetnfs_config_drive_lookup(config_fattrib_name83, &config_fattrib_data,
-                                                                       &config_fattrib_size);
-            if (fattrib_flag == FATTRIB_INQUIRE)
+            // Fase 12A: the local SETTINGS disk is routed by its own
+            // ROM-resolved runtime slot -- checked first, before any
+            // TNFS-specific bounds/consistency logic below.
+            if (sidetnfs_runtime_slot_is_settings(fattrib_rom_slot))
             {
-                if (config_fattrib_found)
+                // Fase 10B/12A: root-only, read-only drive. Inquire returns
+                // the fixed READONLY|ARCH attribute for the two known
+                // files (see sidetnfs_config_drive_backend.c's
+                // SIDETNFS_CONFIG_DRIVE_ATTR); Fattrib SET is always
+                // rejected -- there is nothing to change, and no flash
+                // write ever happens from this backend.
+                char config_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
+                char config_fattrib_path[MAX_FOLDER_LENGTH] = {0};
+                int config_fattrib_prefix_slot = -1;
+                get_tnfs_relative_pathname_for_slot(config_fattrib_path, config_fattrib_raw_path, NULL,
+                                                     fattrib_rom_slot, &config_fattrib_prefix_slot);
+                char config_fattrib_name83[14];
+                const uint8_t *config_fattrib_data;
+                uint32_t config_fattrib_size;
+                bool config_fattrib_found = config_flash_root_name(config_fattrib_path, config_fattrib_name83,
+                                                                      sizeof(config_fattrib_name83)) &&
+                                             sidetnfs_config_drive_lookup(config_fattrib_name83, &config_fattrib_data,
+                                                                           &config_fattrib_size);
+                if (fattrib_flag == FATTRIB_INQUIRE)
                 {
-                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
-                                             (uint32_t)SIDETNFS_CONFIG_DRIVE_ATTR);
+                    if (config_fattrib_found)
+                    {
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                                 (uint32_t)SIDETNFS_CONFIG_DRIVE_ATTR);
+                    }
+                    else
+                    {
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
+                    }
                 }
                 else
                 {
+                    // FATTRIB_SET -- read-only drive, never permitted.
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             config_fattrib_found ? GEMDOS_EACCDN : GEMDOS_EFILNF);
+                }
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            // Fase 5 (virtual NET_ERR.TXT root): an ENABLED TNFS slot
+            // that isn't ready right now answers Fattrib for
+            // SIDETNFS_NET_ERR_NAME directly (fixed, synthetic
+            // attributes), instead of ever attempting a real TNFS STAT
+            // over a session that doesn't exist -- which would only ever
+            // time out. Checked here, before the real-TNFS STAT logic
+            // below, same position as the SETTINGS check above.
+            if (fattrib_rom_slot >= 0 && fattrib_rom_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES &&
+                g_runtime_drives[fattrib_rom_slot].valid &&
+                g_runtime_drives[fattrib_rom_slot].backend == GEMDRIVE_FILE_BACKEND_TNFS &&
+                sidetnfs_probe_classify_slot_error(fattrib_rom_slot, sidetnfs_network_ok) != SIDETNFS_DRIVE_ERR_NONE)
+            {
+                char net_err_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
+                char net_err_fattrib_path[MAX_FOLDER_LENGTH] = {0};
+                int net_err_fattrib_prefix_slot = -1;
+                get_tnfs_relative_pathname_for_slot(net_err_fattrib_path, net_err_fattrib_raw_path, NULL,
+                                                     fattrib_rom_slot, &net_err_fattrib_prefix_slot);
+                char net_err_fattrib_name83[32];
+                bool net_err_fattrib_found = config_flash_root_name(net_err_fattrib_path, net_err_fattrib_name83,
+                                                                      sizeof(net_err_fattrib_name83)) &&
+                                              strcmp(net_err_fattrib_name83, SIDETNFS_NET_ERR_NAME) == 0;
+                if (fattrib_flag == FATTRIB_INQUIRE)
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             net_err_fattrib_found ? (uint32_t)(FS_ST_READONLY | FS_ST_ARCH)
+                                                                    : (uint32_t)GEMDOS_EFILNF);
+                }
+                else
+                {
+                    // FATTRIB_SET -- read-only virtual file, never permitted.
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                             net_err_fattrib_found ? GEMDOS_EACCDN : GEMDOS_EFILNF);
+                }
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
+            }
+            // Fase 6 (SD-service/SD_ERROR.TXT): an ENABLED SD slot that
+            // isn't READY right now answers Fattrib for
+            // SIDETNFS_SD_ERROR_NAME directly (fixed, synthetic
+            // attributes) -- checked here, before the real-TNFS STAT
+            // logic below (which a READY SD slot still falls through to
+            // unchanged -- Fase 6 builds no real SD Fattrib backend yet,
+            // see report).
+            if (fattrib_rom_slot >= 0 && fattrib_rom_slot < GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES &&
+                g_runtime_drives[fattrib_rom_slot].valid &&
+                g_runtime_drives[fattrib_rom_slot].backend == GEMDRIVE_FILE_BACKEND_SD)
+            {
+                sidetnfs_sd_drive_status_t sd_fattrib_status;
+                bool sd_fattrib_known = sidetnfs_sd_get_drive_status(fattrib_rom_slot, &sd_fattrib_status);
+                bool sd_fattrib_ready = sd_fattrib_known && sd_fattrib_status.status == SIDETNFS_SD_STATUS_READY;
+                if (!sd_fattrib_ready)
+                {
+                    char sd_fattrib_raw_path[MAX_FOLDER_LENGTH] = {0};
+                    char sd_fattrib_path[MAX_FOLDER_LENGTH] = {0};
+                    int sd_fattrib_prefix_slot = -1;
+                    get_tnfs_relative_pathname_for_slot(sd_fattrib_path, sd_fattrib_raw_path, NULL,
+                                                         fattrib_rom_slot, &sd_fattrib_prefix_slot);
+                    char sd_fattrib_name83[32];
+                    bool sd_fattrib_found = config_flash_root_name(sd_fattrib_path, sd_fattrib_name83,
+                                                                     sizeof(sd_fattrib_name83)) &&
+                                             strcmp(sd_fattrib_name83, SIDETNFS_SD_ERROR_NAME) == 0;
+                    if (fattrib_flag == FATTRIB_INQUIRE)
+                    {
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                                 sd_fattrib_found ? (uint32_t)(FS_ST_READONLY | FS_ST_ARCH)
+                                                                    : (uint32_t)GEMDOS_EFILNF);
+                    }
+                    else
+                    {
+                        // FATTRIB_SET -- read-only virtual file, never permitted.
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                                 sd_fattrib_found ? GEMDOS_EACCDN : GEMDOS_EFILNF);
+                    }
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                // Fase 7 (SD-mounts als volledige runtime-backend):
+                // sd_fattrib_ready == true -- real per-slot FatFS
+                // Fattrib, same scfs_stat()/attribs_fat2st()/f_chmod()
+                // the pre-existing single-drive SD/FatFS route already
+                // used.
+                char sd_fattrib_real_raw_path[MAX_FOLDER_LENGTH] = {0};
+                char sd_fattrib_real_path[MAX_FOLDER_LENGTH] = {0};
+                int sd_fattrib_real_prefix_slot = -1;
+                get_tnfs_relative_pathname_for_slot(sd_fattrib_real_path, sd_fattrib_real_raw_path, NULL,
+                                                     fattrib_rom_slot, &sd_fattrib_real_prefix_slot);
+                char sd_fattrib_fatfs_path[MAX_FOLDER_LENGTH * 2];
+                if (!sidetnfs_sd_build_fatfs_path(fattrib_rom_slot, sd_fattrib_real_path, sd_fattrib_fatfs_path,
+                                                    sizeof(sd_fattrib_fatfs_path)))
+                {
+                    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EPTHNF);
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+                ScFsStat sd_fattrib_stat_info;
+                bool sd_fattrib_stat_ok = scfs_stat(sd_fattrib_fatfs_path, &sd_fattrib_stat_info);
+                if (!sd_fattrib_stat_ok)
+                {
                     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EFILNF);
                 }
+                else
+                {
+                    uint32_t sd_fattrib_st = attribs_fat2st(sd_fattrib_stat_info.attr);
+                    if (fattrib_flag == FATTRIB_INQUIRE)
+                    {
+                        WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, sd_fattrib_st);
+                    }
+                    else
+                    {
+                        BYTE sd_fattrib_fatfs_new = (BYTE)attribs_st2fat(fattrib_new);
+                        FRESULT sd_fattrib_chmod_fr =
+                            f_chmod(sd_fattrib_fatfs_path, sd_fattrib_fatfs_new, AM_RDO | AM_HID | AM_SYS);
+                        if (sd_fattrib_chmod_fr != FR_OK)
+                        {
+                            DPRINTF("ERROR: Could not set SD file attributes (%d)\r\n", sd_fattrib_chmod_fr);
+                            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS, GEMDOS_EACCDN);
+                        }
+                        else
+                        {
+                            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
+                                                     attribs_fat2st(sd_fattrib_fatfs_new));
+                        }
+                    }
+                }
+                write_random_token(memory_shared_address);
+                active_command_id = 0xFFFF;
+                break;
             }
-            else
-            {
-                // FATTRIB_SET -- read-only drive, never permitted.
-                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FATTRIB_STATUS,
-                                         config_fattrib_found ? GEMDOS_EACCDN : GEMDOS_EFILNF);
-            }
-#else
             // Fase 7L/7Lb: real TNFS Fattrib inquire via STAT (see
             // sidetnfs_tnfs_get_attributes() in sidetnfs_probe.c for the
             // wire-level detail). Fattrib SET is unconditionally reported
@@ -5732,7 +7385,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                 sidetnfs_uart_diag()->fattrib_last_result = (uint16_t)tnfs_fattrib_result;
 #endif
             }
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             // Obtain the fname string and keep it in memory
             // concatenated path and filename
@@ -5823,15 +7475,17 @@ void init_gemdrvemul(bool safe_config_reboot)
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) = SWAP_LONGWORD(GEMDOS_EPTHNF);
             }
 #if SIDETNFS_USE_TNFS_LISTING
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            else
+            // Fase 10B/12A: the local SETTINGS disk is always read-only --
+            // Frename is denied outright if EITHER side names it, never
+            // even parsing the destination path (nothing to rename).
+            // Checked before the bounds check below so an out-of-range
+            // slot on the other side can't mask this.
+            else if (sidetnfs_runtime_slot_is_settings(frename_rom_slot_src) ||
+                     sidetnfs_runtime_slot_is_settings(frename_rom_slot_dst))
             {
-                // Fase 10B: read-only drive -- Frename is always denied,
-                // never even parses the destination path (nothing to rename).
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
                     SWAP_LONGWORD(GEMDOS_EACCDN);
             }
-#else
             else if (frename_rom_slot_src < 0 || (uint32_t)frename_rom_slot_src >= g_drive_count ||
                      frename_rom_slot_src >= GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES || frename_rom_slot_dst < 0 ||
                      (uint32_t)frename_rom_slot_dst >= g_drive_count ||
@@ -5916,6 +7570,63 @@ void init_gemdrvemul(bool safe_config_reboot)
                     break;
                 }
 
+                // Fase 7 (SD-mounts als volledige runtime-backend): an
+                // ENABLED SD slot renames via real FatFS f_rename() instead
+                // of ever sending a TNFS RENAME. tnfs_rename_src/dst are
+                // already the GEMDOS-resolved relative paths (computed
+                // above, generic) -- src/dst are guaranteed to be the SAME
+                // slot by the checks above.
+                if (sidetnfs_slot_backend_is_sd(frename_rom_slot))
+                {
+                    char sd_rename_src[MAX_FOLDER_LENGTH * 2];
+                    char sd_rename_dst[MAX_FOLDER_LENGTH * 2];
+                    if (!sidetnfs_sd_build_fatfs_path(frename_rom_slot, tnfs_rename_src, sd_rename_src,
+                                                        sizeof(sd_rename_src)) ||
+                        !sidetnfs_sd_build_fatfs_path(frename_rom_slot, tnfs_rename_dst, sd_rename_dst,
+                                                        sizeof(sd_rename_dst)))
+                    {
+                        *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
+                            SWAP_LONGWORD(GEMDOS_EPTHNF);
+                        write_random_token(memory_shared_address);
+                        active_command_id = 0xFFFF;
+                        break;
+                    }
+                    FRESULT sd_rename_fr = f_rename(sd_rename_src, sd_rename_dst);
+                    uint32_t sd_rename_status;
+                    if (sd_rename_fr == FR_OK)
+                    {
+                        sd_rename_status = GEMDOS_EOK;
+                        // Same "fix up an already-open handle's own fpath"
+                        // step the TNFS route below does -- the FIL object
+                        // itself stays valid after a FatFS rename (it
+                        // refers to the open file, not the path), only the
+                        // local bookkeeping path string needs correcting.
+                        FileDescriptors *sd_rename_open_file = get_file_by_fpath(fdescriptors, sd_rename_src);
+                        if (sd_rename_open_file != NULL && sd_rename_open_file->backend == GEMDRIVE_FILE_BACKEND_SD)
+                        {
+                            strncpy(sd_rename_open_file->fpath, sd_rename_dst, sizeof(sd_rename_open_file->fpath) - 1);
+                            sd_rename_open_file->fpath[sizeof(sd_rename_open_file->fpath) - 1] = '\0';
+                        }
+                    }
+                    else if (sd_rename_fr == FR_NO_FILE || sd_rename_fr == FR_NO_PATH)
+                    {
+                        sd_rename_status = GEMDOS_EFILNF;
+                    }
+                    else if (sd_rename_fr == FR_EXIST || sd_rename_fr == FR_DENIED)
+                    {
+                        sd_rename_status = GEMDOS_EACCDN;
+                    }
+                    else
+                    {
+                        sd_rename_status = GEMDOS_EINTRN;
+                    }
+                    *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
+                        SWAP_LONGWORD(sd_rename_status);
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    break;
+                }
+
                 uint8_t tnfs_rename_rc = 0xFFu;
                 SidetnfsFileRenameResult tnfs_rename_result =
                     sidetnfs_tnfs_file_rename(frename_rom_slot, tnfs_rename_src, tnfs_rename_dst, &tnfs_rename_rc);
@@ -5967,7 +7678,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                 *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_FRENAME_STATUS)) =
                     SWAP_LONGWORD(tnfs_rename_status);
             }
-#endif // SIDETNFS_CONFIG_DRIVE_ONLY
 #else
             else
             {
@@ -6167,12 +7877,16 @@ void init_gemdrvemul(bool safe_config_reboot)
                     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
                 }
             }
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            else if (fd->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            else if (fd->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH || fd->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                      fd->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR)
             {
-                // Fase 10B: fixed placeholder date/time for both embedded
+                // Fase 10B/12A: fixed placeholder date/time for both embedded
                 // files (see SIDETNFS_CONFIG_DRIVE_DATE/TIME) -- inquire
                 // always succeeds, set is always rejected (read-only drive).
+                // Fase 5/6: NET_ERR.TXT/SD_ERROR.TXT reuse this same fixed
+                // placeholder -- Fdatime inquire just needs to succeed; set
+                // is rejected below exactly like every other read-only
+                // virtual file.
                 if (fdatetime_flag == FDATETIME_INQUIRE)
                 {
                     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_STATUS, GEMDOS_EOK);
@@ -6188,7 +7902,6 @@ void init_gemdrvemul(bool safe_config_reboot)
                     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FDATETIME_TIME, 0);
                 }
             }
-#endif
 #endif
             else
             {
@@ -6476,15 +8189,18 @@ void init_gemdrvemul(bool safe_config_reboot)
                     }
                 }
             }
-#if SIDETNFS_CONFIG_DRIVE_ONLY
-            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH)
+            else if (file->backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH ||
+                      file->backend == GEMDRIVE_FILE_BACKEND_NET_ERR ||
+                      file->backend == GEMDRIVE_FILE_BACKEND_SD_ERROR)
             {
-                // Fase 10B: read-only drive -- never touches file->fobject
-                // (never opened via f_open() for this backend), unlike the
-                // SD/FatFS fallback below which would call f_lseek() on it.
+                // Fase 10B/12A/5/6: read-only drive -- never touches
+                // file->fobject (never opened via f_open() for this
+                // backend), unlike the SD/FatFS fallback below which would
+                // call f_lseek() on it. Test J: a write to NET_ERR.TXT/
+                // SD_ERROR.TXT is refused exactly like any other read-only
+                // file here.
                 WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_WRITE_BYTES, GEMDOS_EACCDN);
             }
-#endif
 #endif
             else
             {
@@ -6734,6 +8450,33 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
         }
         s_uart_diag_select_prev_pressed = select_pressed_now;
+#endif
+#if SIDETNFS_ENABLE_SD_SLOT_DUMP
+        // Fase 12B4: SD-only slot diagnosis. Same short-press,
+        // edge-triggered (rising edge only) pattern as the DEBUG.TXT
+        // dumps above, with its own independent edge-tracker -- reusing
+        // the already-computed select_pressed_now read, never a second
+        // GPIO poll. Completely separate from the 10s factory-reset
+        // long-press in main.c (boot-time only, a different call site
+        // entirely) -- a short press here can never trigger it, and this
+        // dump never runs at boot.
+        static bool s_slot_diag_select_prev_pressed = false;
+        if (select_pressed_now && !s_slot_diag_select_prev_pressed)
+        {
+            sidetnfs_slot_diag_dump_to_file(hd_folder);
+            // Same visual-confirmation convention as the other SD dumps
+            // above (no serial feedback assumed) -- 3 short blinks here
+            // instead of 2, so this dump is visually distinguishable from
+            // the (mutually-exclusive-in-this-build) UART-snapshot dump.
+            for (int diag_blink = 0; diag_blink < 3; diag_blink++)
+            {
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+                sleep_ms(300);
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+                sleep_ms(300);
+            }
+        }
+        s_slot_diag_select_prev_pressed = select_pressed_now;
 #endif
         if (select_pressed_now)
         {

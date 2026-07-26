@@ -66,6 +66,41 @@ else
     export DEBUG_MODE=1
 fi
 
+# Buildvarianten vereenvoudigen en logisch hernoemen: the two officially
+# supported, everyday build variants are "Production" (the default -- no
+# extra diagnostic logging, meant to actually be flashed) and
+# "Diagnostic" (explicit opt-in only -- extra debug/snapshot/serial
+# logging). Never both from a single invocation, and the plain/default
+# command below always produces Production only.
+#
+# SIDETNFS_BUILD_DIAGNOSTIC=1 is the new, preferred way to ask for the
+# Diagnostic variant; the older, still-fully-supported
+# SIDETNFS_ENABLE_DIAG_UART=1 internal macro works exactly as before too
+# (CMakeLists.txt treats the two as a union -- either one alone is enough
+# to select Diagnostic, so they can never contradict each other; there is
+# no way to use SIDETNFS_BUILD_DIAGNOSTIC to force Diagnostic back off).
+# This variable only affects artifact naming/labeling here in build.sh --
+# the actual CMake definitions is where SIDETNFS_ENABLE_DIAG_UART itself
+# gets its value (see CMakeLists.txt).
+#   Production (default):  ./build.sh pico_w
+#   Diagnostic (explicit):  SIDETNFS_BUILD_DIAGNOSTIC=1 ./build.sh pico_w
+if [ "${SIDETNFS_BUILD_DIAGNOSTIC:-0}" = "1" ] || [ "${SIDETNFS_ENABLE_DIAG_UART:-0}" = "1" ]; then
+    BUILD_VARIANT="Diagnostic"
+    ARTIFACT_SUFFIX="diagnostic"
+else
+    BUILD_VARIANT="Production"
+    ARTIFACT_SUFFIX="production"
+fi
+echo "Build variant: $BUILD_VARIANT"
+
+# Fase 10B: SIDETNFS_CONFIG_DRIVE_ONLY (the old CONFIG_DRIVE_ONLY/
+# SETTINGS-only legacy build) is untouched and still fully supported --
+# but it is deliberately never part of the normal Production/Diagnostic
+# workflow above: no dedicated artifact name, no separate reporting here.
+# Build it only by setting the environment variable yourself, same as
+# before this change, e.g.:
+#   SIDETNFS_CONFIG_DRIVE_ONLY=1 SIDETNFS_ENABLE_SD_SUPPORT=0 ./build.sh pico_w
+
 # Set the build directory. Delete previous contents if any
 rm -rf build
 mkdir build
@@ -78,11 +113,29 @@ cd build
 cmake ../romemul -DCMAKE_BUILD_TYPE=RelWithDebInfo
 make -j4
 
-# Copy the built firmware to the /dist folder
+# Copy the built firmware to the /dist folder (unchanged, historical
+# release-packaging path/naming -- kept as-is)
 cd ..
 mkdir -p dist
 if [ "$BUILD_TYPE" = "release" ]; then
     cp build/romemul.uf2 dist/sidecart-$BOARD_TYPE.uf2
 else
     cp build/romemul.uf2 dist/sidecart-$BOARD_TYPE-$BUILD_TYPE.uf2
+fi
+
+# Copy the built firmware to build_artifacts/ using the new official
+# Production/Diagnostic naming -- exactly one file per invocation, never
+# both. Explicitly skipped for a SIDETNFS_CONFIG_DRIVE_ONLY=1 (legacy)
+# build: that variant must never be copied under the "production" or
+# "diagnostic" name (a CONFIG_DRIVE_ONLY/SETTINGS-only image silently
+# named "sidetnfs_production.uf2" would be a real, dangerous mix-up --
+# someone could flash it believing it is the normal, everyday firmware).
+# build/romemul.uf2 (and the unchanged dist/ copy above) are still there
+# for whoever explicitly asked for this legacy build to grab by hand.
+if [ "${SIDETNFS_CONFIG_DRIVE_ONLY:-0}" = "1" ]; then
+    echo "SIDETNFS_CONFIG_DRIVE_ONLY=1 (legacy build) -- not copied to build_artifacts/ under the Production/Diagnostic name; use build/romemul.uf2 directly."
+else
+    mkdir -p build_artifacts
+    cp build/romemul.uf2 build_artifacts/sidetnfs_$ARTIFACT_SUFFIX.uf2
+    echo "Artifact: build_artifacts/sidetnfs_$ARTIFACT_SUFFIX.uf2 ($BUILD_VARIANT)"
 fi

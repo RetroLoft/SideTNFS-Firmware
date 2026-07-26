@@ -1,10 +1,11 @@
 /**
  * File: sidetnfs_rtcconfig.c
- * Description: Fase 12A -- see sidetnfs_rtcconfig.h. Reuses configData
- * (romemul/config.c) and the existing GEMDRIVE_RTC/RTC_NTP_SERVER_HOST/
- * RTC_UTC_OFFSET entries/8KB CONFIG_FLASH sector; never a second flash
- * sector, never a new PARAM_* key. GET/validate never touch flash; SAVE
- * is the only function here that does (via write_all_entries()).
+ * Description: Fase 12A -- see sidetnfs_rtcconfig.h. Fase 2: storage
+ * backend switched from the old ConfigEntry store (romemul/config.c) to
+ * the independent sidetnfs_system_config module -- this file no longer
+ * includes config.h or calls find_entry()/put_bool()/put_string()/
+ * write_all_entries() at all. Wire-protocol struct, validation rules,
+ * and RAM staging are all unchanged from before.
  */
 #include "include/sidetnfs_rtcconfig.h"
 
@@ -13,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "include/config.h"
+#include "include/sidetnfs_system_config.h"
 
 static sidetnfs_rtc_config_t g_staging;
 static bool g_staged = false;
@@ -115,41 +116,13 @@ void sidetnfs_rtcconfig_get(sidetnfs_rtc_config_t *out)
 {
     memset(out, 0, sizeof(*out));
 
-    // Fase 12A: mirrors gemdrvemul.c's own gemdrive_rtc_enabled parsing
-    // exactly (init_gemdrvemul(), PARAM_GEMDRIVE_RTC) -- an entry that
-    // exists but isn't "true"/"True" is 0, not defaulted to 1. The 1
-    // default only applies when the entry is missing entirely (never
-    // expected -- config.c's defaultEntries[] always seeds it).
-    ConfigEntry *rtc_entry = find_entry(PARAM_GEMDRIVE_RTC);
-    if (rtc_entry != NULL)
-    {
-        out->enabled = (uint16_t)((rtc_entry->value[0] == 't' || rtc_entry->value[0] == 'T') ? 1 : 0);
-    }
-    else
-    {
-        out->enabled = 1;
-    }
+    sidetnfs_system_settings_t sys;
+    sidetnfs_system_config_get(&sys);
 
-    ConfigEntry *host_entry = find_entry(PARAM_RTC_NTP_SERVER_HOST);
-    if (host_entry != NULL && strlen(host_entry->value) > 0)
-    {
-        strncpy(out->ntp_server, host_entry->value, sizeof(out->ntp_server) - 1);
-    }
-    else
-    {
-        strncpy(out->ntp_server, "pool.ntp.org", sizeof(out->ntp_server) - 1);
-    }
+    out->enabled = sys.rtc_enabled;
+    strncpy(out->ntp_server, sys.ntp_server, sizeof(out->ntp_server) - 1);
     out->ntp_server[sizeof(out->ntp_server) - 1] = '\0';
-
-    ConfigEntry *offset_entry = find_entry(PARAM_RTC_UTC_OFFSET);
-    if (offset_entry != NULL && strlen(offset_entry->value) > 0)
-    {
-        strncpy(out->utc_offset, offset_entry->value, sizeof(out->utc_offset) - 1);
-    }
-    else
-    {
-        strncpy(out->utc_offset, "+1", sizeof(out->utc_offset) - 1);
-    }
+    strncpy(out->utc_offset, sys.utc_offset, sizeof(out->utc_offset) - 1);
     out->utc_offset[sizeof(out->utc_offset) - 1] = '\0';
 }
 
@@ -209,29 +182,6 @@ bool sidetnfs_rtcconfig_is_staged(void)
     return g_staged;
 }
 
-// Linear lookup against an arbitrary ConfigData block (e.g. a flash
-// readback), not the live global configData -- find_entry() in config.c
-// only ever searches the live global, so SAVE's readback verification
-// needs its own copy of the same simple scan. Same pattern as
-// sidetnfs_netconfig.c's own find_entry_in()/readback_field_matches().
-static ConfigEntry *find_entry_in(ConfigData *data, const char *key)
-{
-    for (size_t i = 0; i < data->count; i++)
-    {
-        if (strncmp(data->entries[i].key, key, MAX_KEY_LENGTH) == 0)
-        {
-            return &data->entries[i];
-        }
-    }
-    return NULL;
-}
-
-static bool readback_field_matches(ConfigData *readback, const char *key, const char *expected)
-{
-    ConfigEntry *entry = find_entry_in(readback, key);
-    return entry != NULL && strcmp(entry->value, expected) == 0;
-}
-
 sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
 {
     if (!g_staged)
@@ -240,9 +190,9 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
     }
 
     // Fase 12A: re-validate the staged copy in full before touching
-    // configData/flash at all -- defense in depth, since stage() already
-    // validated it once, but nothing else in this module can have
-    // mutated g_staging in between.
+    // sidetnfs_system_config at all -- defense in depth, since stage()
+    // already validated it once, but nothing else in this module can
+    // have mutated g_staging in between.
     sidetnfs_rtcconfig_status_t result = sidetnfs_rtcconfig_validate(&g_staging);
     if (result != SIDETNFS_RTCCONFIG_STATUS_OK)
     {
@@ -251,70 +201,41 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
 
     // Clean local copy: guarantees NUL-termination and canonical
     // utc_offset form, independent of what was already true of the
-    // (already-validated, already-normalized-by-stage()) staging copy --
-    // same "build a clean temp before writing anything real" shape
-    // sidetnfs_netconfig_save() uses for its own clean/candidate struct.
+    // (already-validated, already-normalized-by-stage()) staging copy.
     sidetnfs_rtc_config_t clean = g_staging;
     clean.ntp_server[sizeof(clean.ntp_server) - 1] = '\0';
     clean.utc_offset[sizeof(clean.utc_offset) - 1] = '\0';
     normalize_utc_offset(clean.utc_offset, sizeof(clean.utc_offset));
 
-    const char *enabled_str = clean.enabled ? "true" : "false";
+    // Fase 2: read the current full system settings first, so the
+    // WiFi/Network fields (owned by sidetnfs_netconfig.c, sharing the
+    // same underlying sidetnfs_system_flash_t) are preserved exactly as
+    // they were -- this SAVE only ever touches the RTC fields.
+    sidetnfs_system_settings_t sys;
+    sidetnfs_system_config_get(&sys);
 
-    // Fase 12A: put_bool()/put_string() mutate the live in-RAM
-    // configData immediately (romemul/config.c's add_entry()) -- the
-    // same behavior sidetnfs_netconfig_save() already relies on and
-    // ships with. If write_all_entries() or the readback below then
-    // fails, configData has already been updated in RAM even though
-    // flash was not (successfully) changed; the next SAVE (or reboot,
-    // which reloads from flash) is required to reconcile it. This is a
-    // pre-existing, accepted characteristic of this save pattern, not
-    // something introduced here -- see report.
-    //
-    // put_bool()/put_string() declare their key parameter as
-    // `const char key[MAX_KEY_LENGTH]` (20 bytes). PARAM_GEMDRIVE_RTC
-    // ("GEMDRIVE_RTC", 13 bytes incl. NUL) and PARAM_RTC_UTC_OFFSET
-    // ("RTC_UTC_OFFSET", 15 bytes incl. NUL) are both shorter string
-    // literals than that, which -Wstringop-overread flags as a
-    // (harmless, since put_bool()/put_string() never actually read past
-    // the NUL) size mismatch. Copied into a correctly-sized local
-    // MAX_KEY_LENGTH buffer first -- same fix shape without touching the
-    // shared put_bool()/put_string() signature. PARAM_RTC_NTP_SERVER_HOST
-    // is exactly 20 bytes incl. NUL, so it never triggered this warning.
-    char gemdrive_rtc_key[MAX_KEY_LENGTH];
-    memset(gemdrive_rtc_key, 0, sizeof(gemdrive_rtc_key));
-    strncpy(gemdrive_rtc_key, PARAM_GEMDRIVE_RTC, sizeof(gemdrive_rtc_key) - 1);
+    sys.rtc_enabled = clean.enabled;
+    strncpy(sys.ntp_server, clean.ntp_server, sizeof(sys.ntp_server) - 1);
+    sys.ntp_server[sizeof(sys.ntp_server) - 1] = '\0';
+    strncpy(sys.utc_offset, clean.utc_offset, sizeof(sys.utc_offset) - 1);
+    sys.utc_offset[sizeof(sys.utc_offset) - 1] = '\0';
 
-    char rtc_utc_offset_key[MAX_KEY_LENGTH];
-    memset(rtc_utc_offset_key, 0, sizeof(rtc_utc_offset_key));
-    strncpy(rtc_utc_offset_key, PARAM_RTC_UTC_OFFSET, sizeof(rtc_utc_offset_key) - 1);
-
-    put_bool(gemdrive_rtc_key, clean.enabled != 0);
-    put_string(PARAM_RTC_NTP_SERVER_HOST, clean.ntp_server);
-    put_string(rtc_utc_offset_key, clean.utc_offset);
-
-    if (write_all_entries() != 0)
+    sidetnfs_system_config_status_t set_result = sidetnfs_system_config_set(&sys);
+    if (set_result != SIDETNFS_SYSCONFIG_STATUS_OK)
     {
+        // See sidetnfs_netconfig_save()'s identical comment -- this
+        // module already validated everything semantically above.
         return SIDETNFS_RTCCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
-    // Real XIP readback -- re-read the bytes actually committed to flash
-    // (not the live in-RAM configData, which trivially already matches
-    // what was just written) -- same proof-of-write
-    // sidetnfs_netconfig_save() performs. static: sizeof(ConfigData) is
-    // far too large for the stack.
-    const uint8_t *flash_ptr = (const uint8_t *)(XIP_BASE + CONFIG_FLASH_OFFSET);
-    static ConfigData readback;
-    memcpy(&readback, flash_ptr, sizeof(readback));
-
-    bool ok = true;
-    ok = ok && readback_field_matches(&readback, PARAM_GEMDRIVE_RTC, enabled_str);
-    ok = ok && readback_field_matches(&readback, PARAM_RTC_NTP_SERVER_HOST, clean.ntp_server);
-    ok = ok && readback_field_matches(&readback, PARAM_RTC_UTC_OFFSET, clean.utc_offset);
-
-    if (!ok)
+    sidetnfs_system_config_status_t save_result = sidetnfs_system_config_save();
+    if (save_result == SIDETNFS_SYSCONFIG_STATUS_CRC_MISMATCH)
     {
         return SIDETNFS_RTCCONFIG_STATUS_FLASH_VERIFY_FAILED;
+    }
+    if (save_result != SIDETNFS_SYSCONFIG_STATUS_OK)
+    {
+        return SIDETNFS_RTCCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
     // Fase 12A: deliberately does NOT touch WiFi/NTP or reboot -- the new
