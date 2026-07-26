@@ -176,6 +176,20 @@ int network_init(bool force, bool async, char **pass);
 // legacy adapter calling this with settings built from ConfigEntry.
 int network_init_with_settings(bool force, bool async, char **pass, const sidetnfs_system_settings_t *settings);
 
+// Fase 4 (CYW43-initialisatie en WiFi-timeouts): the single, sole CYW43
+// hardware init call for the entire boot -- resolves country from
+// *settings and calls cyw43_arch_init_with_country() exactly once.
+// main() calls this exactly once, early (right after
+// sidetnfs_system_config_init(), before anything else touches cyw43 --
+// blink_morse()/the factory-reset and force-config-recovery LED
+// indicators depend on this having already run). network_init_with_settings()
+// also calls this internally, but only when cyw43_initialized is false
+// (never true again after main()'s own call succeeds, except across an
+// explicit network_terminate() + reinit cycle -- see
+// gemdrvemul.c's bounded WiFi-connect retry loop). Returns 0 on success,
+// non-zero if the CYW43 hardware itself failed to initialize.
+int network_wifi_init_for_settings(const sidetnfs_system_settings_t *settings);
+
 u_int32_t get_ip_address();
 u_int32_t get_netmask();
 u_int32_t get_gateway();

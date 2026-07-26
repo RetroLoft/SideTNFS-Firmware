@@ -496,10 +496,4 @@ void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void);
 // Function Prototypes
 void init_gemdrvemul(bool safe_config_reboot);
 
-// Fase 10B-afronding: true once main()'s cyw43_arch_init() has actually
-// succeeded this boot (see main.c) -- defined there, not here. Any
-// cyw43_arch_deinit() call site should check this instead of assuming init
-// always ran first.
-bool sidetnfs_cyw43_arch_is_ready(void);
-
 #endif // GEMDRVEMUL_H

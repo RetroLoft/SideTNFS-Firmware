@@ -298,7 +298,19 @@ int network_wifi_init()
 
 // Fase 2B: SideTNFS path -- resolves country from *settings (RAM only,
 // never writes back to ConfigEntry, unlike the legacy path above).
-static int network_wifi_init_for_settings(const sidetnfs_system_settings_t *settings)
+// Fase 4 (CYW43-initialisatie en WiFi-timeouts): no longer static -- this
+// is now the single, sole CYW43 init call for the whole boot, called
+// exactly once from main() (before anything else touches cyw43, so
+// blink_morse()/the factory-reset and force-config-recovery LED
+// indicators all work correctly off this one init). network_init_with_settings()
+// below still calls this too, but only reaches it when `cyw43_initialized`
+// is false -- never true after main()'s own call succeeds, so this is a
+// no-op there for the whole rest of the boot except across an explicit
+// network_terminate() + reinit retry cycle (see gemdrvemul.c's bounded
+// WiFi-connect retry loop). Replaces the old pattern of a generic,
+// country-less cyw43_arch_init() in main() followed by a
+// cyw43_arch_deinit()+cyw43_arch_init_with_country() cycle here.
+int network_wifi_init_for_settings(const sidetnfs_system_settings_t *settings)
 {
     // get_country_code() takes a non-const char* (it uppercases in
     // place) -- settings is const here (this function must never modify

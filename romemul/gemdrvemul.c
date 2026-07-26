@@ -2566,6 +2566,15 @@ static char select_gemdrive_drive_letter(void)
 #endif
 }
 
+// Fase 4 (CYW43-initialisatie en WiFi-timeouts): exactly three
+// WiFi-connect attempts, each bounded to five seconds -- replaces the old
+// single PARAM_GEMDRIVE_TIMEOUT_SEC-bounded (default 45s) wait. Pico-side
+// C constants only, not part of the configuration protocol or flash
+// layout. NTP/RTC timing (still PARAM_GEMDRIVE_TIMEOUT_SEC-bounded) is
+// unaffected -- see init_gemdrvemul()'s own WiFi-connect block.
+#define SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS 3
+#define SIDETNFS_WIFI_CONNECT_ATTEMPT_TIMEOUT_MS 5000
+
 void init_gemdrvemul(bool safe_config_reboot)
 {
     FRESULT fr; /* FatFs function common result code */
@@ -2741,15 +2750,15 @@ void init_gemdrvemul(bool safe_config_reboot)
     // exactly (see the bottom of this same if/else below), just skipped
     // unconditionally instead of based on PARAM_WIFI_SSID.
     //
-    // Fase 10B-afronding: only deinit if main() actually confirmed
-    // cyw43_arch_init() succeeded -- checked here instead of assumed, even
-    // though main() currently guarantees it for every path that can reach
-    // GEMDRIVE_EMULATOR mode (a failed cyw43_arch_init() there returns -1
-    // before any emulator mode runs at all).
-    if (sidetnfs_cyw43_arch_is_ready())
-    {
-        cyw43_arch_deinit();
-    }
+    // Fase 4: main() now always performs the single CYW43 init (with the
+    // real country, see main.c) before init_gemdrvemul() is ever called,
+    // regardless of SIDETNFS_CONFIG_DRIVE_ONLY -- this build still wants
+    // zero WiFi hardware activity for its own runtime, so it tears cyw43
+    // back down here via network_terminate() (never call
+    // cyw43_arch_deinit() directly -- see that function's own comment).
+    // No readiness check needed anymore: cyw43 is unconditionally
+    // initialized by the time any GEMDRIVE_EMULATOR-reachable code runs.
+    network_terminate();
     DPRINTF("SIDETNFS_CONFIG_DRIVE_ONLY build -- skipping network initialization.\n");
     sidetnfs_mark_network_skipped();
 #else
@@ -2783,93 +2792,97 @@ void init_gemdrvemul(bool safe_config_reboot)
         DPRINTF("SD support disabled -- using flash-stored WiFi credentials only\r\n");
 #endif
 
-        cyw43_arch_deinit();
-
-        network_init_with_settings(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content, &sys);
-        absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(reconnect_t, 0);
-        absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(second_t, 0);
-        uint32_t time_to_connect_again = 1000; // 1 second
+        // Fase 4 (CYW43-initialisatie en WiFi-timeouts): bounded retry --
+        // exactly SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS attempts, each capped
+        // at SIDETNFS_WIFI_CONNECT_ATTEMPT_TIMEOUT_MS, success meaning
+        // CYW43_LINK_UP (CONNECTED_WIFI_IP, the same mapping
+        // get_network_connection_status() already used). Replaces the old
+        // single PARAM_GEMDRIVE_TIMEOUT_SEC-bounded (45s) wait with
+        // unbounded-within-budget status-driven retries. No
+        // cyw43_arch_deinit()/reinit for the FIRST attempt -- cyw43 was
+        // already initialized exactly once, with the real country, by
+        // main() before init_gemdrvemul() was ever called (see
+        // network_wifi_init_for_settings()'s own doc comment);
+        // network_init_with_settings() below already skips re-initializing
+        // cyw43 itself (its own `if (!cyw43_initialized)` guard), so this
+        // first call only brings up the IP config and starts the SSID
+        // connect. NTP/RTC timing below this block (Fase 8's own scope) is
+        // completely unchanged.
         bool network_ready = false;
-        bool wifi_init = true;
-        uint32_t wifi_timeout_sec = gemdrive_timeout_sec;
-
-        // Wait until timeout
-        while ((!network_ready) && (wifi_timeout_sec > 0) && (strlen(sys.ssid) > 0))
+        bool wifi_cancelled = false;
+        for (uint32_t attempt = 1; attempt <= SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS && !network_ready && !wifi_cancelled; attempt++)
         {
-            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RANDOM_TOKEN_SEED)) = rand() % 0xFFFFFFFF;
-#if PICO_CYW43_ARCH_POLL
-            if (wifi_init)
+            if (attempt > 1)
             {
-                cyw43_arch_poll();
+                // Fase 4: clean disconnect/reset between attempts -- never
+                // a firmware mode switch, never a full Pico reset. Same
+                // network_terminate() + network_init_with_settings() pair
+                // the pre-Fase-4 code already used for its own
+                // status-driven reconnect logic, now simply bounded to a
+                // fixed attempt count instead of an open-ended backoff.
+                network_terminate();
             }
-#endif
+            network_init_with_settings(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content, &sys);
 
-            // Check the cancel command
-            if (active_command_id == GEMDRVEMUL_CANCEL)
+            absolute_time_t attempt_deadline_t = make_timeout_time_ms(SIDETNFS_WIFI_CONNECT_ATTEMPT_TIMEOUT_MS);
+            while (!network_ready && !wifi_cancelled && !time_reached(attempt_deadline_t))
             {
-                DPRINTF("CANCEL command received!\n");
-                wifi_timeout_sec = 0;
-                write_random_token(memory_shared_address);
-                active_command_id = 0xFFFF;
-                break;
-            }
+                *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RANDOM_TOKEN_SEED)) = rand() % 0xFFFFFFFF;
+                network_safe_poll();
 
-            // Only display when changes status to avoid flooding the console
-            ConnectionStatus previous_status = get_previous_connection_status();
-            ConnectionStatus current_status = get_network_connection_status();
-            if (current_status != previous_status)
-            {
-#if defined(_DEBUG) && (_DEBUG != 0)
-                ConnectionData connection_data = {0};
-                get_connection_data(&connection_data);
-                DPRINTF("Status: %d - Prev: %d - SSID: %s - IPv4: %s - GW:%s - Mask:%s - MAC:%s\n",
-                        current_status,
-                        previous_status,
-                        connection_data.ssid,
-                        connection_data.ipv4_address,
-                        print_ipv4(get_gateway()),
-                        print_ipv4(get_netmask()),
-                        print_mac(get_mac_address()));
-#endif
-                if ((current_status == GENERIC_ERROR) || (current_status == CONNECT_FAILED_ERROR) || (current_status == BADAUTH_ERROR))
+                // Check the cancel command
+                if (active_command_id == GEMDRVEMUL_CANCEL)
                 {
-                    if (wifi_init)
-                    {
-                        network_terminate();
-                        reconnect_t = make_timeout_time_ms(0);
-                        time_to_connect_again = time_to_connect_again * 1.2;
-                        wifi_init = false;
-                        DPRINTF("Connection failed. Retrying in %d ms...\n", time_to_connect_again);
-                    }
+                    DPRINTF("CANCEL command received!\n");
+                    write_random_token(memory_shared_address);
+                    active_command_id = 0xFFFF;
+                    wifi_cancelled = true;
+                    break;
+                }
+
+                // Only display when changes status to avoid flooding the console
+                ConnectionStatus previous_status = get_previous_connection_status();
+                ConnectionStatus current_status = get_network_connection_status();
+                if (current_status != previous_status)
+                {
+#if defined(_DEBUG) && (_DEBUG != 0)
+                    ConnectionData connection_data = {0};
+                    get_connection_data(&connection_data);
+                    DPRINTF("Status: %d - Prev: %d - SSID: %s - IPv4: %s - GW:%s - Mask:%s - MAC:%s\n",
+                            current_status,
+                            previous_status,
+                            connection_data.ssid,
+                            connection_data.ipv4_address,
+                            print_ipv4(get_gateway()),
+                            print_ipv4(get_netmask()),
+                            print_mac(get_mac_address()));
+#endif
+                }
+                network_ready = (current_status == CONNECTED_WIFI_IP);
+
+                // If SELECT button is pressed, launch the configurator
+                if (gpio_get(SELECT_GPIO) != 0)
+                {
+                    select_button_action(safe_config_reboot, write_config_only_once);
+                    // Write config only once to avoid hitting the flash too much
+                    write_config_only_once = false;
                 }
             }
-            network_ready = (current_status == CONNECTED_WIFI_IP);
-            if (time_passed(&second_t, 1000) == 1)
-            {
-                DPRINTF("Timeout in seconds: %d\n", wifi_timeout_sec);
-                wifi_timeout_sec--;
-                second_t = make_timeout_time_ms(0);
-            }
-
-            // If SELECT button is pressed, launch the configurator
-            if (gpio_get(SELECT_GPIO) != 0)
-            {
-                select_button_action(safe_config_reboot, write_config_only_once);
-                // Write config only once to avoid hitting the flash too much
-                write_config_only_once = false;
-            }
-            if ((!wifi_init) && (time_passed(&reconnect_t, time_to_connect_again) == 1))
-            {
-                network_init_with_settings(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content, &sys);
-                reconnect_t = make_timeout_time_ms(0);
-                wifi_init = true;
-            }
+            DPRINTF("WiFi attempt %lu/%d: %s\n", (unsigned long)attempt, SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS,
+                    network_ready ? "CYW43_LINK_UP" : (wifi_cancelled ? "cancelled" : "timed out"));
         }
-        if (wifi_timeout_sec <= 0)
+        if (!network_ready)
         {
-            // Just be sure to deinit the network stack
+            // Fase 4: exactly SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS failed/
+            // timed-out attempts (or an explicit cancel) -- clean, final
+            // disconnect, then GEMDRIVE proceeds offline. SETTINGS remains
+            // published regardless (sidetnfs_runtime_drives_init() already
+            // ran, unaffected by this); TNFS drive letters stay published
+            // too, still using the existing offline/fake-root listing
+            // until a real session is established later (unchanged, out
+            // of this phase's scope).
             network_terminate();
-            DPRINTF("No wifi configured. Skipping network initialization.\n");
+            DPRINTF("WiFi connect failed after %d attempt(s). Booting offline.\n", SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS);
             sidetnfs_mark_network_skipped();
         }
         else
@@ -2946,8 +2959,15 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // Check the cancel command
                 if (active_command_id == GEMDRVEMUL_CANCEL)
                 {
+                    // Fase 4: the old `wifi_timeout_sec = 0;` write here was
+                    // already dead by this point in the original code too --
+                    // by the time this NTP-wait loop runs, the WiFi-connect
+                    // phase has already succeeded and that variable was
+                    // never consulted again afterward. Removed only because
+                    // the variable itself no longer exists (see the new
+                    // bounded WiFi-connect retry above) -- no other change
+                    // to this NTP/RTC cancel handling.
                     DPRINTF("CANCEL command received!\n");
-                    wifi_timeout_sec = 0;
                     write_random_token(memory_shared_address);
                     active_command_id = 0xFFFF;
                     break;
@@ -3033,8 +3053,15 @@ void init_gemdrvemul(bool safe_config_reboot)
     }
     else
     {
-        // Just be sure to deinit the network stack
-        cyw43_arch_deinit();
+        // Fase 4: main() now always initializes cyw43 via
+        // network_wifi_init_for_settings() (which sets cyw43_initialized =
+        // true), even when RTC is disabled or no SSID is configured at
+        // all -- a raw cyw43_arch_deinit() here would tear down the
+        // hardware while leaving that flag stuck true, exactly the
+        // "polling a torn-down network stack" hazard network_terminate()
+        // exists to prevent (see its own comment). Use it here too, same
+        // as every other teardown path in this function.
+        network_terminate();
         DPRINTF("No wifi configured. Skipping network initialization.\n");
         sidetnfs_mark_network_skipped();
     }
