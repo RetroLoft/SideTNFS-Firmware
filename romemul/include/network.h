@@ -13,6 +13,7 @@
 #include "constants.h"
 #include "firmware.h"
 #include "config.h"
+#include "sidetnfs_system_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,7 +160,21 @@ void network_wifi_disconnect();
 void network_poll();
 void network_safe_poll();
 void network_terminate();
+
+// Legacy entry point -- reads WiFi/network settings from the old
+// ConfigEntry store (romemul/config.c) via a thin adapter, then
+// delegates to network_init_with_settings() below. Used by the old
+// configurator/floppy-emulator/standalone RTC-emulator (romloader.c/
+// floppyemul.c/rtcemul.c) -- never by GEMDRIVE/SideTNFS as of Fase 2B.
 int network_init(bool force, bool async, char **pass);
+
+// Fase 2B: the real implementation -- takes WiFi/network settings
+// explicitly instead of reading them from ConfigEntry itself. This is
+// the ONLY entry point GEMDRIVE/SideTNFS boot code (gemdrvemul.c) calls,
+// with *settings from sidetnfs_system_config_get() -- no hidden global
+// ConfigEntry lookup on that path. network_init() above is now just a
+// legacy adapter calling this with settings built from ConfigEntry.
+int network_init_with_settings(bool force, bool async, char **pass, const sidetnfs_system_settings_t *settings);
 
 u_int32_t get_ip_address();
 u_int32_t get_netmask();

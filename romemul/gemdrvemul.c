@@ -2593,6 +2593,17 @@ void init_gemdrvemul(bool safe_config_reboot)
     // Local wifi password in the local file
     char *wifi_password_file_content = NULL;
 
+    // Fase 2B: the ONLY read of SideTNFS's WiFi/network/RTC settings in
+    // this whole function -- everything below uses sys.* fields, never
+    // find_entry(PARAM_WIFI_*)/find_entry(PARAM_GEMDRIVE_RTC)/
+    // find_entry(PARAM_RTC_NTP_SERVER_HOST)/find_entry(PARAM_RTC_UTC_OFFSET)
+    // again. sys lives for this function's entire (never-returning)
+    // lifetime, so pointers into it (ntp_server_host below) stay valid
+    // for as long as they're used. sidetnfs_system_config_init() has
+    // already run by now (see main.c, called before init_gemdrvemul()).
+    sidetnfs_system_settings_t sys;
+    sidetnfs_system_config_get(&sys);
+
     srand(time(0));
     printf("Initializing GEMDRIVE...\n"); // Print alwayse
 
@@ -2623,12 +2634,9 @@ void init_gemdrvemul(bool safe_config_reboot)
     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_RTC_XBIOS_REENTRY_TRAP)) = 0x0;
 
 
-    ConfigEntry *gemdrive_rtc = find_entry(PARAM_GEMDRIVE_RTC);
-    bool gemdrive_rtc_enabled = true;
-    if (gemdrive_rtc != NULL)
-    {
-        gemdrive_rtc_enabled = gemdrive_rtc->value[0] == 't' || gemdrive_rtc->value[0] == 'T';
-    }
+    // Fase 2B: rtc_enabled now comes from sys (sidetnfs_system_config),
+    // not find_entry(PARAM_GEMDRIVE_RTC).
+    bool gemdrive_rtc_enabled = (sys.rtc_enabled != 0);
     // #if defined(_DEBUG) && (_DEBUG != 0)
     //     DPRINTF("RTC DISABLED FOR DEBUGGING\n");
     //     gemdrive_rtc_enabled = false;
@@ -2745,7 +2753,7 @@ void init_gemdrvemul(bool safe_config_reboot)
     DPRINTF("SIDETNFS_CONFIG_DRIVE_ONLY build -- skipping network initialization.\n");
     sidetnfs_mark_network_skipped();
 #else
-    if (gemdrive_rtc_enabled && strlen(find_entry(PARAM_WIFI_SSID)->value) > 0)
+    if (gemdrive_rtc_enabled && strlen(sys.ssid) > 0)
     {
 #if SIDETNFS_ENABLE_SD_SUPPORT
         // Initialize SD card
@@ -2777,7 +2785,7 @@ void init_gemdrvemul(bool safe_config_reboot)
 
         cyw43_arch_deinit();
 
-        network_init(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content);
+        network_init_with_settings(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content, &sys);
         absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(reconnect_t, 0);
         absolute_time_t ABSOLUTE_TIME_INITIALIZED_VAR(second_t, 0);
         uint32_t time_to_connect_again = 1000; // 1 second
@@ -2786,7 +2794,7 @@ void init_gemdrvemul(bool safe_config_reboot)
         uint32_t wifi_timeout_sec = gemdrive_timeout_sec;
 
         // Wait until timeout
-        while ((!network_ready) && (wifi_timeout_sec > 0) && (strlen(find_entry(PARAM_WIFI_SSID)->value) > 0))
+        while ((!network_ready) && (wifi_timeout_sec > 0) && (strlen(sys.ssid) > 0))
         {
             *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RANDOM_TOKEN_SEED)) = rand() % 0xFFFFFFFF;
 #if PICO_CYW43_ARCH_POLL
@@ -2852,7 +2860,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             if ((!wifi_init) && (time_passed(&reconnect_t, time_to_connect_again) == 1))
             {
-                network_init(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content);
+                network_init_with_settings(true, NETWORK_CONNECTION_ASYNC, &wifi_password_file_content, &sys);
                 reconnect_t = make_timeout_time_ms(0);
                 wifi_init = true;
             }
@@ -2875,17 +2883,25 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Start the internal RTC
             rtc_init();
 
-            ntp_server_host = find_entry(PARAM_RTC_NTP_SERVER_HOST)->value;
+            // Fase 2B: ntp_server_host now points into sys (sidetnfs_system_config),
+            // not a ConfigEntry value -- sys lives for this whole
+            // (never-returning) function, so this pointer stays valid.
+            // PARAM_RTC_NTP_SERVER_PORT stays a legacy-only read: the
+            // SideTNFS config protocol never exposed an NTP port field
+            // even before this phase (sidetnfs_rtcconfig.h's own
+            // long-standing comment: "RTC_NTP_SERVER_PORT stays an
+            // internal-only default (123, config.c); this protocol never
+            // reads or writes it") -- not a new gap introduced here.
+            ntp_server_host = sys.ntp_server;
             ntp_server_port = atoi(find_entry(PARAM_RTC_NTP_SERVER_PORT)->value);
 
             DPRINTF("NTP server host: %s\n", ntp_server_host);
             DPRINTF("NTP server port: %d\n", ntp_server_port);
 
-            char *utc_offset_entry = find_entry(PARAM_RTC_UTC_OFFSET)->value;
-            if (strlen(utc_offset_entry) > 0)
+            if (strlen(sys.utc_offset) > 0)
             {
                 // The offset can be in decimal format
-                set_utc_offset_seconds((long)(atoi(utc_offset_entry) * 60 * 60));
+                set_utc_offset_seconds((long)(atoi(sys.utc_offset) * 60 * 60));
             }
             DPRINTF("UTC offset: %ld\n", get_utc_offset_seconds());
 

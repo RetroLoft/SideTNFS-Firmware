@@ -215,19 +215,16 @@ void network_terminate()
     cyw43_arch_deinit();
 }
 
-int network_wifi_init()
+// Fase 2B: the real WiFi-driver bring-up, parameterized on an
+// already-resolved country code -- no ConfigEntry access at all. Shared
+// by both network_wifi_init() (legacy, resolves country from
+// ConfigEntry first) and the SideTNFS path (resolves country from
+// sidetnfs_system_settings_t first) below.
+static int network_wifi_init_with_country_code(uint32_t country)
 {
     // This flag is important, because calling a cyw43 function before the initialization will cause a crash
     cyw43_initialized = true;
     DPRINTF("CYW43 Logging level: %d\n", CYW43_VERBOSE_DEBUG);
-    uint32_t country = CYW43_COUNTRY_WORLDWIDE;
-    ConfigEntry *country_entry = find_entry(PARAM_WIFI_COUNTRY);
-    if (country_entry != NULL)
-    {
-        char *valid;
-        country = get_country_code(country_entry->value, &valid);
-        put_string(PARAM_WIFI_COUNTRY, valid);
-    }
 
     int res;
     DPRINTF("Initialization WiFi...\n");
@@ -237,12 +234,13 @@ int network_wifi_init()
         DPRINTF("Failed to initialize WiFi: %d\n", res);
         return -1;
     }
-    DPRINTF("Country: %s\n", country_entry->value);
 
     DPRINTF("Enabling STA mode...\n");
     cyw43_arch_enable_sta_mode();
 
-    // Setting the power management
+    // Setting the power management -- PARAM_WIFI_POWER stays a legacy-only
+    // knob (not part of sidetnfs_system_config's WiFi/Network/RTC field
+    // list; Fase 2B deliberately leaves it as-is for both callers).
     uint32_t pm_value = 0xa11140; // 0: Disable PM
     ConfigEntry *pm_entry = find_entry(PARAM_WIFI_POWER);
     if (pm_entry != NULL)
@@ -272,19 +270,61 @@ int network_wifi_init()
     }
     DPRINTF("Setting power management to: %08x\n", pm_value);
     cyw43_wifi_pm(&cyw43_state, pm_value);
+    return 0;
 }
 
-int network_init(bool force, bool async, char **pass)
+// Legacy entry point -- resolves country from the old ConfigEntry store,
+// same behavior as before Fase 2B (including the put_string() write-back
+// of the normalized country code). Only called from network_init()'s own
+// legacy adapter below, and from any other pre-Fase-2B caller that used
+// to call this directly.
+int network_wifi_init()
+{
+    uint32_t country = CYW43_COUNTRY_WORLDWIDE;
+    ConfigEntry *country_entry = find_entry(PARAM_WIFI_COUNTRY);
+    if (country_entry != NULL)
+    {
+        char *valid;
+        country = get_country_code(country_entry->value, &valid);
+        put_string(PARAM_WIFI_COUNTRY, valid);
+    }
+    int res = network_wifi_init_with_country_code(country);
+    if (res == 0)
+    {
+        DPRINTF("Country: %s\n", country_entry != NULL ? country_entry->value : "?");
+    }
+    return res;
+}
+
+// Fase 2B: SideTNFS path -- resolves country from *settings (RAM only,
+// never writes back to ConfigEntry, unlike the legacy path above).
+static int network_wifi_init_for_settings(const sidetnfs_system_settings_t *settings)
+{
+    // get_country_code() takes a non-const char* (it uppercases in
+    // place) -- settings is const here (this function must never modify
+    // the caller's copy), so a local mutable copy is made first rather
+    // than casting the const away.
+    char country_copy[SIDETNFS_SYS_COUNTRY_LEN];
+    strncpy(country_copy, settings->country, sizeof(country_copy) - 1);
+    country_copy[sizeof(country_copy) - 1] = '\0';
+
+    char *valid = NULL;
+    uint32_t country = get_country_code(country_copy, &valid);
+    return network_wifi_init_with_country_code(country);
+}
+
+int network_init_with_settings(bool force, bool async, char **pass, const sidetnfs_system_settings_t *settings)
 {
     if (!cyw43_initialized)
     {
         // Setup the underlying WiFi stack
-        network_wifi_init();
+        network_wifi_init_for_settings(settings);
     }
 
     int res;
 
-    // Set hostname
+    // Set hostname -- PARAM_HOSTNAME stays a legacy-only field (not part
+    // of sidetnfs_system_config's WiFi/Network/RTC scope).
     char *hostname = find_entry(PARAM_HOSTNAME)->value;
 
     struct netif *n = &cyw43_state.netif[CYW43_ITF_STA];
@@ -307,7 +347,7 @@ int network_init(bool force, bool async, char **pass)
     netif_set_status_callback(n, network_status_callback);
 
     // DHCP or static IP
-    if ((find_entry(PARAM_WIFI_DHCP) != NULL) && (find_entry(PARAM_WIFI_DHCP)->value[0] == 't' || find_entry(PARAM_WIFI_DHCP)->value[0] == 'T'))
+    if (settings->use_dhcp)
     {
         DPRINTF("DHCP enabled\n");
     }
@@ -316,50 +356,34 @@ int network_init(bool force, bool async, char **pass)
         DPRINTF("Static IP enabled\n");
         dhcp_stop(n);
         ip_addr_t ipaddr, netmask, gw;
-        ipaddr.addr = ipaddr_addr(find_entry(PARAM_WIFI_IP)->value);
-        netmask.addr = ipaddr_addr(find_entry(PARAM_WIFI_NETMASK)->value);
-        gw.addr = ipaddr_addr(find_entry(PARAM_WIFI_GATEWAY)->value);
+        ipaddr.addr = ipaddr_addr(settings->ip_address);
+        netmask.addr = ipaddr_addr(settings->netmask);
+        gw.addr = ipaddr_addr(settings->gateway);
         netif_set_addr(n, &ipaddr, &netmask, &gw);
         DPRINTF("IP: %s\n", ipaddr_ntoa(&ipaddr));
         DPRINTF("Netmask: %s\n", ipaddr_ntoa(&netmask));
         DPRINTF("Gateway: %s\n", ipaddr_ntoa(&gw));
 
-        // Now set the DNS
-        // The values in PARAM_WIFI_DNS are separated by commas. Only one or two values are allowed
-        ConfigEntry *entry = find_entry(PARAM_WIFI_DNS);
-        if (entry == NULL || entry->value == NULL) {
+        // Fase 2B: sidetnfs_system_settings_t only ever carries one DNS
+        // server (primary_dns) -- the SideTNFS config protocol itself
+        // never supported the legacy store's comma-separated
+        // second-DNS convention, so this is not a new limitation.
+        if (strlen(settings->primary_dns) == 0)
+        {
             DPRINTF("Error: DNS configuration is missing.\n");
         }
-        else {
-            char *dns = entry->value;
-            char *dns_copy = strdup(dns); // Make a copy of the string to avoid modifying the original
-            if (dns_copy == NULL) {
-                DPRINTF("Error: Memory allocation failed.\n");
+        else
+        {
+            ip_addr_t dns1_ip;
+            if ((dns1_ip.addr = ipaddr_addr(settings->primary_dns)) == IPADDR_NONE)
+            {
+                DPRINTF("Error: Invalid DNS1 address.\n");
             }
-            else {
-                char *dns1 = strtok(dns_copy, ",");
-                char *dns2 = strtok(NULL, ",");
-
-                ip_addr_t dns1_ip, dns2_ip;
-                if (dns1 == NULL || (dns1_ip.addr = ipaddr_addr(dns1)) == IPADDR_NONE) {
-                    DPRINTF("Error: Invalid DNS1 address.\n");
-                    free(dns_copy); // Free the allocated memory
-                }else {
-                    dns_setserver(0, &dns1_ip);
-                    DPRINTF("DNS1: %s\n", ipaddr_ntoa(&dns1_ip));
-
-                    if (dns2 != NULL) {
-                        if ((dns2_ip.addr = ipaddr_addr(dns2)) == IPADDR_NONE) {
-                            DPRINTF("Error: Invalid DNS2 address.\n");
-                        } else {
-                            dns_setserver(1, &dns2_ip);
-                            DPRINTF("DNS2: %s\n", ipaddr_ntoa(&dns2_ip));
-                        }
-                    }                    
-                }
+            else
+            {
+                dns_setserver(0, &dns1_ip);
+                DPRINTF("DNS1: %s\n", ipaddr_ntoa(&dns1_ip));
             }
-
-            free(dns_copy); // Free the copied string after use
         }
     }
     netif_set_up(n);
@@ -374,25 +398,22 @@ int network_init(bool force, bool async, char **pass)
         return -2;
     }
 
-    ConfigEntry *ssid = find_entry(PARAM_WIFI_SSID);
-    if (strlen(ssid->value) == 0)
+    if (strlen(settings->ssid) == 0)
     {
         DPRINTF("No SSID found in config. Can't connect\n");
         return -3;
     }
-    ConfigEntry *auth_mode = find_entry(PARAM_WIFI_AUTH);
-    if (strlen(auth_mode->value) == 0)
-    {
-        DPRINTF("No auth mode found in config. Can't connect\n");
-        return -4;
-    }
+    // auth_mode has no "unset" sentinel of its own in sidetnfs_system_settings_t
+    // (unlike the legacy PARAM_WIFI_AUTH, which can be an empty string) --
+    // 0 (CYW43_AUTH_OPEN via get_auth_pico_code()) is a valid, meaningful
+    // value here, so there is nothing to reject the way the legacy path
+    // rejects an empty PARAM_WIFI_AUTH string.
     char *password_value = NULL;
     if (*pass == NULL)
     {
-        ConfigEntry *password = find_entry(PARAM_WIFI_PASSWORD);
-        if (strlen(password->value) > 0)
+        if (strlen(settings->password) > 0)
         {
-            password_value = strdup(password->value);
+            password_value = strdup(settings->password);
         }
         else
         {
@@ -405,10 +426,15 @@ int network_init(bool force, bool async, char **pass)
     }
     DPRINTF("The password is: %s\n", password_value);
 
-    uint32_t auth_value = get_auth_pico_code(atoi(auth_mode->value));
+    uint32_t auth_value = get_auth_pico_code((uint16_t)settings->auth_mode);
     int error_code = 0;
     if (!async)
     {
+        // PARAM_WIFI_CONNECT_TIMEOUT stays a legacy-only knob (not part of
+        // sidetnfs_system_config's field list) -- Fase 2B leaves it as-is
+        // for both callers; in practice GEMDRIVE always calls with
+        // async=true (see gemdrvemul.c), so this branch is not exercised
+        // by the SideTNFS path.
         uint32_t network_timeout = NETWORK_CONNECTION_TIMEOUT;
         if (find_entry(PARAM_WIFI_CONNECT_TIMEOUT) != NULL)
         {
@@ -417,14 +443,14 @@ int network_init(bool force, bool async, char **pass)
         uint16_t retries = 3;
         do
         {
-            DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. SYNC. Retry: %d\n", ssid->value, password_value, auth_value, retries);
-            error_code = cyw43_arch_wifi_connect_timeout_ms(ssid->value, password_value, auth_value, network_timeout);
+            DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. SYNC. Retry: %d\n", settings->ssid, password_value, auth_value, retries);
+            error_code = cyw43_arch_wifi_connect_timeout_ms(settings->ssid, password_value, auth_value, network_timeout);
         } while (error_code != 0 && retries--);
     }
     else
     {
-        DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. ASYNC\n", ssid->value, password_value, auth_value);
-        error_code = cyw43_arch_wifi_connect_async(ssid->value, password_value, auth_value);
+        DPRINTF("Connecting to SSID=%s, password=%s, auth=%08x. ASYNC\n", settings->ssid, password_value, auth_value);
+        error_code = cyw43_arch_wifi_connect_async(settings->ssid, password_value, auth_value);
     }
     free(password_value);
     if (error_code != 0)
@@ -434,6 +460,67 @@ int network_init(bool force, bool async, char **pass)
     }
     DPRINTF("Connected. Check the connection status...\n");
     return 0;
+}
+
+// Fase 2B: legacy adapter -- builds a sidetnfs_system_settings_t from the
+// old ConfigEntry store's PARAM_WIFI_* entries (exact same fields/
+// fallback-to-empty behavior network_init() always had) and delegates to
+// network_init_with_settings(), the one real implementation. Used by the
+// old configurator/floppy-emulator/standalone RTC-emulator -- GEMDRIVE/
+// SideTNFS never calls this as of Fase 2B (see gemdrvemul.c, which calls
+// network_init_with_settings() directly with settings from
+// sidetnfs_system_config_get()).
+int network_init(bool force, bool async, char **pass)
+{
+    sidetnfs_system_settings_t legacy;
+    memset(&legacy, 0, sizeof(legacy));
+
+    ConfigEntry *auth_entry = find_entry(PARAM_WIFI_AUTH);
+    legacy.auth_mode = (uint16_t)((auth_entry != NULL && strlen(auth_entry->value) > 0) ? atoi(auth_entry->value) : 0);
+
+    ConfigEntry *dhcp_entry = find_entry(PARAM_WIFI_DHCP);
+    legacy.use_dhcp = (uint16_t)((dhcp_entry != NULL && (dhcp_entry->value[0] == 't' || dhcp_entry->value[0] == 'T')) ? 1 : 0);
+
+    ConfigEntry *ssid_entry = find_entry(PARAM_WIFI_SSID);
+    if (ssid_entry != NULL) strncpy(legacy.ssid, ssid_entry->value, sizeof(legacy.ssid) - 1);
+
+    ConfigEntry *password_entry = find_entry(PARAM_WIFI_PASSWORD);
+    if (password_entry != NULL) strncpy(legacy.password, password_entry->value, sizeof(legacy.password) - 1);
+
+    ConfigEntry *country_entry = find_entry(PARAM_WIFI_COUNTRY);
+    if (country_entry != NULL) strncpy(legacy.country, country_entry->value, sizeof(legacy.country) - 1);
+
+    ConfigEntry *ip_entry = find_entry(PARAM_WIFI_IP);
+    if (ip_entry != NULL) strncpy(legacy.ip_address, ip_entry->value, sizeof(legacy.ip_address) - 1);
+
+    ConfigEntry *netmask_entry = find_entry(PARAM_WIFI_NETMASK);
+    if (netmask_entry != NULL) strncpy(legacy.netmask, netmask_entry->value, sizeof(legacy.netmask) - 1);
+
+    ConfigEntry *gateway_entry = find_entry(PARAM_WIFI_GATEWAY);
+    if (gateway_entry != NULL) strncpy(legacy.gateway, gateway_entry->value, sizeof(legacy.gateway) - 1);
+
+    // Fase 2B: the legacy PARAM_WIFI_DNS entry can hold a comma-separated
+    // pair ("dns1,dns2") -- network_init_with_settings() only ever reads
+    // a single primary_dns, matching sidetnfs_system_settings_t's own
+    // shape (see that function's own comment). Only the first address is
+    // carried over here; a legacy caller relying on a second DNS server
+    // loses it via this adapter -- acceptable for the legacy-only modes
+    // this path now serves (unchanged from what SideTNFS's own protocol
+    // already supported).
+    ConfigEntry *dns_entry = find_entry(PARAM_WIFI_DNS);
+    if (dns_entry != NULL)
+    {
+        char dns_copy[MAX_STRING_VALUE_LENGTH];
+        strncpy(dns_copy, dns_entry->value, sizeof(dns_copy) - 1);
+        dns_copy[sizeof(dns_copy) - 1] = '\0';
+        char *dns1 = strtok(dns_copy, ",");
+        if (dns1 != NULL)
+        {
+            strncpy(legacy.primary_dns, dns1, sizeof(legacy.primary_dns) - 1);
+        }
+    }
+
+    return network_init_with_settings(force, async, pass, &legacy);
 }
 
 void network_scan()

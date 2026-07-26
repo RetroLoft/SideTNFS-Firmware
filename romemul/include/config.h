@@ -110,6 +110,19 @@ extern ConfigData configData;
 
 // Load functions. Should be used only at startup
 void load_all_entries();
+
+// Fase 2B: true iff the most recent load_all_entries() call actually
+// found a matching magic in flash (current or the older 4KB-version
+// fallback) and overlaid real stored values on top of the defaults --
+// false means configData holds ONLY load_default_entries()'s built-in
+// defaults (blank/foreign flash). Purely additive introspection: does
+// not change load_all_entries()'s own behavior at all, and configData
+// itself is populated identically either way (defaults first, then
+// overlaid with real values only when this is true). Added so callers
+// migrating away from this store (see sidetnfs_system_config.c) can
+// tell "real legacy configuration" apart from "legacy store was never
+// configured" instead of treating both the same.
+bool config_loaded_from_real_flash(void);
 // Save all entries as a batch. Use in configuration mode only.
 int write_all_entries();
 // Reset config to default

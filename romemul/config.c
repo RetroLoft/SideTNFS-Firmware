@@ -54,6 +54,16 @@ static ConfigEntry defaultEntries[MAX_ENTRIES] = {
 
 ConfigData configData;
 
+// Fase 2B: see config_loaded_from_real_flash()'s own doc comment in
+// config.h. Set exactly once per load_all_entries() call, before any
+// caller could possibly read it.
+static bool g_config_loaded_from_real_flash = false;
+
+bool config_loaded_from_real_flash(void)
+{
+    return g_config_loaded_from_real_flash;
+}
+
 static ConfigEntry read_entry(uint8_t **addressOffset)
 {
     ConfigEntry entry;
@@ -119,6 +129,12 @@ void load_all_entries()
     // First, load default entries
     load_default_entries();
 
+    // Fase 2B: reset before every attempt -- only set true below, once a
+    // matching magic (current or the older 4KB-version fallback) is
+    // actually found and this function is about to overlay real values
+    // on top of the defaults just loaded above.
+    g_config_loaded_from_real_flash = false;
+
     uint8_t count = 0;
     uint16_t max_entries = MAX_ENTRIES;
     uint8_t *currentAddress = NULL;
@@ -143,6 +159,11 @@ void load_all_entries()
         max_entries = 47; // Only 47 entries in the previous version
         DPRINTF("Previous version of the config found in FLASH. Loading it.\n");
     }
+
+    // Fase 2B: reaching this point means a real, matching magic was
+    // found (either branch) -- everything below overlays genuine stored
+    // values on top of the defaults.
+    g_config_loaded_from_real_flash = true;
 
     currentAddress += sizeof(uint32_t);
     while (count < max_entries)
