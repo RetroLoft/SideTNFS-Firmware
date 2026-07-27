@@ -100,13 +100,8 @@
 #define LWIP_NETIF_API 0 //  Not needed. Sequential API, and therefore for platforms with OSes only.
 #define LWIP_SOCKET 0    //  Not needed. Sequential API, and therefore for platforms with OSes only.
 
-#define LWIP_HTTPD 1
-#define LWIP_HTTPD_SSI 1
-#define LWIP_HTTPD_CGI 1
-// don't include the tag comment - less work for the CPU, but may be harder to debug
-#define LWIP_HTTPD_SSI_INCLUDE_TAG 1
-#define LWIP_HTTPD_SSI_MULTIPART 1
-
-#define HTTPD_FSDATA_FILE "my_fsdata.c"
+// Fase 12: lwIP HTTP server options removed -- the web configurator and
+// the floppy web UI that used them are gone, and pico_lwip_http is no
+// longer linked.
 
 #endif /* __LWIPOPTS_H__ */

@@ -11,7 +11,6 @@
 
 #include "debug.h"
 #include "constants.h"
-#include "firmware.h"
 #include "config.h"
 #include "sidetnfs_system_config.h"
 
@@ -118,34 +117,8 @@ typedef struct connection_data
     int16_t rssi;                                   // Received Signal Strength Indicator
 } ConnectionData;
 
-typedef struct
-{
-    char *url;
-    char *name;
-    char *description;
-    // Ignoring tags as per your request
-    char *tags;
-    int size_kb;
-    void *next;
-} RomInfo;
-
-typedef struct
-{
-    char *name;
-    char *status;
-    char *description;
-    char *tags;
-    char *extra;
-    char *url;
-    void *next;
-} FloppyImageInfo;
-
-typedef struct
-{
-    char *protocol;
-    char *domain;
-    char *uri;
-} UrlParts;
+// Fase 12: RomInfo/FloppyImageInfo/UrlParts removed -- they described the
+// ROM catalogue, floppy database and URL parser of the deleted configurator.
 
 extern WifiScanData wifiScanData;
 
@@ -208,15 +181,8 @@ uint16_t get_wifi_scan_poll_secs();
 uint32_t get_network_status_polling_ms();
 void wait_cyw43_with_polling(uint32_t milliseconds);
 
-int split_url(const char *url, UrlParts *parts);
-err_t get_rom_catalog_file(RomInfo **items, int *itemCount, const char *url);
-int compare_versions(const char *newer_version, const char *current_version);
-int get_latest_release(void);
-char *get_latest_release_str(void);
-
-int download_rom(const char *url, uint32_t rom_load_offset);
-int download_floppy(const char *url, const char *folder, const char *dest_filename, bool overwrite_flag);
-err_t get_floppy_db_files(FloppyImageInfo **items, int *itemCount, const char *url);
+// Fase 12: URL/HTTP-download layer removed together with the configurator,
+// ROM loader and floppy emulator -- see network.c.
 
 int time_passed(absolute_time_t *t, uint32_t ms);
 

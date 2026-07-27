@@ -11,9 +11,7 @@
  * compiling/linking only, see this phase's own report.
  */
 
-#include "include/romloader.h"
 #include "include/romemul.h"
-#include "include/floppyemul.h"
 #include "include/rtcemul.h"
 #include "include/gemdrvemul.h"
 #include "include/network.h"
@@ -491,12 +489,9 @@ int main()
     // with the blink_morse() product-mode status codes it carried
     // ('D', 'E', 'T') and the init_firmware() configurator entry.
     //
-    // Deliberately NOT removed, per this phase's scope: the emulator
-    // implementations themselves. floppyemul.c/.h, its firmware blob and
-    // its CMake rules are untouched and still build, so a future floppy
-    // release only has to re-add a call site. The same applies to
-    // romloader.c (init_firmware) and rtcemul.c (init_rtcemul); rtcemul.c
-    // additionally still provides the NTP/RTC helpers gemdrvemul.c calls
-    // every boot, so only its init_rtcemul() entry point is now unused.
+    // Deliberately NOT removed: rtcemul.c, which still provides the NTP /
+    // Pico-RTC / Atari-time helpers this flow calls every boot. The old
+    // configurator, ROM loader, floppy emulator and standalone RTC emulator
+    // are gone from the repository entirely.
     return 0;
 }

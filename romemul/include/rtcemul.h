@@ -11,7 +11,6 @@
 
 #include "debug.h"
 #include "constants.h"
-#include "firmware_rtcemul.h"
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -43,28 +42,13 @@
 #include "network.h"
 #include "filesys.h"
 
-#define RTCEMUL_RANDOM_TOKEN 0x0                             // Offset from 0x0000 of the shared memory buffer
-#define RTCEMUL_RANDOM_TOKEN_SEED (RTCEMUL_RANDOM_TOKEN + 4) // random_token + 4 bytes
-#define RTCEMUL_NTP_SUCCESS (RTCEMUL_RANDOM_TOKEN_SEED + 4)  // random_token_seed + 4 bytes
-#define RTCEMUL_DATETIME_BCD   (RTCEMUL_NTP_SUCCESS + 4)     // ntp_success + 4 bytes
-#define RTCEMUL_DATETIME_MSDOS (RTCEMUL_DATETIME_BCD + 8)    // datetime_bcd + 8 bytes
-#define RTCEMUL_OLD_XBIOS_TRAP (RTCEMUL_DATETIME_MSDOS + 8)  // datetime_msdos + 8 bytes
-#define RTCEMUL_REENTRY_TRAP (RTCEMUL_OLD_XBIOS_TRAP + 4)    // old_bios trap + 4 bytes
-#define RTCEMUL_Y2K_PATCH       (RTCEMUL_REENTRY_TRAP + 4)   // reentry_trap + 4 byte
-#define RTCEMUL_SHARED_VARIABLES (RTCEMUL_Y2K_PATCH + 8)     // y2k_patch + 4 bytes
+// Fase 12: the RTCEMUL_* shared-memory offsets belonged to the standalone
+// RTC emulator's own protocol and are gone with it. GEMDRIVE uses its own
+// GEMDRVEMUL_* layout (see gemdrvemul.h), which is untouched.
 
 #define NTP_DEFAULT_PORT 123 // NTP UDP port
 #define NTP_DELTA 2208988800 // seconds between 1 Jan 1900 and 1 Jan 1970
 #define NTP_MSG_LEN 48       // ignore Authenticator (optional)
-
-typedef enum
-{
-    RTC_SIDECART,
-    RTC_DALLAS,
-    RTC_AREAL,
-    RTC_FMCII,
-    RTC_UNKNOWN
-} RTC_TYPE;
 
 typedef struct NTP_TIME_T
 {
@@ -74,32 +58,10 @@ typedef struct NTP_TIME_T
     bool ntp_error;
 } NTP_TIME;
 
-// DAllas RTC. Info here: https://pdf1.alldatasheet.es/datasheet-pdf/view/58439/DALLAS/DS1216.html
-typedef struct
-{
-    uint64_t last_magic_found;
-    uint16_t retries;
-    uint64_t magic_sequence_hex;
-    uint8_t clock_sequence[64];
-    uint8_t read_address_bit;
-    uint8_t write_address_bit_zero;
-    uint8_t write_address_bit_one;
-    uint8_t magic_sequence[66];
-    uint16_t size_magic_sequence;
-    uint16_t size_clock_sequence;
-    uint32_t rom_address;
-} DallasClock;
-
-typedef void (*IRQInterceptionCallback)();
-
-extern int read_addr_rom_dma_channel;
-extern int lookup_data_rom_dma_channel;
-
-// Interrupt handler callback for DMA completion
-void __not_in_flash_func(rtcemul_dma_irq_handler_lookup_callback)(void);
-
-// Function Prototypes
-int init_rtcemul(bool safe_config_reboot);
+// Fase 12: RTC_TYPE, DallasClock, the IRQInterceptionCallback/DMA-channel
+// plumbing, rtcemul_dma_irq_handler_lookup_callback() and init_rtcemul()
+// are removed with the standalone RTC emulator. What remains is only the
+// NTP / Pico-RTC / Atari-time helper API the GEMDRIVE flow calls.
 void host_found_callback(const char *name, const ip_addr_t *ipaddr, void *arg);
 void set_internal_rtc();
 void ntp_init();
@@ -109,7 +71,6 @@ long get_utc_offset_seconds();
 void set_utc_offset_seconds(long offset);
 uint8_t to_bcd(uint8_t val);
 uint8_t add_bcd(uint8_t bcd1, uint8_t bcd2);
-uint8_t sub_bcd(uint8_t bcd1, uint8_t bcd2);
 void set_ikb_datetime_msg(uint32_t mem_shared_addr, 
                         uint16_t rtcemul_datetime_bcd_idx, 
                         uint16_t rtcemul_y2k_patch_idx, 
