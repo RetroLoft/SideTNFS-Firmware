@@ -9467,7 +9467,7 @@ const uint8_t sidetnfs_config_prg[] __attribute__((used)) = {
 };
 const uint32_t sidetnfs_config_prg_length __attribute__((used)) = sizeof(sidetnfs_config_prg);
 
-// README.TXT, from /home/frank/retro/sidecart/sd2tnfs/romemul/assets/config_drive/README.TXT
+// README.TXT, from /home/frank/retro/sidecart/AtariConfig/README.TXT
 // length: 1168 bytes
 // sha256: 57b66b1b403136f1669432cc52ec6b8c37f2094972e4438290c9084068c9dd08
 const uint8_t sidetnfs_config_readme[] __attribute__((used)) = {

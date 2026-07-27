@@ -1,5 +1,9 @@
-"""Fase 10A: generate sidetnfs_config_drive.c, the byte-exact C embedding of
-the SideTNFS configuration drive's contents (SIDETNFS.PRG and README.TXT).
+"""Generate sidetnfs_config_drive.c, the byte-exact C embedding of the
+SideTNFS configuration drive's contents (SIDETNFS.PRG and README.TXT).
+
+Both files belong to the SideTNFS-Config repository, which is where the
+settings tool is developed and where its on-disk documentation is kept, so
+this repository holds neither of them in source form.
 
 Follows the style of download_firmware.py, but deliberately does NOT do any
 endian conversion or word-packing: firmwareROM/gemdrvemulROM etc. hold
@@ -19,11 +23,15 @@ import urllib.request
 
 BYTES_PER_LINE = 16
 
-DEFAULT_PRG_URL = (
-    "https://github.com/RetroLoft/SideTNFS-Config/releases/latest/download/SIDETNFS.PRG"
+# Both files are owned by the SideTNFS-Config repository and are published
+# together as assets of the same release, so they are always taken from the
+# same source and cannot drift apart in version.
+CONFIG_RELEASE_BASE = (
+    "https://github.com/RetroLoft/SideTNFS-Config/releases/latest/download"
 )
+DEFAULT_PRG_URL = f"{CONFIG_RELEASE_BASE}/SIDETNFS.PRG"
+DEFAULT_README_URL = f"{CONFIG_RELEASE_BASE}/README.TXT"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_README_PATH = os.path.join(SCRIPT_DIR, "assets", "config_drive", "README.TXT")
 DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "sidetnfs_config_drive.c")
 
 
@@ -119,12 +127,14 @@ if __name__ == "__main__":
         "--prg",
         default=DEFAULT_PRG_URL,
         help="SIDETNFS.PRG source: URL or local file path "
-        "(e.g. --prg /home/frank/retro/sidecart/AtariConfig/SIDETNFS.PRG for development)",
+        "(point it at a SideTNFS-Config checkout for development, "
+        "e.g. --prg ../../AtariConfig/SIDETNFS.PRG)",
     )
     parser.add_argument(
         "--readme",
-        default=DEFAULT_README_PATH,
-        help="README.TXT source file path",
+        default=DEFAULT_README_URL,
+        help="README.TXT source: URL or local file path, same repository and "
+        "same release as --prg (e.g. --readme ../../AtariConfig/README.TXT)",
     )
     parser.add_argument(
         "--output",
