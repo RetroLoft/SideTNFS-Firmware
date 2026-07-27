@@ -4107,6 +4107,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             get_net_time()->ntp_server_found = false;
 
             bool dns_query_done = false;
+            // Fase 9E: guarantees at most one NTP UDP request per resolve
+            // attempt, even if the direct (ERR_OK) path and a late
+            // host_found_callback() were ever to both mark the server as
+            // found. Cleared again for every new resolve attempt below.
+            bool ntp_request_sent = false;
 
             // Fase 8 (boot-time NTP met korte timeout): a single, short
             // (~3s) attempt -- replaces the old, up-to-45s
@@ -4138,15 +4143,23 @@ void init_gemdrvemul(bool safe_config_reboot)
                     active_command_id = 0xFFFF;
                     break;
                 }
-                if ((get_net_time()->ntp_server_found) && dns_query_done)
+                if ((get_net_time()->ntp_server_found) && dns_query_done && !ntp_request_sent)
                 {
                     DPRINTF("NTP server found. Connecting to NTP server...\n");
                     get_net_time()->ntp_server_found = false;
+                    ntp_request_sent = true;
                     set_internal_rtc();
                 }
                 // Get the IP address from the DNS server if the wifi is connected and no IP address is found yet
                 if (!(dns_query_done))
                 {
+                    // Fase 9E: clear every DNS/NTP flag before each new
+                    // resolve attempt, so nothing left over from a previous
+                    // (failed) attempt can leak into this one.
+                    get_net_time()->ntp_server_found = false;
+                    get_net_time()->ntp_error = false;
+                    ntp_request_sent = false;
+
                     // Let's connect to ntp server
                     DPRINTF("Querying the DNS...\n");
                     err_t dns_ret = dns_gethostbyname(ntp_server_host, &get_net_time()->ntp_ipaddr, host_found_callback, get_net_time());
@@ -4159,6 +4172,36 @@ void init_gemdrvemul(bool safe_config_reboot)
                     }
                     DPRINTF("DNS query done\n");
                     dns_query_done = true;
+
+                    // Fase 9E: dns_gethostbyname() has three outcomes, and
+                    // only ERR_INPROGRESS ever reaches host_found_callback():
+                    //   ERR_OK         -- resolved immediately, either from
+                    //                     the lwIP DNS cache or because the
+                    //                     configured "hostname" is a numeric
+                    //                     IP literal. ntp_ipaddr is already
+                    //                     filled in by the call itself and the
+                    //                     callback is NEVER invoked, so adopt
+                    //                     exactly the state the callback would
+                    //                     have set. The send block above then
+                    //                     fires once on the next iteration,
+                    //                     through the same set_internal_rtc()
+                    //                     helper as the async path. Without
+                    //                     this the request was never sent and
+                    //                     the attempt always hit the timeout.
+                    //   ERR_INPROGRESS -- unchanged async path; the callback
+                    //                     decides found vs. error.
+                    //   anything else  -- hard synchronous DNS failure
+                    //                     (ERR_ARG/ERR_VAL, e.g. no DNS server
+                    //                     configured): no request is sent, and
+                    //                     ntp_error is deliberately NOT raised,
+                    //                     because the retry block below would
+                    //                     then re-query as fast as this loop
+                    //                     spins. The attempt just ends in the
+                    //                     normal timeout.
+                    if (dns_ret == ERR_OK)
+                    {
+                        get_net_time()->ntp_server_found = true;
+                    }
                 }
                 if (get_net_time()->ntp_error)
                 {
