@@ -5,6 +5,7 @@
  * include/sidetnfs_probe.h.
  */
 #include "include/sidetnfs_probe.h"
+#include "lwip/dns.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -560,6 +561,10 @@ static uint8_t s_readdirx_seq = 2; // MOUNT uses 0, OPENDIRX uses 1
 // tnfs_recv_callback() (response side); read by
 // sidetnfs_probe_get_slot_context() below.
 static sidetnfs_slot_tnfs_context_t s_slot_contexts[SIDETNFS_PROBE_MAX_RUNTIME_SLOTS];
+
+// Address helpers, defined below next to the resolver glue.
+static bool slot_server_ip(int slot, ip_addr_t *out);
+static bool ctx_server_ip(const sidetnfs_slot_tnfs_context_t *ctx, ip_addr_t *out);
 
 // Explicit single-outstanding-MOUNT
 // tracker. -1 means "no MOUNT currently outstanding" -- deliberately NOT
@@ -1731,7 +1736,7 @@ static struct udp_pcb *s_mount_pcb = NULL;
 bool sidetnfs_udp_connect_test(void)
 {
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!slot_server_ip(0, &server_ip))
     {
         return false;
     }
@@ -1756,7 +1761,7 @@ bool sidetnfs_udp_connect_test(void)
 void sidetnfs_send_udp_probe(void)
 {
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!slot_server_ip(0, &server_ip))
     {
         return;
     }
@@ -2293,6 +2298,198 @@ static void build_canonical_mount_path(const char *mount_path, char *out, size_t
 // s_mount_pcb, if any, is removed first so repeated resets never leak a
 // PCB (the original one-PCB-for-the-firmware's-lifetime comment on
 // s_mount_pcb above only held while this was truly a once-per-boot call).
+/**
+ * Monotonically increasing identifier handed to each DNS lookup. Never
+ * reused, so an answer can always be matched to the exact lookup that
+ * asked for it. Wrapping after 2^32 lookups is not reachable in practice.
+ */
+static uint32_t s_next_dns_request_id = 1;
+
+/**
+ * lwIP resolver callback.
+ *
+ * The callback argument is the lookup's request id, not a pointer: lwIP may
+ * deliver an answer for a lookup that already timed out and cannot be
+ * cancelled, so nothing is dereferenced here that a timed-out lookup could
+ * have invalidated. The id is matched against every slot, and applied only
+ * to a slot still waiting for exactly that lookup. A stale answer therefore
+ * matches nothing and is dropped, even when the same slot has meanwhile
+ * started a retry.
+ *
+ * @param name   Resolved name; unused, the id identifies the lookup.
+ * @param ipaddr Resolved address, or NULL when the lookup failed.
+ * @param arg    The request id of the lookup being answered.
+ */
+static void slot_dns_found_callback(const char *name, const ip_addr_t *ipaddr, void *arg)
+{
+    (void)name;
+    uint32_t request_id = (uint32_t)(uintptr_t)arg;
+
+    for (int slot = 0; slot < SIDETNFS_PROBE_MAX_RUNTIME_SLOTS; slot++)
+    {
+        if (!sidetnfs_resolve_accepts(&s_slot_contexts[slot].resolve, request_id))
+        {
+            continue;
+        }
+        if (ipaddr != NULL)
+        {
+            uint32_t addr = ipaddr->addr;
+            sidetnfs_resolve_complete(&s_slot_contexts[slot].resolve, request_id, &addr);
+        }
+        else
+        {
+            sidetnfs_resolve_complete(&s_slot_contexts[slot].resolve, request_id, NULL);
+        }
+        return; // ids are unique, so at most one slot can match
+    }
+}
+
+/**
+ * Ensures slot `slot` has a usable IPv4 address for its configured host.
+ *
+ * A dotted-quad literal is taken directly and costs no DNS query. Anything
+ * else is resolved through lwIP, handling both an immediate cache hit
+ * (dns_gethostbyname() returning ERR_OK, with no callback) and a deferred
+ * answer (ERR_INPROGRESS, answered by slot_dns_found_callback()). The wait
+ * is bounded by SIDETNFS_RESOLVE_TIMEOUT_MS.
+ *
+ * A resolved address is cached in the slot for the rest of this session, so
+ * repeated mounts of the same slot query DNS at most once. Failure marks
+ * the slot host_unresolvable, which surfaces as SIDETNFS_DRIVE_ERR_DNS_FAILED;
+ * it is not sticky, since repopulating the slot resets the state.
+ *
+ * @param slot Runtime slot index; must be populated and TNFS-backed.
+ *
+ * @return true when the slot has an address to send to.
+ */
+static bool ensure_slot_address(int slot)
+{
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS)
+    {
+        return false;
+    }
+    sidetnfs_slot_tnfs_context_t *ctx = &s_slot_contexts[slot];
+    if (ctx->resolve.state == SIDETNFS_RESOLVE_DONE)
+    {
+        return true; // already resolved for this slot
+    }
+
+    // Fast path: a numeric literal never reaches the resolver. ipaddr_aton()
+    // is kept as a fallback so any address form accepted before still works.
+    uint32_t literal = 0;
+    ip_addr_t parsed;
+    if (sidetnfs_resolve_parse_ipv4(ctx->host, &literal))
+    {
+        uint32_t id = s_next_dns_request_id++;
+        sidetnfs_resolve_reset(&ctx->resolve, slot);
+        sidetnfs_resolve_begin(&ctx->resolve, id);
+        sidetnfs_resolve_complete(&ctx->resolve, id, &literal);
+        ctx->host_unresolvable = false;
+        return true;
+    }
+    if (ipaddr_aton(ctx->host, &parsed))
+    {
+        uint32_t a = parsed.addr;
+        uint32_t id = s_next_dns_request_id++;
+        sidetnfs_resolve_reset(&ctx->resolve, slot);
+        sidetnfs_resolve_begin(&ctx->resolve, id);
+        sidetnfs_resolve_complete(&ctx->resolve, id, &a);
+        ctx->host_unresolvable = false;
+        return true;
+    }
+
+    if (ctx->host[0] == '\0')
+    {
+        ctx->host_unresolvable = true;
+        return false; // nothing configured -- no query to make
+    }
+
+    uint32_t request_id = s_next_dns_request_id++;
+    sidetnfs_resolve_reset(&ctx->resolve, slot);
+    sidetnfs_resolve_begin(&ctx->resolve, request_id);
+
+    ip_addr_t resolved;
+    cyw43_arch_lwip_begin();
+    err_t err = dns_gethostbyname(ctx->host, &resolved, slot_dns_found_callback,
+                                   (void *)(uintptr_t)request_id);
+    cyw43_arch_lwip_end();
+
+    if (err == ERR_OK)
+    {
+        // Answered straight from the lwIP cache; the callback is not invoked.
+        uint32_t a = resolved.addr;
+        sidetnfs_resolve_complete(&ctx->resolve, request_id, &a);
+    }
+    else if (err != ERR_INPROGRESS)
+    {
+        sidetnfs_resolve_complete(&ctx->resolve, request_id, NULL);
+    }
+
+    while (ctx->resolve.state == SIDETNFS_RESOLVE_PENDING)
+    {
+        cyw43_arch_poll();
+        sleep_ms(SIDETNFS_RESOLVE_STEP_MS);
+        sidetnfs_resolve_tick(&ctx->resolve, SIDETNFS_RESOLVE_STEP_MS, SIDETNFS_RESOLVE_TIMEOUT_MS);
+    }
+
+    if (ctx->resolve.state != SIDETNFS_RESOLVE_DONE)
+    {
+        ctx->host_unresolvable = true;
+        DPRINTF("TNFS slot %d: could not resolve '%s'\n", slot, ctx->host);
+        return false;
+    }
+    ctx->host_unresolvable = false;
+    return true;
+}
+
+/**
+ * Fills *out with the address slot `slot` should be contacted on.
+ *
+ * @param slot Runtime slot index.
+ * @param out  Receives the address; untouched on failure.
+ *
+ * @return true when the slot has a resolved address.
+ */
+static bool slot_server_ip(int slot, ip_addr_t *out)
+{
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS || out == NULL)
+    {
+        return false;
+    }
+    if (s_slot_contexts[slot].resolve.state == SIDETNFS_RESOLVE_DONE)
+    {
+        out->addr = s_slot_contexts[slot].resolve.addr;
+        return true;
+    }
+    return ipaddr_aton(s_slot_contexts[slot].host, out) != 0;
+}
+
+/**
+ * Fills *out with the address a slot context should be contacted on.
+ *
+ * Uses the resolved address when the slot has one, and otherwise falls
+ * back to parsing host[] as a literal, so contexts that were populated
+ * without going through ensure_slot_address() still work.
+ *
+ * @param ctx Slot context to read; may be NULL.
+ * @param out Receives the address; untouched on failure.
+ *
+ * @return true when an address is available.
+ */
+static bool ctx_server_ip(const sidetnfs_slot_tnfs_context_t *ctx, ip_addr_t *out)
+{
+    if (ctx == NULL || out == NULL)
+    {
+        return false;
+    }
+    if (ctx->resolve.state == SIDETNFS_RESOLVE_DONE)
+    {
+        out->addr = ctx->resolve.addr;
+        return true;
+    }
+    return ipaddr_aton(ctx->host, out) != 0;
+}
+
 void sidetnfs_send_mount_probe(void)
 {
     // Mark as attempted regardless of what happens below -- this is a
@@ -2307,7 +2504,7 @@ void sidetnfs_send_mount_probe(void)
 #endif
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!slot_server_ip(0, &server_ip))
     {
         // Capture this existing check's
         // already-computed result instead of discarding it -- the closest
@@ -2434,7 +2631,7 @@ static void send_slot_mount_request(int slot)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_slot_contexts[slot].host, &server_ip))
+    if (!slot_server_ip(slot, &server_ip))
     {
         // Same capture as
         // sidetnfs_send_mount_probe()'s own comment above.
@@ -2525,6 +2722,12 @@ void sidetnfs_probe_mount_runtime_slots(void)
     if (s_slot_contexts[0].valid && s_slot_contexts[0].backend_type == SIDETNFS_DRIVE_TNFS &&
         s_slot_contexts[0].transport == SIDETNFS_TRANSPORT_UDP)
     {
+        // Resolve before mounting: a name has to become an address first,
+        // and WiFi plus the network interface are already up by the time
+        // this runs. A failure here leaves the slot marked
+        // host_unresolvable, which the status layer reports as DNS FAILED.
+        if (ensure_slot_address(0))
+        {
         sidetnfs_send_mount_probe();
         bool slot0_ok = wait_for_mount_response(&s_slot_contexts[0].response_received);
         // Clear the pending marker once
@@ -2546,6 +2749,7 @@ void sidetnfs_probe_mount_runtime_slots(void)
         printf("mount runtime 0: rc=%u sid=0x%04X %s\r\n", s_slot_contexts[0].mount_result,
                s_slot_contexts[0].session_id, slot0_ok ? "responded" : "timeout");
 #endif
+        }
     }
 
     for (int slot = 1; slot < SIDETNFS_PROBE_MAX_RUNTIME_SLOTS; slot++)
@@ -2554,6 +2758,10 @@ void sidetnfs_probe_mount_runtime_slots(void)
             s_slot_contexts[slot].transport != SIDETNFS_TRANSPORT_UDP)
         {
             continue; // SETTINGS/SD/unpopulated -- never mounted as TNFS
+        }
+        if (!ensure_slot_address(slot))
+        {
+            continue; // unresolvable host -- reported as DNS FAILED, other slots unaffected
         }
         send_slot_mount_request(slot);
         bool ok = wait_for_mount_response(&s_slot_contexts[slot].response_received);
@@ -2586,7 +2794,7 @@ static void send_opendirx_probe(void)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!slot_server_ip(0, &server_ip))
     {
         return;
     }
@@ -2642,7 +2850,7 @@ static void send_readdirx_probe(void)
     }
 
     ip_addr_t server_ip;
-    if (!ipaddr_aton(s_active_host, &server_ip))
+    if (!slot_server_ip(0, &server_ip))
     {
         return;
     }
@@ -3183,7 +3391,7 @@ static bool fslisting_send_opendirx(const sidetnfs_slot_tnfs_context_t *ctx, con
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3234,7 +3442,7 @@ static bool fslisting_send_readdirx(const sidetnfs_slot_tnfs_context_t *ctx, uin
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3275,7 +3483,7 @@ static bool fslisting_send_closedir(const sidetnfs_slot_tnfs_context_t *ctx, uin
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3323,7 +3531,7 @@ static bool fslisting_send_open(const sidetnfs_slot_tnfs_context_t *ctx, const c
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3370,7 +3578,7 @@ static bool fslisting_send_unlink(const sidetnfs_slot_tnfs_context_t *ctx, const
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3412,7 +3620,7 @@ static bool fslisting_send_stat(const sidetnfs_slot_tnfs_context_t *ctx, const c
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3462,7 +3670,7 @@ static bool fslisting_send_mkdir(const sidetnfs_slot_tnfs_context_t *ctx, const 
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3505,7 +3713,7 @@ static bool fslisting_send_rmdir(const sidetnfs_slot_tnfs_context_t *ctx, const 
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3548,7 +3756,7 @@ static bool fslisting_send_rename(const sidetnfs_slot_tnfs_context_t *ctx, const
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3596,7 +3804,7 @@ static bool fslisting_send_read(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3644,7 +3852,7 @@ static bool fslisting_send_write(const sidetnfs_slot_tnfs_context_t *ctx, uint8_
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3689,7 +3897,7 @@ static bool fslisting_send_close(const sidetnfs_slot_tnfs_context_t *ctx, uint8_
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }
@@ -3730,7 +3938,7 @@ static bool fslisting_send_seek(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t
         return false;
     }
     ip_addr_t server_ip;
-    if (!ipaddr_aton(ctx->host, &server_ip))
+    if (!ctx_server_ip(ctx, &server_ip))
     {
         return false;
     }

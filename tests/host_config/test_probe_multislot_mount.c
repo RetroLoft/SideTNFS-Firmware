@@ -401,6 +401,17 @@ static void test_I_mixed_backends_only_tnfs_mounted(void)
     CHECK(!ctx1.response_received && !ctx2.response_received, "neither SD/SETTINGS slot was ever attempted as TNFS");
 }
 
+
+/* lwIP DNS is not host-buildable; sidetnfs_probe.c only ever reaches this
+   for a non-literal host, which these tests do not configure. */
+#include "lwip/dns.h"
+void sleep_ms(uint32_t ms) { (void)ms; }
+err_t dns_gethostbyname(const char *hostname, ip_addr_t *addr, dns_found_callback found, void *callback_arg)
+{
+    (void)hostname; (void)addr; (void)found; (void)callback_arg;
+    return ERR_INPROGRESS;
+}
+
 int main(void)
 {
     test_F_three_independent_tnfs_sessions();

@@ -576,6 +576,17 @@ static void test_I_settings_never_affected(void)
     CHECK(mirror_fopen_net_err(0, "OTHER.TXT") == MIRROR_GEMDOS_EFILNF, "Fopen of any other name on this virtual root is EFILNF");
 }
 
+
+/* lwIP DNS is not host-buildable; sidetnfs_probe.c only ever reaches this
+   for a non-literal host, which these tests do not configure. */
+#include "lwip/dns.h"
+void sleep_ms(uint32_t ms) { (void)ms; }
+err_t dns_gethostbyname(const char *hostname, ip_addr_t *addr, dns_found_callback found, void *callback_arg)
+{
+    (void)hostname; (void)addr; (void)found; (void)callback_arg;
+    return ERR_INPROGRESS;
+}
+
 int main(void)
 {
     test_A_no_wifi();

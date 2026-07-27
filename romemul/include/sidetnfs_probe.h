@@ -12,7 +12,8 @@
 #include <stdint.h>
 #include <stddef.h> // size_t -- sidetnfs_build_net_err_text()
 
-#include "sidetnfs_config.h" // sidetnfs_drive_config_t -- see sidetnfs_slot_tnfs_context_t below
+#include "sidetnfs_config.h"
+#include "sidetnfs_resolve.h" // sidetnfs_drive_config_t -- see sidetnfs_slot_tnfs_context_t below
 
 // Central backend choice for GEMDRIVE directory listing.
 // Replaced the old on/off SIDETNFS_EXPERIMENTAL_FS_LISTING switch (removed
@@ -321,6 +322,15 @@ typedef struct
     // TNFS mount. Reset to false whenever this slot is repopulated (see
     // sidetnfs_probe_set_slot_context()'s memset).
     bool host_unresolvable;
+
+    // Address resolution for host[], owned by this slot alone. A dotted-quad
+    // literal completes here without any DNS traffic; a name goes through
+    // lwIP's resolver. Because this lives inside the static slot-context
+    // array, its address stays valid for the whole of an asynchronous
+    // lookup, which is what dns_gethostbyname() requires of its callback
+    // argument. Keeping it per slot is also what stops two drives with
+    // different hosts from overwriting each other's answer.
+    sidetnfs_resolve_t resolve;
 } sidetnfs_slot_tnfs_context_t;
 
 // Populates slot `slot`'s host/port/mount_path/sd_path/backend/transport
