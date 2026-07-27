@@ -650,8 +650,9 @@ bool sidetnfs_probe_get_slot_context(int slot, sidetnfs_slot_tnfs_context_t *out
 // slot's own already-stored sidetnfs_slot_tnfs_context_t -- never sends
 // network traffic, never blocks, never invents a new TNFS error code.
 // Fixed priority order: no WiFi first (nothing else can matter without
-// it), then DNS/host-parse failure (deterministic, no wait ever
-// happened), then "no response within the bounded wait" (timeout),
+// it), then "the host never yielded an address" (unparseable, empty, or a
+// name DNS could not resolve -- no MOUNT was ever sent in any of those
+// cases), then "no response within the bounded wait" (timeout),
 // then "response received but rc != TNFS_OK" (mount failed), and
 // finally "no session context at all" for a slot that was never even
 // populated by sidetnfs_probe_set_slot_context() -- which, for an
@@ -728,6 +729,19 @@ size_t sidetnfs_build_net_err_text(int slot, char driveletter, bool wifi_ok, cha
                      "SideTNFS drive %c: not available\r\n"
                      "Reason: %s\r\n",
                      driveletter, sidetnfs_drive_error_category_text(category));
+    }
+    else if (category == SIDETNFS_DRIVE_ERR_DNS_FAILED)
+    {
+        // A name that never resolved has no address, so no MOUNT was ever
+        // sent: port, mount path and mount_result all still hold their
+        // initial values and would only mislead here -- mount_result 0 in
+        // particular reads as TNFS_OK. Name the one thing that did fail.
+        n = snprintf(out, out_size,
+                     "SideTNFS drive %c: not available\r\n"
+                     "Reason: %s\r\n"
+                     "The TNFS server hostname could not be resolved.\r\n"
+                     "Host: %s\r\n",
+                     driveletter, sidetnfs_drive_error_category_text(category), ctx.host);
     }
     else
     {

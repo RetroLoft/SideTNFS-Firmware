@@ -574,7 +574,7 @@ typedef enum
 {
     SIDETNFS_DRIVE_ERR_NONE = 0,
     SIDETNFS_DRIVE_ERR_NO_WIFI,             // WiFi not connected this boot (global)
-    SIDETNFS_DRIVE_ERR_DNS_FAILED,          // host[] did not parse as an IP (ipaddr_aton() failure)
+    SIDETNFS_DRIVE_ERR_DNS_FAILED,          // host[] yielded no address: empty, unparseable, or a name DNS could not resolve
     SIDETNFS_DRIVE_ERR_SERVER_UNREACHABLE,  // MOUNT sent, no response within the bounded wait (timeout)
     SIDETNFS_DRIVE_ERR_MOUNT_FAILED,        // MOUNT response received, rc != TNFS_OK
     SIDETNFS_DRIVE_ERR_NO_SESSION,          // slot has no valid session context at all (never populated)
