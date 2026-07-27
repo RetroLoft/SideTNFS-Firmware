@@ -8,6 +8,15 @@
 
 #include "include/rtcemul.h"
 
+// Fase 11 (Floppy en standalone RTC uit de Production-build): everything
+// between this guard and its #endif belongs to the STANDALONE RTC emulator
+// product (its own protocol handlers, Dallas RTC emulation, PIO/DMA/IRQ
+// resources and init entry point). It is not compiled at all in the default
+// build. The NTP/RTC helpers GEMDRIVE's clock flow calls every boot
+// (get_rtc_time/get_net_time/get_utc_offset_seconds/host_found_callback/
+// ntp_init/set_internal_rtc/set_ikb_datetime_msg and the BCD helpers) live
+// OUTSIDE these guards and are always compiled -- unchanged.
+#if SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 // MEmory base
 static uint32_t memory_shared_address;
 
@@ -27,6 +36,7 @@ static bool save_vectors = false;
 // XBIOS reentry lock variables
 static bool reentry_locked = false;
 static bool reentry_unlocked = false;
+#endif // SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 
 // NTP and RTC variables
 static datetime_t rtc_time = {0};
@@ -35,6 +45,7 @@ static long utc_offset_seconds = 0;
 static char *ntp_server_host = NULL;
 static int ntp_server_port = NTP_DEFAULT_PORT;
 
+#if SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 // Dallas RTC variables
 static DallasClock dallasClock = {0};
 
@@ -47,6 +58,7 @@ static char *wifi_password_file_content = NULL;
 
 // Y2K patch
 static bool y2k_patch_enabled = false;
+#endif // SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 
 datetime_t *get_rtc_time()
 {
@@ -68,6 +80,7 @@ void set_utc_offset_seconds(long offset)
     utc_offset_seconds = offset;
 }
 
+#if SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 static uint16_t rtc_get_raw_time()
 {
     // Ensure the values fit into the designated bit sizes
@@ -95,6 +108,7 @@ static uint16_t rtc_get_raw_date()
 
     return bit_date;
 }
+#endif // SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 
 void host_found_callback(const char *name, const ip_addr_t *ipaddr, void *arg)
 {
@@ -311,6 +325,7 @@ void set_ikb_datetime_msg(uint32_t mem_shared_addr,
 }
 
 
+#if SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 static void set_shared_var(uint32_t p_shared_variable_index, uint32_t p_shared_variable_value, uint32_t memory_shared_address)
 {
     DPRINTF("Setting shared variable %d to %x\n", p_shared_variable_index, p_shared_variable_value);
@@ -390,6 +405,8 @@ static void __not_in_flash_func(handle_protocol_command)(const TransmissionProto
 }
 
 // Function to convert a binary number to BCD format
+#endif // SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
+
 inline uint8_t to_bcd(uint8_t val)
 {
     return ((val / 10) << 4) | (val % 10);
@@ -445,6 +462,7 @@ inline uint8_t sub_bcd(uint8_t bcd1, uint8_t bcd2)
 static uint8_t offset_sync = 3;
 
 // Function to populate the magic_sequence_dallas_rtc
+#if SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION
 static void populate_magic_sequence(uint8_t *sequence, uint64_t hex_value)
 {
     // Loop through each bit of the 64-bit hex value. Leave the first two bits untouched
@@ -934,3 +952,4 @@ int init_rtcemul(bool safe_config_reboot)
 
     blink_error();
 }
+#endif // SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION

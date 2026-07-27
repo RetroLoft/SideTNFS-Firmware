@@ -60,17 +60,46 @@ pico_add_extra_outputs(${PROJECT_NAME})
 # by default the header is generated into the build dir
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/romemul.pio)
 
+# Fase 11 (Floppy en standalone RTC uit de Production-build): two explicit,
+# independent product-feature flags, both defaulting to 0. They are NOT tied
+# to the old PARAM_BOOT_FEATURE boot-mode string in any way (that dispatch is
+# gone since Fase 10) and NOT tied to the Production/Diagnostic variant above
+# -- Diagnostic keeps the exact same defaults, so neither variant links these
+# products unless someone opts in explicitly, e.g.:
+#   SIDETNFS_ENABLE_FLOPPY_EMULATION=1 ./build.sh pico_w
+#   SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION=1 ./build.sh pico_w
+#
+# At 0 the corresponding .c files are not added to target_sources() at all
+# (see below) -- they are genuinely not compiled and not linked, rather than
+# compiled and then discarded by --gc-sections. The source files, headers and
+# generator scripts all stay in the repository untouched.
+#
+# rtcemul.c is the one exception that stays compiled unconditionally: it also
+# holds the NTP/RTC helpers the GEMDRIVE production clock flow calls every
+# boot (ntp_init/set_internal_rtc/get_rtc_time/set_ikb_datetime_msg/
+# host_found_callback/get_utc_offset_seconds). Its standalone-emulator half
+# (protocol handlers, Dallas RTC, PIO/DMA/IRQ callback, init_rtcemul) is
+# guarded inside the file by SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION.
+if("$ENV{SIDETNFS_ENABLE_FLOPPY_EMULATION}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_FLOPPY_EMULATION 0)
+else()
+        set(_SIDETNFS_ENABLE_FLOPPY_EMULATION $ENV{SIDETNFS_ENABLE_FLOPPY_EMULATION})
+endif()
+
+if("$ENV{SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION 0)
+else()
+        set(_SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION $ENV{SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION})
+endif()
+
 target_sources(${PROJECT_NAME} PRIVATE lwipopts.h)
 target_sources(${PROJECT_NAME} PRIVATE hw_config.c)
 target_sources(${PROJECT_NAME} PRIVATE commands.c)
 target_sources(${PROJECT_NAME} PRIVATE constants.c)
 target_sources(${PROJECT_NAME} PRIVATE firmware.c)
-target_sources(${PROJECT_NAME} PRIVATE firmware_floppyemul.c)
-target_sources(${PROJECT_NAME} PRIVATE firmware_rtcemul.c)
 target_sources(${PROJECT_NAME} PRIVATE firmware_gemdrvemul.c)
 target_sources(${PROJECT_NAME} PRIVATE httpd.c)
 target_sources(${PROJECT_NAME} PRIVATE romemul.c)
-target_sources(${PROJECT_NAME} PRIVATE floppyemul.c)
 target_sources(${PROJECT_NAME} PRIVATE romloader.c)
 target_sources(${PROJECT_NAME} PRIVATE tprotocol.c)
 target_sources(${PROJECT_NAME} PRIVATE config.c)
@@ -87,6 +116,28 @@ target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive_backend.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_sd_service.c)
 target_sources(${PROJECT_NAME} PRIVATE rtcemul.c)
 target_sources(${PROJECT_NAME} PRIVATE gemdrvemul.c)
+
+# Fase 11: product features, both OFF by default (see the flag block above).
+# At 0 these translation units are never handed to the compiler or the
+# linker; the files themselves stay in the repository.
+if(NOT ${_SIDETNFS_ENABLE_FLOPPY_EMULATION} STREQUAL "0")
+        target_sources(${PROJECT_NAME} PRIVATE floppyemul.c)
+        target_sources(${PROJECT_NAME} PRIVATE firmware_floppyemul.c)
+        message(STATUS "Floppy emulation: ENABLED (opt-in)")
+else()
+        message(STATUS "Floppy emulation: disabled (floppyemul.c/firmware_floppyemul.c not compiled)")
+endif()
+
+# rtcemul.c itself stays compiled unconditionally -- it carries the shared
+# NTP/RTC helpers GEMDRIVE needs. Only the standalone ROM blob is dropped
+# here; the standalone emulator code inside rtcemul.c is guarded by the
+# SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION define.
+if(NOT ${_SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION} STREQUAL "0")
+        target_sources(${PROJECT_NAME} PRIVATE firmware_rtcemul.c)
+        message(STATUS "Standalone RTC emulation: ENABLED (opt-in)")
+else()
+        message(STATUS "Standalone RTC emulation: disabled (firmware_rtcemul.c not compiled)")
+endif()
 target_sources(${PROJECT_NAME} PRIVATE usb_descriptors.c)
 target_sources(${PROJECT_NAME} PRIVATE usb_mass.c)
 
@@ -220,6 +271,7 @@ else()
         set(_SIDETNFS_BUILD_VARIANT "Diagnostic")
 endif()
 
+
 # Fase 10B: SIDETNFS_CONFIG_DRIVE_ONLY -- same passthrough pattern, default
 # 0 (unchanged behavior) unless explicitly overridden, e.g.:
 #   SIDETNFS_CONFIG_DRIVE_ONLY=1 SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
@@ -340,6 +392,8 @@ add_definitions(-DSIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM=${_SIDETNFS_FORCE_FACTORY
 add_definitions(-DSIDETNFS_ENABLE_SLOT_DIAG=${_SIDETNFS_ENABLE_SLOT_DIAG})
 add_definitions(-DSIDETNFS_ENABLE_SD_SLOT_DUMP=${_SIDETNFS_ENABLE_SD_SLOT_DUMP})
 add_definitions(-DSIDETNFS_FORCE_CONFIG_RECOVERY=${_SIDETNFS_FORCE_CONFIG_RECOVERY})
+add_definitions(-DSIDETNFS_ENABLE_FLOPPY_EMULATION=${_SIDETNFS_ENABLE_FLOPPY_EMULATION})
+add_definitions(-DSIDETNFS_ENABLE_STANDALONE_RTC_EMULATION=${_SIDETNFS_ENABLE_STANDALONE_RTC_EMULATION})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")
