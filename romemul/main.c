@@ -55,6 +55,16 @@
 // gemdrvemul.c, which is timing-critical cartridge-bus code this phase
 // deliberately does not touch -- boot-time-only detection is the safe
 // tradeoff (see report).
+// Number of CONSECUTIVE low samples required before SELECT counts as
+// genuinely released. sidetnfs_longpress_poll_step() documents that it
+// wants a *debounced* reading, but this call site used to hand it the raw
+// pin state, so a single contact bounce or noise glitch anywhere in the
+// ~667 samples of a 10s hold silently aborted the whole procedure -- with
+// no LED feedback to reveal it. At SIDETNFS_FACTORY_RESET_POLL_MS (15ms)
+// per sample this is ~60ms of tolerance, far longer than mechanical
+// bounce and far shorter than any intentional release.
+#define SIDETNFS_FACTORY_RESET_RELEASE_SAMPLES 4u
+
 static void sidetnfs_check_select_factory_reset(void)
 {
     if (gpio_get(SELECT_GPIO) == 0)
@@ -62,13 +72,34 @@ static void sidetnfs_check_select_factory_reset(void)
         return; // not held at boot at all -- nothing to do, nothing changed
     }
 
+    // SELECT is down on the very first sample: light the LED for the whole
+    // procedure so the user can actually see it is running. Without this
+    // the entire 10s hold was completely dark and indistinguishable from
+    // "nothing is happening" (see report).
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+
     uint32_t elapsed_ms = 0;
+    uint32_t low_samples = 0;
     for (;;)
     {
         sleep_ms(SIDETNFS_FACTORY_RESET_POLL_MS);
         elapsed_ms += SIDETNFS_FACTORY_RESET_POLL_MS;
 
-        bool pressed = (gpio_get(SELECT_GPIO) != 0);
+        if (gpio_get(SELECT_GPIO) != 0)
+        {
+            low_samples = 0; // still held -- any high sample breaks the low run
+        }
+        else
+        {
+            low_samples++;
+        }
+
+        // The debounced reading the helper's contract asks for: only a run
+        // of SIDETNFS_FACTORY_RESET_RELEASE_SAMPLES consecutive lows counts
+        // as released. elapsed_ms keeps accumulating through a bounce, so a
+        // glitch costs no hold time.
+        bool pressed = (low_samples < SIDETNFS_FACTORY_RESET_RELEASE_SAMPLES);
+
         sidetnfs_longpress_result_t result =
             sidetnfs_longpress_poll_step(pressed, elapsed_ms, SIDETNFS_FACTORY_RESET_HOLD_MS);
 
@@ -76,6 +107,7 @@ static void sidetnfs_check_select_factory_reset(void)
         {
             DPRINTF("SELECT released before %lums -- factory reset cancelled, nothing changed.\n",
                     (unsigned long)SIDETNFS_FACTORY_RESET_HOLD_MS);
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0); // procedure aborted -- LED off, boot on
             return;
         }
         if (result == SIDETNFS_LONGPRESS_TRIGGERED)
@@ -86,7 +118,7 @@ static void sidetnfs_check_select_factory_reset(void)
     }
 
     DPRINTF("SELECT held %lums -- performing factory reset.\n", (unsigned long)SIDETNFS_FACTORY_RESET_HOLD_MS);
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1); // already on since the first sample -- kept explicit
 
     sidetnfs_config_status_t rc = sidetnfs_config_factory_reset();
     if (rc == SIDETNFS_CONFIG_STATUS_OK)
@@ -178,6 +210,49 @@ static void sidetnfs_force_config_recovery(void)
 }
 #endif // SIDETNFS_FORCE_CONFIG_RECOVERY
 
+// Fase 10 (Morse-LED en oude productstates verwijderen): the only LED
+// signal left on the normal boot path. Three short flashes, purely as
+// physical "the Pico came up / restarted" feedback for user and
+// developer -- deliberately NOT a Morse character and NOT a status code:
+// it never encodes product mode, WiFi, network, NTP or any error state.
+//
+// Replaces the old blink_morse('H') ("H" for HARDISK, i.e. a product-mode
+// status code) that used to sit at this exact point. Written out here
+// rather than routed through blink_morse() so nothing on the production
+// boot path depends on the Morse alphabet any more; blink_morse()/
+// blink_error() themselves stay compiled for the retained floppy
+// emulation code (see report).
+//
+// Requires cyw43 to be initialized already -- the Pico W's onboard LED is
+// wired through the CYW43 chip, so this can only run after
+// network_wifi_init_for_settings() (see its call site in main()).
+#define BOOT_FLASH_COUNT 3
+#define BOOT_FLASH_ON_MS 150
+#define BOOT_FLASH_OFF_MS 150
+
+// Settle time given to CYW43/lwIP after the boot flashes, before the first
+// DNS/NTP and TNFS activity in init_gemdrvemul() below.
+//
+// Not cosmetic: hardware isolation (see report) proved this is required.
+// The old blink_morse('H') that used to sit at this point spent ~1200ms
+// here ("H" = four Morse dots); boot_led_flash() spends ~900ms. Removing
+// those ~300ms made the boot-time NTP sync fail with a timeout on every
+// single boot, while the byte-identical build with the 300ms restored
+// syncs normally. Four A/B/C isolation builds narrowed it to exactly this
+// delay -- it is not the NTP timeout, not the WiFi retry logic and not
+// DNS itself, all of which are untouched.
+#define SIDETNFS_WIFI_SETTLE_DELAY_MS 300
+static void boot_led_flash(void)
+{
+    for (int i = 0; i < BOOT_FLASH_COUNT; i++)
+    {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        sleep_ms(BOOT_FLASH_ON_MS);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+        sleep_ms(BOOT_FLASH_OFF_MS);
+    }
+}
+
 int main()
 {
     // Set the clock frequency. 20% overclocking
@@ -258,8 +333,13 @@ int main()
     // sidetnfs_config_init()/any SideTNFS-drive-list-dependent code below.
     sidetnfs_check_select_factory_reset();
 
-    ConfigEntry *default_config_entry = find_entry(PARAM_BOOT_FEATURE);
-    DPRINTF("BOOT_FEATURE: %s\n", default_config_entry->value);
+    // Fase 10 (Morse-LED en oude productstates verwijderen): the
+    // PARAM_BOOT_FEATURE read that used to be here is gone. Boot dispatch
+    // no longer consults it (Fase 3 already made GEMDRIVE the sole
+    // reachable production path), so reading it only produced a log line
+    // describing a decision nothing acts on. The config entry itself and
+    // its flash layout/offsets are deliberately left untouched -- see
+    // config.c's configEntries table.
 
     ConfigEntry *default_config_reboot_mode = find_entry(PARAM_SAFE_CONFIG_REBOOT);
     DPRINTF("SAFE_CONFIG_REBOOT: %s\n", default_config_reboot_mode->value);
@@ -304,8 +384,14 @@ int main()
 
     DPRINTF("Ready to accept commands.\n");
 
-    // The "H" character stands for "HARDISK"
-    blink_morse('H');
+    // Fase 10: three short LED flashes -- physical boot/restart feedback
+    // only (see boot_led_flash()'s own comment). Replaces the old
+    // blink_morse('H') product-mode status code.
+    boot_led_flash();
+    // Let CYW43/lwIP settle before the first DNS/NTP and TNFS traffic --
+    // see SIDETNFS_WIFI_SETTLE_DELAY_MS's own comment for why this is
+    // required and not cosmetic.
+    sleep_ms(SIDETNFS_WIFI_SETTLE_DELAY_MS);
 
     // Fase 9C: load/validate the persistent SideTNFS drive-list flash
     // config exactly once, before GEMDRIVE can process any of the
@@ -395,165 +481,22 @@ int main()
         tight_loop_contents();
     }
 
-    // You should never reach this line...
-
-    // --- Everything below this point is Fase-3-unreachable legacy mode
-    // selection, kept compiling/linking on purpose (see this phase's
-    // report) -- init_gemdrvemul() above never returns. ---
-    if (strcmp(default_config_entry->value, "ROM_EMULATOR") == 0)
-    {
-        DPRINTF("No SELECT button pressed. ROM_EMULATOR entry found in config. Launching.\n");
-
-        // Check if Delay ROM emulation (ripper style boot) is true
-        ConfigEntry *rom_delay_config_entry = find_entry(PARAM_DELAY_ROM_EMULATION);
-        DPRINTF("DELAY_ROM_EMULATION: %s\n", rom_delay_config_entry->value);
-        if ((strcmp(rom_delay_config_entry->value, "true") == 0) || (strcmp(rom_delay_config_entry->value, "TRUE") == 0) || (strcmp(rom_delay_config_entry->value, "T") == 0))
-        {
-            DPRINTF("Delaying ROM emulation.\n"); // Always print this line
-            // The "D" character stands for "Delay"
-            blink_morse('D');
-
-            // While until the user presses the SELECT button again to launch the ROM emulator
-            while (gpio_get(SELECT_GPIO) == 0)
-            {
-                tight_loop_contents();
-                sleep_ms(1000); // Give me a break... to display the message
-            }
-
-            DPRINTF("SELECT button pressed.\n");
-            // Now wait for the user to release the SELECT button
-            while (gpio_get(SELECT_GPIO) != 0)
-            {
-                tight_loop_contents();
-            }
-
-            DPRINTF("SELECT button released. Launching ROM emulator.\n");
-        }
-
-        // Canonical way to initialize the ROM emulator:
-        // No IRQ handler callbacks, copy the FLASH ROMs to RAM, and start the state machine
-        init_romemul(NULL, NULL, true);
-
-        DPRINTF("ROM Emulation started.\n"); // Always print this line
-
-        // The "E" character stands for "Emulator"
-        blink_morse('E');
-
-        // Deinit the CYW43 WiFi module. DO NOT INTERRUPT, BUDDY!
-        cyw43_arch_deinit();
-
-        bool write_config_only_once = true;
-        // Loop forever and block until the state machine put data into the FIFO
-        while (true)
-        {
-            tight_loop_contents();
-            sleep_ms(1000); // Give me a break... to display the message
-            if (gpio_get(SELECT_GPIO) != 0)
-            {
-                select_button_action(safe_config_reboot, write_config_only_once);
-                // Write config only once to avoid hitting the flash too much
-                write_config_only_once = false;
-            }
-        }
-    }
-
-    if (strcmp(default_config_entry->value, "FLOPPY_EMULATOR") == 0)
-    {
-        DPRINTF("FLOPPY_EMULATOR entry found in config. Launching.\n");
-
-        // Copy the ST floppy firmware emulator to RAM
-        // Copy the firmware to RAM
-        COPY_FIRMWARE_TO_RAM((uint16_t *)floppyemulROM, floppyemulROM_length);
-
-        // Reserve memory for the protocol parser
-        init_protocol_parser();
-        DPRINTF("Floppy emulation started.\n"); // Print always
-
-        // Hybrid way to initialize the ROM emulator:
-        // IRQ handler callback to read the commands in ROM3, and NOT copy the FLASH ROMs to RAM
-        // and start the state machine
-        init_romemul(NULL, floppyemul_dma_irq_handler_lookup_callback, false);
-
-        change_spi_speed();
-
-        DPRINTF("Ready to accept commands.\n");
-
-        init_floppyemul(safe_config_reboot);
-
-        // You should never reach this line...
-    }
-
-    if (strcmp(default_config_entry->value, "RTC_EMULATOR") == 0)
-    {
-        DPRINTF("RTC_EMULATOR entry found in config. Launching.\n");
-
-        char *rtc_type_str = find_entry(PARAM_RTC_TYPE)->value;
-        if (strcmp(rtc_type_str, "SIDECART") == 0)
-        {
-            // Copy the ST RTC firmware emulator to RAM
-            COPY_FIRMWARE_TO_RAM((uint16_t *)rtcemulROM, rtcemulROM_length);
-        }
-        else
-        {
-            ERASE_FIRMWARE_IN_RAM();
-        }
-
-        // Reserve memory for the protocol parser
-        init_protocol_parser();
-        DPRINTF("RTC emulation started.\n"); // Print always
-
-        // Hybrid way to initialize the ROM emulator:
-        // IRQ handler callback to read the commands in ROM3, and NOT copy the FLASH ROMs to RAM
-        // and start the state machine
-        init_romemul(NULL, rtcemul_dma_irq_handler_lookup_callback, false);
-
-        DPRINTF("Ready to accept commands.\n");
-
-        // The "T" character stands for "TIME"
-        blink_morse('T');
-
-        init_rtcemul(safe_config_reboot);
-
-        // You should never reach this line...
-    }
-
-    // Fase 3: the GEMDRIVE_EMULATOR block that used to live here (identical
-    // body) has moved above, unconditional -- see this function's own
-    // comment near the top. Everything from here down (the old
-    // "fall through to the configurator" default) is unreachable in
-    // production for the same reason, kept compiling/linking on purpose.
-
-    // Now if we enter a value that is not recognized, we enter the configuration mode by default always
-
-    DPRINTF("If you are here, you must ALWAYS enter into configuration mode.\n");
-
-    //  Check if the USB is connected. If so, check if the SD card is inserted and initialize the USB Mass storage device
-    if (cyw43_arch_gpio_get(CYW43_WL_GPIO_VBUS_PIN))
-    {
-
-#if TUD_OPT_HIGH_SPEED
-        DPRINTF("USB High Speed enabled. Configure serial USB speed\n");
-        change_spi_speed();
-#endif
-
-        DPRINTF("USB connected\n");
-        usb_mass_init();
-    }
-
-    DPRINTF("Launch configurator.\n");
-
-    // Deinit the CYW43 WiFi module. Enter clean in the firmware configurator
-    network_terminate();
-
-    init_firmware();
-
-    // Now the user needs to reset or poweroff the board to load the ROMs
-    DPRINTF("Rebooting the board.\n");
-
-    // Give a break to handle pending messages
-    sleep_ms(1000);
-
-    reboot();
-    while (1);
+    // Fase 10 (Morse-LED en oude productstates verwijderen): the four
+    // legacy mode-selection blocks that used to follow here are gone --
+    // ROM_EMULATOR, FLOPPY_EMULATOR, RTC_EMULATOR and the final
+    // "fall through to the old configurator" default, each dispatched on
+    // a PARAM_BOOT_FEATURE strcmp(). Fase 3 already made GEMDRIVE the
+    // sole reachable production path (init_gemdrvemul() above never
+    // returns), so all of it was provably dead boot dispatch, together
+    // with the blink_morse() product-mode status codes it carried
+    // ('D', 'E', 'T') and the init_firmware() configurator entry.
+    //
+    // Deliberately NOT removed, per this phase's scope: the emulator
+    // implementations themselves. floppyemul.c/.h, its firmware blob and
+    // its CMake rules are untouched and still build, so a future floppy
+    // release only has to re-add a call site. The same applies to
+    // romloader.c (init_firmware) and rtcemul.c (init_rtcemul); rtcemul.c
+    // additionally still provides the NTP/RTC helpers gemdrvemul.c calls
+    // every boot, so only its init_rtcemul() entry point is now unused.
     return 0;
 }

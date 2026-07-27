@@ -457,22 +457,26 @@ void swap_data(uint16_t *dest_ptr_word)
  */
 void select_button_action(bool safe_config_reboot, bool write_config_only_once)
 {
+    // Fase 10 (Morse-LED en oude productstates verwijderen): SELECT no
+    // longer writes PARAM_BOOT_FEATURE. It used to persist "CONFIGURATOR"
+    // here so the next boot would land in the old configurator, but boot
+    // dispatch stopped consulting that field entirely (GEMDRIVE is the
+    // sole reachable production path), so the write only cost a full
+    // write_all_entries() flash program on every SELECT press while
+    // changing nothing about the next boot. The accompanying
+    // write_all_entries() call is gone with it -- persisting the field was
+    // its only purpose here. The PARAM_BOOT_FEATURE entry itself, and the
+    // flash layout/offsets around it, are deliberately left untouched.
     if (safe_config_reboot)
     {
         if (write_config_only_once)
         {
-            DPRINTF("SELECT button pressed. Configurator will start after power cycling the computer.\n");
-            // Do not reboot if the user has disabled it
-            put_string(PARAM_BOOT_FEATURE, "CONFIGURATOR");
-            write_all_entries();
+            DPRINTF("SELECT button pressed. Safe-config-reboot mode: not rebooting.\n");
         }
     }
     else
     {
-
-        DPRINTF("SELECT button pressed. Launch configurator.\n");
-        put_string(PARAM_BOOT_FEATURE, "CONFIGURATOR");
-        write_all_entries();
+        DPRINTF("SELECT button pressed. Rebooting.\n");
         reboot();
         while (1)
             ;
