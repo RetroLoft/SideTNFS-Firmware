@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_netconfig.h
- * Description: Fase 11A -- WiFi/network configuration accessible while
+ * Description: -- WiFi/network configuration accessible while
  * GEMDRIVE is running (GEMDRVEMUL_SIDETNFS_GET/SET/SAVE_NETWORK_CONFIG).
  * Reuses the existing PARAM_WIFI_* configData entries and the existing 8KB
  * CONFIG_FLASH sector (romemul/config.c) -- no second permanent network
@@ -21,12 +21,12 @@
                      // field-size constants already used elsewhere in this codebase
                      // (WifiNetworkAuthInfo/ConnectionData), not new invented sizes.
 
-// Fase 11A: matches ConnectionData's own wifi_country[4] convention in
+// Matches ConnectionData's own wifi_country[4] convention in
 // network.h (2-letter ISO-3166-1 alpha-2 code + NUL + 1 padding byte for
 // CHANGE_ENDIANESS_BLOCK16's even-length requirement).
 #define SIDETNFS_NET_COUNTRY_LEN 4
 
-// Fase 11A: one fixed wire record, every field either uint16_t or a char[]
+// One fixed wire record, every field either uint16_t or a char[]
 // of even length -- no field ever needs compiler-inserted padding, and
 // this struct is never memcpy'd as a whole onto the ROM3 shared-memory
 // window (see GEMDRVEMUL_SIDETNFS_NETWORK_* explicit offsets in
@@ -45,7 +45,7 @@ typedef struct
     char primary_dns[IPV4_ADDRESS_LENGTH];      // 16
 } sidetnfs_network_config_t;
 
-// Fase 11A: exact size guarded at compile time -- 2+2+36+68+4+16*4 = 176.
+// Exact size guarded at compile time -- 2+2+36+68+4+16*4 = 176.
 // If this ever fails, GEMDRVEMUL_SIDETNFS_NETWORK_* offsets in gemdrvemul.h
 // (which are computed independently, field-length-by-field-length, not
 // from sizeof()) and this struct have silently drifted apart.
@@ -73,7 +73,7 @@ typedef enum
 // empty stored country is normalized to "XX" (display convenience only;
 // the flash entry itself is left untouched). Returns the existing
 // PARAM_WIFI_PASSWORD verbatim -- SIDETNFS.PRG must be able to read it back
-// for editing (see report).
+// for editing.
 void sidetnfs_netconfig_get(sidetnfs_network_config_t *out);
 
 // Pure validation, no side effects whatsoever -- never touches configData,
@@ -98,12 +98,12 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_stage(const sidetnfs_network_conf
 // depth -- staging already validated it once), builds a clean local copy,
 // updates the nine existing PARAM_WIFI_* configData entries via
 // put_string()/put_integer()/put_bool(), calls write_all_entries() (see
-// its own Fase 11A page-alignment fix in config.c), reads the same nine
+// its own page-alignment fix in config.c), reads the same nine
 // entries back via a fresh load_all_entries()-independent XIP re-read, and
 // only reports SIDETNFS_NETCONFIG_STATUS_OK if every one of the nine
 // fields byte-for-byte round-trips. Never disconnects/restarts the active
 // WiFi connection -- the new configuration only takes effect on a later,
-// separate apply/reinit path (not part of this phase).
+// separate apply/reinit path.
 sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void);
 
 // Test/introspection helper: true once sidetnfs_netconfig_stage() has

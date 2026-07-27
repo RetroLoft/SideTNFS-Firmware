@@ -60,7 +60,7 @@
 #define SHARED_VARIABLE_PEXEC_RESTORE SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 3
 #define SHARED_VARIABLE_FAKE_FLOPPY SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 4
 
-// Fase 1 (multi-drive, ROM side only in this phase): mirrors
+// Mirrors
 // sidecart-gemdrive-atari/src/gemdrive.s exactly --
 // SHARED_VARIABLE_PROTOCOL_VERSION/_DRIVE_COUNT/_DRIVE_NUMBER_TABLE (same
 // names, same SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE-relative indices 21/22/23).
@@ -137,7 +137,7 @@
 
 #define GEMDRVEMUL_EXEC_PD (GEMDRVEMUL_SHARED_VARIABLES + 256) // shared variables + 256 bytes
 
-// Fase 9B1: start of the SIDETNFS config-protocol response block. Placed
+// Start of the SIDETNFS config-protocol response block. Placed
 // right after the PD copy written by GEMDRVEMUL_PEXEC_CALL/SAVE_BASEPAGE
 // (memcpy(pexec_pd, origin, sizeof(PD)) at GEMDRVEMUL_EXEC_PD,
 // sizeof(PD) == 256 bytes -- see struct _pd in this file: p_cmdlin[128] at
@@ -149,11 +149,11 @@
 // 65536 -- ~48KB of headroom remains after this whole block).
 #define GEMDRVEMUL_SIDETNFS_CONFIG (GEMDRVEMUL_EXEC_PD + 256) // exec pd + sizeof(PD) bytes
 
-// Fase 9C: GET_CONFIG_INFO response block -- protocol version bumped to 2,
-// fields renamed/extended from the never-committed Fase 9B2 server-list
+// GET_CONFIG_INFO response block -- protocol version bumped to 2,
+// fields renamed/extended from the never-committed server-list
 // model (max_servers/server_count -> max_drives/drive_count, plus the new
 // config_drive_letter field). All five fields are 32-bit swapped longs
-// (WRITE_AND_SWAP_LONGWORD), same proven convention as Fase 9B1/9B2.
+// (WRITE_AND_SWAP_LONGWORD), same proven convention as .
 #define GEMDRVEMUL_SIDETNFS_CONFIG_VERSION (GEMDRVEMUL_SIDETNFS_CONFIG + 0)                        // uint32_t, protocol version (3)
 #define GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES (GEMDRVEMUL_SIDETNFS_CONFIG_VERSION + 4)             // uint32_t, SIDETNFS_MAX_DRIVES
 #define GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT (GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES + 4)         // uint32_t, configured (DISABLED+ENABLED) ordinary-drive count
@@ -161,7 +161,7 @@
 #define GEMDRVEMUL_SIDETNFS_CONFIG_STATUS (GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER + 4)            // uint32_t, status code (0 = OK)
 // Block ends at GEMDRVEMUL_SIDETNFS_CONFIG_STATUS + 4 (20 bytes total).
 
-// Fase 12B: bumped 2 -> 3. The byte layout below is UNCHANGED (same
+// Bumped 2 -> 3. The byte layout below is UNCHANGED (same
 // offsets, same field widths) -- only the value range/meaning of the
 // first drive-record field changed (DRIVE_USED: 0/1 -> DRIVE_STATE:
 // 0/1/2, see sidetnfs_drive_slot_state_t in sidetnfs_config.h). That
@@ -173,7 +173,7 @@
 // back as disabled -- see report ("waarom protocolversie omhoog").
 #define SIDETNFS_CONFIG_PROTOCOL_VERSION 3
 
-// Fase 9C: GET_DRIVE/SET_DRIVE/DELETE_DRIVE/SET_CONFIG_DRIVE/SAVE_CONFIG
+// GET_DRIVE/SET_DRIVE/DELETE_DRIVE/SET_CONFIG_DRIVE/SAVE_CONFIG
 // share this one block, immediately after the 20-byte GET_CONFIG_INFO
 // block above. GEMDRVEMUL_SIDETNFS_DRIVE_STATUS is GET_DRIVE's status
 // field AND the sole response field written by SET_DRIVE/DELETE_DRIVE/
@@ -190,7 +190,7 @@
 // docs/sidetnfs-config-protocol.md.
 #define GEMDRVEMUL_SIDETNFS_DRIVE (GEMDRVEMUL_SIDETNFS_CONFIG_STATUS + 4)
 #define GEMDRVEMUL_SIDETNFS_DRIVE_STATUS (GEMDRVEMUL_SIDETNFS_DRIVE + 0)                                // uint32_t, swapped long
-// Fase 12B: renamed from GEMDRVEMUL_SIDETNFS_DRIVE_USED -- same offset,
+// Renamed from GEMDRVEMUL_SIDETNFS_DRIVE_USED -- same offset,
 // same uint16_t plain-word wire type, now carries a
 // sidetnfs_drive_slot_state_t value (0 EMPTY/1 DISABLED/2 ENABLED)
 // instead of a 0/1 boolean. See SIDETNFS_CONFIG_PROTOCOL_VERSION's own
@@ -206,13 +206,13 @@
 #define GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH (GEMDRVEMUL_SIDETNFS_DRIVE_MOUNT_PATH + SIDETNFS_MOUNTPATH_LEN) // char[SIDETNFS_SDPATH_LEN]
 // Block ends at GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH + SIDETNFS_SDPATH_LEN (198 bytes total).
 
-// Fase 11C: round a shared-memory offset up to the next 4-byte boundary.
+// Round a shared-memory offset up to the next 4-byte boundary.
 // Scoped name (not a generic ALIGN4) to avoid any collision with unrelated
 // same-named macros elsewhere in the tree (e.g. pico-sdk's btstack ASF
 // ports, never included by this build, but not worth risking).
 #define SIDETNFS_NETWORK_ALIGN4(value) (((value) + 3u) & ~3u)
 
-// Fase 11A/11C: GET/SET/SAVE_NETWORK_CONFIG response/request block, placed
+// GET/SET/SAVE_NETWORK_CONFIG response/request block, placed
 // after the 198-byte drive record above, rounded up to the next 4-byte
 // boundary (offset 17524/0x4474 of the 64KB ROM3 shared-memory window --
 // ~46KB of headroom remains). Every field's offset is computed
@@ -230,7 +230,7 @@
 // comment for the hardware-proven rationale. Never change this swap based
 // on host-only testing. See docs/sidetnfs-config-protocol.md.
 //
-// Fase 11C alignment fix: the 198-byte drive record's own size is not a
+// Alignment fix: the 198-byte drive record's own size is not a
 // multiple of 4, so the network block's unrounded base was only 2-byte
 // aligned -- STATUS's WRITE_AND_SWAP_LONGWORD then performed an unaligned
 // 32-bit store, which Cortex-M0+ cannot do in hardware (HardFault,
@@ -250,7 +250,7 @@
 #define GEMDRVEMUL_SIDETNFS_NETWORK_DNS (GEMDRVEMUL_SIDETNFS_NETWORK_GATEWAY + IPV4_ADDRESS_LENGTH)               // char[IPV4_ADDRESS_LENGTH] (16)
 // Block ends at GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH (182 bytes total incl. 2 bytes of leading padding: 4 status + 176 sidetnfs_network_config_t + 2 padding).
 
-// Fase 11C: compile-time alignment/bounds guarantees for the network
+// Compile-time alignment/bounds guarantees for the network
 // block. NETWORK_STATUS must be 4-byte aligned (the only uint32_t
 // WRITE_AND_SWAP_LONGWORD field); AUTH_MODE/USE_DHCP must be 2-byte
 // aligned (WRITE_WORD); every string field's byte length must be even,
@@ -268,7 +268,7 @@ _Static_assert(SIDETNFS_NET_COUNTRY_LEN % 2 == 0, "SIDETNFS_NET_COUNTRY_LEN must
 _Static_assert(IPV4_ADDRESS_LENGTH % 2 == 0, "IPV4_ADDRESS_LENGTH must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_NETWORK block must fit within the 64KB ROM3 window");
 
-// Fase 12A: GET/SET/SAVE_RTC_CONFIG response/request block ("Set Atari
+// GET/SET/SAVE_RTC_CONFIG response/request block ("Set Atari
 // clock using NTP" / NTP server / UTC offset), placed directly after the
 // network block above. GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH
 // (0x4528) is already 4-byte aligned, but this still goes through
@@ -290,7 +290,7 @@ _Static_assert((GEMDRVEMUL_SIDETNFS_NETWORK_DNS + IPV4_ADDRESS_LENGTH) <= 0x1000
 #define GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET (GEMDRVEMUL_SIDETNFS_RTC_NTP_SERVER + SIDETNFS_RTC_NTP_SERVER_LEN) // char[SIDETNFS_RTC_UTC_OFFSET_LEN] (4)
 // Block ends at GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET + SIDETNFS_RTC_UTC_OFFSET_LEN (74 bytes total: 4 status + 70 sidetnfs_rtc_config_t).
 
-// Fase 12A: compile-time alignment/bounds guarantees for the RTC block,
+// Compile-time alignment/bounds guarantees for the RTC block,
 // same shape as the network block's own assertions above. RTC_STATUS
 // must be 4-byte aligned (the only uint32_t WRITE_AND_SWAP_LONGWORD
 // field); RTC_ENABLED must be 2-byte aligned (WRITE_WORD); both string
@@ -395,7 +395,7 @@ typedef struct DTANode
     struct DTANode *next;
 } DTANode;
 
-// Fase 7D: which backend actually opened this descriptor. fobject is only
+// Which backend actually opened this descriptor. fobject is only
 // ever populated/touched for GEMDRIVE_FILE_BACKEND_SD; tnfs_handle only for
 // GEMDRIVE_FILE_BACKEND_TNFS. Routing itself stays compile-time
 // (SIDETNFS_USE_TNFS_LISTING, like every other gemdrive_backend_* helper in
@@ -405,13 +405,13 @@ typedef enum
 {
     GEMDRIVE_FILE_BACKEND_SD = 0,
     GEMDRIVE_FILE_BACKEND_TNFS,
-    // Fase 10B: read-only, root-only virtual drive serving the Fase 10A
+    // Read-only, root-only virtual drive serving the
     // flash-embedded SIDETNFS.PRG/README.TXT directly from their const
     // arrays -- see romemul/sidetnfs_config_drive_backend.c. Only reached
     // when SIDETNFS_CONFIG_DRIVE_ONLY (compile-time, default 0) selects it
     // as the sole GEMDRIVE backend for a temporary test build.
     GEMDRIVE_FILE_BACKEND_CONFIG_FLASH,
-    // Fase 5 (virtual NET_ERR.TXT root): read-only, root-only virtual
+    // Read-only, root-only virtual
     // file for an ENABLED TNFS drive whose backend isn't ready right now
     // (see sidetnfs_probe_classify_slot_error()) -- generated fresh at
     // Fopen time into FileDescriptors.net_err_text, then served exactly
@@ -422,7 +422,7 @@ typedef enum
     // reusing GEMDRIVE_FILE_BACKEND_CONFIG_FLASH so SETTINGS and this
     // virtual file are never conflated (diagnostics, future maintenance).
     GEMDRIVE_FILE_BACKEND_NET_ERR,
-    // Fase 6 (SD-service/SD_ERROR.TXT): read-only, root-only virtual file
+    // Read-only, root-only virtual file
     // for an ENABLED SD drive whose backend isn't READY right now (see
     // sidetnfs_sd_get_drive_status()) -- generated fresh at Fopen time
     // into FileDescriptors.sd_error_text, served via the exact same
@@ -441,26 +441,26 @@ typedef struct FileDescriptors
     uint32_t offset;
     GemdriveFileBackend backend;
     uint8_t tnfs_handle; // valid only when backend == GEMDRIVE_FILE_BACKEND_TNFS
-    // Fase 7K: whether this handle was opened for writing (Fopen mode 1/2,
+    // Whether this handle was opened for writing (Fopen mode 1/2,
     // or Fcreate). Only meaningful/checked for GEMDRIVE_FILE_BACKEND_TNFS --
     // the SD/FatFS backend already enforces this itself (f_write() on an
     // FA_READ-only FIL returns FR_DENIED), so no equivalent check is added
     // there. Lets GEMDRVEMUL_WRITE_BUFF_CALL deny a write to a read-only
     // TNFS handle locally, before ever contacting the server.
     bool tnfs_writable;
-    // Fase 10 (Fopen/Fcreate slot-aware fix): the runtime slot (0=N:,
+    // The runtime slot (0=N:,
     // 1=O:, ...) this handle's TNFS session belongs to -- set once at
     // Fopen/Fcreate time (see gemdrive_backend_fopen()/
     // GEMDRVEMUL_FCREATE_CALL) and read back by every later call that
     // needs this handle's own host/port/session_id (Fread/Fwrite/Fseek/
-    // Fclose/Fdatime -- not changed in this phase, still slot-0-only, but
+    // Fclose/Fdatime
     // this is the field they will read from once they are). Meaningful
     // only when backend == GEMDRIVE_FILE_BACKEND_TNFS.
     int runtime_slot;
-    // Fase 10B: direct pointer into the existing Fase 10A const flash
+    // Direct pointer into the existing const flash
     // array (sidetnfs_config_prg/sidetnfs_config_readme) -- never a copy.
     // Valid only when backend == GEMDRIVE_FILE_BACKEND_CONFIG_FLASH.
-    // Fase 5: also reused (unchanged meaning: base pointer + size for a
+    // Also reused (unchanged meaning: base pointer + size for a
     // plain offset-bounded read) for GEMDRIVE_FILE_BACKEND_NET_ERR --
     // there config_flash_data always points at this SAME descriptor's own
     // net_err_text[] below (set once at Fopen time), never a shared/
@@ -468,12 +468,12 @@ typedef struct FileDescriptors
     // failing drives, test D) never alias each other.
     const uint8_t *config_flash_data;
     uint32_t config_flash_size;
-    // Fase 5 (virtual NET_ERR.TXT root): this handle's own generated
+    // This handle's own generated
     // body text, filled in once at Fopen time by
     // sidetnfs_build_net_err_text() -- valid only when
     // backend == GEMDRIVE_FILE_BACKEND_NET_ERR.
     char net_err_text[SIDETNFS_NET_ERR_TEXT_MAX];
-    // Fase 6 (SD_ERROR.TXT): this handle's own generated body text,
+    // This handle's own generated body text,
     // filled in once at Fopen time by sidetnfs_build_sd_error_text() --
     // valid only when backend == GEMDRIVE_FILE_BACKEND_SD_ERROR.
     // config_flash_data/config_flash_size are reused for this backend too

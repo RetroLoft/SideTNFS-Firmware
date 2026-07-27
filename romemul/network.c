@@ -207,7 +207,7 @@ void network_terminate()
     cyw43_arch_deinit();
 }
 
-// Fase 2B: the real WiFi-driver bring-up, parameterized on an
+// The real WiFi-driver bring-up, parameterized on an
 // already-resolved country code -- no ConfigEntry access at all. Shared
 // by both network_wifi_init() (legacy, resolves country from
 // ConfigEntry first) and the SideTNFS path (resolves country from
@@ -232,7 +232,7 @@ static int network_wifi_init_with_country_code(uint32_t country)
 
     // Setting the power management -- PARAM_WIFI_POWER stays a legacy-only
     // knob (not part of sidetnfs_system_config's WiFi/Network/RTC field
-    // list; Fase 2B deliberately leaves it as-is for both callers).
+    // list; deliberately leaves it as-is for both callers).
     uint32_t pm_value = 0xa11140; // 0: Disable PM
     ConfigEntry *pm_entry = find_entry(PARAM_WIFI_POWER);
     if (pm_entry != NULL)
@@ -266,9 +266,9 @@ static int network_wifi_init_with_country_code(uint32_t country)
 }
 
 // Legacy entry point -- resolves country from the old ConfigEntry store,
-// same behavior as before Fase 2B (including the put_string() write-back
+// same behavior as (including the put_string write-back
 // of the normalized country code). Only called from network_init()'s own
-// legacy adapter below, and from any other pre-Fase-2B caller that used
+// legacy adapter below, and from any other pre-caller that used
 // to call this directly.
 int network_wifi_init()
 {
@@ -288,9 +288,9 @@ int network_wifi_init()
     return res;
 }
 
-// Fase 2B: SideTNFS path -- resolves country from *settings (RAM only,
+// SideTNFS path -- resolves country from *settings (RAM only,
 // never writes back to ConfigEntry, unlike the legacy path above).
-// Fase 4 (CYW43-initialisatie en WiFi-timeouts): no longer static -- this
+// No longer static -- this
 // is now the single, sole CYW43 init call for the whole boot, called
 // exactly once from main() (before anything else touches cyw43, so
 // blink_morse()/the factory-reset and force-config-recovery LED
@@ -368,7 +368,7 @@ int network_init_with_settings(bool force, bool async, char **pass, const sidetn
         DPRINTF("Netmask: %s\n", ipaddr_ntoa(&netmask));
         DPRINTF("Gateway: %s\n", ipaddr_ntoa(&gw));
 
-        // Fase 2B: sidetnfs_system_settings_t only ever carries one DNS
+        // Sidetnfs_system_settings_t only ever carries one DNS
         // server (primary_dns) -- the SideTNFS config protocol itself
         // never supported the legacy store's comma-separated
         // second-DNS convention, so this is not a new limitation.
@@ -435,7 +435,7 @@ int network_init_with_settings(bool force, bool async, char **pass, const sidetn
     if (!async)
     {
         // PARAM_WIFI_CONNECT_TIMEOUT stays a legacy-only knob (not part of
-        // sidetnfs_system_config's field list) -- Fase 2B leaves it as-is
+        // sidetnfs_system_config's field list)
         // for both callers; in practice GEMDRIVE always calls with
         // async=true (see gemdrvemul.c), so this branch is not exercised
         // by the SideTNFS path.
@@ -466,12 +466,12 @@ int network_init_with_settings(bool force, bool async, char **pass, const sidetn
     return 0;
 }
 
-// Fase 2B: legacy adapter -- builds a sidetnfs_system_settings_t from the
+// Legacy adapter -- builds a sidetnfs_system_settings_t from the
 // old ConfigEntry store's PARAM_WIFI_* entries (exact same fields/
 // fallback-to-empty behavior network_init() always had) and delegates to
 // network_init_with_settings(), the one real implementation. Used by the
 // old configurator/floppy-emulator/standalone RTC-emulator -- GEMDRIVE/
-// SideTNFS never calls this as of Fase 2B (see gemdrvemul.c, which calls
+// SideTNFS never calls this (see gemdrvemul.c, which calls
 // network_init_with_settings() directly with settings from
 // sidetnfs_system_config_get()).
 int network_init(bool force, bool async, char **pass)
@@ -503,7 +503,7 @@ int network_init(bool force, bool async, char **pass)
     ConfigEntry *gateway_entry = find_entry(PARAM_WIFI_GATEWAY);
     if (gateway_entry != NULL) strncpy(legacy.gateway, gateway_entry->value, sizeof(legacy.gateway) - 1);
 
-    // Fase 2B: the legacy PARAM_WIFI_DNS entry can hold a comma-separated
+    // The legacy PARAM_WIFI_DNS entry can hold a comma-separated
     // pair ("dns1,dns2") -- network_init_with_settings() only ever reads
     // a single primary_dns, matching sidetnfs_system_settings_t's own
     // shape (see that function's own comment). Only the first address is

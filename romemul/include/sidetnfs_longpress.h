@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_longpress.h
- * Fase 12B2 (SELECT 10s factory reset): pure, host-testable long-press
+ * Pure, host-testable long-press
  * timing decision -- no GPIO/sleep/hardware calls, so it can be unit
  * tested without the Pico SDK (see tests/host_config/test_longpress.c).
  * The actual GPIO polling loop lives in main.c and calls this once per

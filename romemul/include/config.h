@@ -111,7 +111,7 @@ extern ConfigData configData;
 // Load functions. Should be used only at startup
 void load_all_entries();
 
-// Fase 2B: true iff the most recent load_all_entries() call actually
+// True iff the most recent load_all_entries call actually
 // found a matching magic in flash (current or the older 4KB-version
 // fallback) and overlaid real stored values on top of the defaults --
 // false means configData holds ONLY load_default_entries()'s built-in

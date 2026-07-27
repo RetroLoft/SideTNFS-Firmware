@@ -54,7 +54,7 @@ static ConfigEntry defaultEntries[MAX_ENTRIES] = {
 
 ConfigData configData;
 
-// Fase 2B: see config_loaded_from_real_flash()'s own doc comment in
+// See config_loaded_from_real_flash's own doc comment in
 // config.h. Set exactly once per load_all_entries() call, before any
 // caller could possibly read it.
 static bool g_config_loaded_from_real_flash = false;
@@ -129,7 +129,7 @@ void load_all_entries()
     // First, load default entries
     load_default_entries();
 
-    // Fase 2B: reset before every attempt -- only set true below, once a
+    // Reset before every attempt -- only set true below, once a
     // matching magic (current or the older 4KB-version fallback) is
     // actually found and this function is about to overlay real values
     // on top of the defaults just loaded above.
@@ -160,7 +160,7 @@ void load_all_entries()
         DPRINTF("Previous version of the config found in FLASH. Loading it.\n");
     }
 
-    // Fase 2B: reaching this point means a real, matching magic was
+    // Reaching this point means a real, matching magic was
     // found (either branch) -- everything below overlays genuine stored
     // values on top of the defaults.
     g_config_loaded_from_real_flash = true;
@@ -320,7 +320,7 @@ int write_all_entries()
     DPRINTF("Size of ConfigEntry: %d\n", sizeof(ConfigEntry));
     DPRINTF("Size of entries: %d\n", configData.count * sizeof(ConfigEntry));
 
-    // Fase 11A: flash_range_program() requires a length that's a multiple
+    // Flash_range_program requires a length that's a multiple
     // of FLASH_PAGE_SIZE (256) -- sizeof(ConfigData) (4136 bytes on this
     // target) is not. The Pico SDK's own flash.c documents this
     // requirement (invalid_params_if(FLASH, count & (FLASH_PAGE_SIZE-1))),
@@ -457,7 +457,7 @@ void swap_data(uint16_t *dest_ptr_word)
  */
 void select_button_action(bool safe_config_reboot, bool write_config_only_once)
 {
-    // Fase 10 (Morse-LED en oude productstates verwijderen): SELECT no
+    // SELECT no
     // longer writes PARAM_BOOT_FEATURE. It used to persist "CONFIGURATOR"
     // here so the next boot would land in the old configurator, but boot
     // dispatch stopped consulting that field entirely (GEMDRIVE is the

@@ -1,8 +1,8 @@
 /**
  * File: sidetnfs_sd_service.h
- * Fase 6 (SD-service en SD_ERROR.TXT): a single, one-shot, non-blocking
+ * A single, one-shot, non-blocking
  * boot-time SD card/mount check plus a per-ENABLED-SD-drive directory
- * check -- never the full FatFS/SD GEMDOS file backend (that is Fase 7).
+ * check -- never the full FatFS/SD GEMDOS file backend (that is ).
  * Mirrors sidetnfs_probe.c's own TNFS multi-slot pattern
  * (sidetnfs_probe_set_slot_context()/sidetnfs_probe_mount_runtime_slots()/
  * sidetnfs_probe_get_slot_context()), applied to SD instead of TNFS. Keeps
@@ -22,13 +22,13 @@
                               // result types (SETTINGS' own config-drive backend already
                               // reuses these too); no TNFS session/state coupling implied.
 
-// Fase 6: mirrors gemdrvemul.c's GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (9),
+// Mirrors gemdrvemul.c's GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (9),
 // duplicated as a literal rather than included -- same reasoning as
 // sidetnfs_probe.h's own SIDETNFS_PROBE_MAX_RUNTIME_SLOTS (this header must
 // not depend on gemdrvemul.h; the dependency already goes the other way).
 #define SIDETNFS_SD_SERVICE_MAX_SLOTS 9
 
-// Fase 6: minimum required status set. READY covers both "the physical
+// Minimum required status set. READY covers both "the physical
 // card/mount is fine" (global) and "this slot's own sd_path exists and is
 // a directory" (per-slot) -- see sidetnfs_sd_get_drive_status()'s own
 // comment for how the two combine.
@@ -61,7 +61,7 @@ typedef struct
 // slot is out of range.
 void sidetnfs_sd_service_set_slot_path(int slot, char driveletter, const char *sd_path);
 
-// Fase 6: the one boot-time SD detection/mount/per-slot directory check --
+// The one boot-time SD detection/mount/per-slot directory check --
 // see gemdrvemul.c's own call-site comment for exactly where this runs.
 // Never retries, never loops waiting for a card, never blocks WiFi/TNFS/
 // SETTINGS/the GEMDRIVE command loop. A second call this boot is a no-op
@@ -103,7 +103,7 @@ const char *sidetnfs_sd_status_text(sidetnfs_sd_status_t status);
 // NULL, never allocates.
 const char *sidetnfs_sd_status_hint(sidetnfs_sd_status_t status);
 
-// Fase 6: exact filename shown for an ENABLED SD drive whose backend
+// Exact filename shown for an ENABLED SD drive whose backend
 // isn't READY -- Fsfirst/Fsnext ever produce exactly this one entry for
 // such a drive, nothing else (no "."/"..", never NO_NETW.TXT/NET_ERR.TXT
 // -- SD is never routed through the TNFS fake-listing path).
@@ -117,7 +117,7 @@ const char *sidetnfs_sd_status_hint(sidetnfs_sd_status_t status);
 // Fsfirst/Fopen must report (test H) -- the two must never disagree.
 size_t sidetnfs_build_sd_error_text(int slot, char driveletter, char *out, size_t out_size);
 
-// Fase 6: a small, dedicated, memory-only listing for exactly one
+// A small, dedicated, memory-only listing for exactly one
 // synthetic entry (SIDETNFS_SD_ERROR_NAME) -- the SD equivalent of
 // sidetnfs_probe.c's fake/NET_ERR listings, but entirely separate state
 // (own search-slot table, own file) so SD is never routed through the

@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_rtcconfig.h
- * Description: Fase 12A -- minimal (KISS) "Set Atari clock using NTP"
+ * Description: -- minimal (KISS) "Set Atari clock using NTP"
  * configuration accessible while GEMDRIVE is running
  * (GEMDRVEMUL_SIDETNFS_GET/SET/SAVE_RTC_CONFIG). Reuses the existing
  * GEMDRIVE_RTC/RTC_NTP_SERVER_HOST/RTC_UTC_OFFSET configData entries and
@@ -12,7 +12,7 @@
  * configData/CONFIG_FLASH storage, but a completely separate command-ID
  * space (0x16-0x18).
  *
- * Explicitly out of scope for this phase (see report): timezone names,
+ * Explicitly out of scope for this phase: timezone names,
  * IANA database, automatic DST, POSIX TZ, NTP port configuration, live
  * resync, decoupling network/NTP startup, timeout changes, runtime
  * status beyond the STATUS field below, multiple drives.
@@ -23,18 +23,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Fase 12A: NTP hostname buffer -- matches PARAM_RTC_NTP_SERVER_HOST's
+// NTP hostname buffer -- matches PARAM_RTC_NTP_SERVER_HOST's
 // existing MAX_STRING_VALUE_LENGTH (64, config.h) exactly, so any value
 // already stored in configData round-trips without truncation.
 #define SIDETNFS_RTC_NTP_SERVER_LEN 64
 
-// Fase 12A: UTC offset text buffer -- whole hours only, range -12..+14
+// UTC offset text buffer -- whole hours only, range -12..+14
 // (see sidetnfs_rtcconfig_validate()), canonical form "0"/"+N"/"-N".
 // 4 bytes is exactly enough for the longest values ("+14"/"-12", 3 chars)
 // plus a NUL terminator -- no slack for anything longer.
 #define SIDETNFS_RTC_UTC_OFFSET_LEN 4
 
-// Fase 12A: one fixed wire record, every field either uint16_t or a
+// One fixed wire record, every field either uint16_t or a
 // char[] of even length -- no field ever needs compiler-inserted
 // padding, and this struct is never memcpy'd as a whole onto the ROM3
 // shared-memory window (see GEMDRVEMUL_SIDETNFS_RTC_* explicit offsets
@@ -48,7 +48,7 @@ typedef struct
     char utc_offset[SIDETNFS_RTC_UTC_OFFSET_LEN];   // 4, whole hours, "-12".."+14"
 } sidetnfs_rtc_config_t;
 
-// Fase 12A: exact size guarded at compile time -- 2+64+4 = 70. If this
+// Exact size guarded at compile time -- 2+64+4 = 70. If this
 // ever fails, GEMDRVEMUL_SIDETNFS_RTC_* offsets in gemdrvemul.h (which
 // are computed independently, field-length-by-field-length, not from
 // sizeof()) and this struct have silently drifted apart.
@@ -100,7 +100,7 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_stage(const sidetnfs_rtc_config_t
 // RTC_NTP_SERVER_HOST/RTC_UTC_OFFSET configData entries via put_bool()/
 // put_string() (same as sidetnfs_netconfig_save() -- note these mutate
 // the live in-RAM configData immediately, before write_all_entries() is
-// even attempted; see report for the known implication if the
+// even attempted;
 // subsequent flash write/readback then fails), calls write_all_entries()
 // (romemul/config.c), reads the same three entries back via a fresh XIP
 // re-read, and only reports SIDETNFS_RTCCONFIG_STATUS_OK if all three

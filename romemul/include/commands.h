@@ -80,18 +80,18 @@
 #define GEMDRVEMUL_REENTRY_XBIOS_LOCK  (APP_GEMDRVEMUL << 8 | 11)     // Enable reentry XBIOS calls
 #define GEMDRVEMUL_REENTRY_XBIOS_UNLOCK (APP_GEMDRVEMUL << 8 | 12)    // Disable reentry XBIOS calls
 
-// Fase 9B1/9C: SIDETNFS config-protocol probe -- subcommand 0x0D,
+// SIDETNFS config-protocol probe -- subcommand 0x0D,
 // re-verified free in both this file and the Atari-side
 // sidecart-gemdrive-atari/src/gemdrive.s CMD_* table (highest used code
 // there and here is 0x0C/0x8B; 0x0D-0x18 is free on both sides). No request
 // payload, no SD/WiFi/TNFS/flash access, no handle/session changes --
 // returns protocol_version/max_drives/drive_count/config_drive_letter/
-// status (Fase 9C: protocol version bumped to 2, fields renamed from the
-// Fase 9B2 server-list model -- see docs/sidetnfs-config-protocol.md).
+// status (protocol version bumped to 2, fields renamed from the
+// Server-list model -- see docs/sidetnfs-config-protocol.md).
 #define GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x0D) // Get SIDETNFS config-protocol info
 
-// Fase 9C: subcommand 0x0E, same free range as 0x0D above. Replaces the
-// never-committed Fase 9B2 GEMDRVEMUL_SIDETNFS_GET_SERVER (same code
+// Subcommand 0x0E, same free range as 0x0D above. Replaces the
+// never-committed GEMDRVEMUL_SIDETNFS_GET_SERVER (same code
 // point) -- the server-list model is gone, replaced by the drive-list
 // model (romemul/include/sidetnfs_config.h). Request: one uint32_t index
 // (0..SIDETNFS_MAX_DRIVES-1, ordinary drives only -- the config drive has
@@ -100,23 +100,23 @@
 // docs/sidetnfs-config-protocol.md.
 #define GEMDRVEMUL_SIDETNFS_GET_DRIVE (APP_GEMDRVEMUL << 8 | 0x0E) // Get one SIDETNFS drive record
 
-// Fase 9C: sets/replaces one ordinary drive record in the RAM copy only --
+// Sets/replaces one ordinary drive record in the RAM copy only --
 // no flash write. Request: uint32_t index followed by the same field
 // layout as GET_DRIVE's response (minus status). Response: status only
 // (GEMDRVEMUL_SIDETNFS_DRIVE_STATUS). See docs/sidetnfs-config-protocol.md.
 #define GEMDRVEMUL_SIDETNFS_SET_DRIVE (APP_GEMDRVEMUL << 8 | 0x0F) // Set one SIDETNFS drive record (RAM only)
 
-// Fase 9C: clears one ordinary drive record in the RAM copy only -- no
+// Clears one ordinary drive record in the RAM copy only -- no
 // flash write, and can never touch the config drive (it has no index in
 // this array). Request: uint32_t index. Response: status only.
 #define GEMDRVEMUL_SIDETNFS_DELETE_DRIVE (APP_GEMDRVEMUL << 8 | 0x10) // Delete one SIDETNFS drive record (RAM only)
 
-// Fase 9C: changes the config drive letter in the RAM copy only -- no
+// Changes the config drive letter in the RAM copy only -- no
 // flash write. Request: uint32_t new_config_drive_letter (ASCII code).
 // Response: status only.
 #define GEMDRVEMUL_SIDETNFS_SET_CONFIG_DRIVE (APP_GEMDRVEMUL << 8 | 0x11) // Set the config drive letter (RAM only)
 
-// Fase 9C: validates the full RAM drive list and, only if valid, erases +
+// Validates the full RAM drive list and, only if valid, erases +
 // programs the standalone SIDETNFS_CONFIG_FLASH_OFFSET sector, reads it
 // back via XIP, and verifies magic/version/CRC before reporting success.
 // The only command in this protocol that ever touches flash. Does not
@@ -125,7 +125,7 @@
 // status only.
 #define GEMDRVEMUL_SIDETNFS_SAVE_CONFIG (APP_GEMDRVEMUL << 8 | 0x12) // Persist the RAM drive list to flash
 
-// Fase 11A: WiFi/network configuration accessible while GEMDRIVE runs.
+// WiFi/network configuration accessible while GEMDRIVE runs.
 // Subcommands 0x13-0x15, re-verified free in both this file (highest used
 // low code before this addition was 0x12/SAVE_CONFIG, next used is
 // 0x19/DGETDRV_CALL -- 0x13-0x18 free) and the reference Atari driver
@@ -141,7 +141,7 @@
 #define GEMDRVEMUL_SIDETNFS_SET_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x14)  // Validate + stage a new WiFi/network config (RAM only)
 #define GEMDRVEMUL_SIDETNFS_SAVE_NETWORK_CONFIG (APP_GEMDRVEMUL << 8 | 0x15) // Persist the staged WiFi/network config to flash
 
-// Fase 12A: minimal "Set Atari clock using NTP" / NTP server / UTC offset
+// Minimal "Set Atari clock using NTP" / NTP server / UTC offset
 // configuration accessible while GEMDRIVE runs. Subcommands 0x16-0x18,
 // re-verified free (highest used low code before this addition was
 // 0x15/SAVE_NETWORK_CONFIG, next used is 0x19/DGETDRV_CALL -- 0x16-0x18
@@ -186,7 +186,7 @@
 #define GEMDRVEMUL_DTA_EXIST_CALL (APP_GEMDRVEMUL << 8 | 0x8A)   // Check if the DTA exists in the rp2040 memory
 #define GEMDRVEMUL_DTA_RELEASE_CALL (APP_GEMDRVEMUL << 8 | 0x8B) // Release the DTA from the rp2040 memory
 
-// Fase 9A: controlled Pico reboot. Subcommand 0x1B, re-verified free in
+// Controlled Pico reboot. Subcommand 0x1B, re-verified free in
 // both this file (highest used low code before this addition was
 // 0x1A/FSETDTA_CALL, next used is 0x36/DFREE_CALL -- 0x1B-0x35 free) and
 // the reference Atari driver (sidecart-gemdrive-atari/src/gemdrive.s

@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_rtcconfig.c
- * Description: Fase 12A -- see sidetnfs_rtcconfig.h. Fase 2: storage
+ * Description: -- see sidetnfs_rtcconfig.h. storage
  * backend switched from the old ConfigEntry store (romemul/config.c) to
  * the independent sidetnfs_system_config module -- this file no longer
  * includes config.h or calls find_entry()/put_bool()/put_string()/
@@ -167,7 +167,7 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_stage(const sidetnfs_rtc_config_t
     sidetnfs_rtcconfig_status_t result = sidetnfs_rtcconfig_validate(cfg);
     if (result != SIDETNFS_RTCCONFIG_STATUS_OK)
     {
-        // Fase 12A: g_staging/g_staged are untouched on any failure --
+        // G_staging/g_staged are untouched on any failure --
         // the previous staging copy (if any) survives exactly as it was.
         return result;
     }
@@ -189,7 +189,7 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
         return SIDETNFS_RTCCONFIG_STATUS_NOT_STAGED;
     }
 
-    // Fase 12A: re-validate the staged copy in full before touching
+    // Re-validate the staged copy in full before touching
     // sidetnfs_system_config at all -- defense in depth, since stage()
     // already validated it once, but nothing else in this module can
     // have mutated g_staging in between.
@@ -207,7 +207,7 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
     clean.utc_offset[sizeof(clean.utc_offset) - 1] = '\0';
     normalize_utc_offset(clean.utc_offset, sizeof(clean.utc_offset));
 
-    // Fase 2: read the current full system settings first, so the
+    // Read the current full system settings first, so the
     // WiFi/Network fields (owned by sidetnfs_netconfig.c, sharing the
     // same underlying sidetnfs_system_flash_t) are preserved exactly as
     // they were -- this SAVE only ever touches the RTC fields.
@@ -238,7 +238,7 @@ sidetnfs_rtcconfig_status_t sidetnfs_rtcconfig_save(void)
         return SIDETNFS_RTCCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
-    // Fase 12A: deliberately does NOT touch WiFi/NTP or reboot -- the new
+    // Deliberately does NOT touch WiFi/NTP or reboot -- the new
     // configuration only takes effect on the next normal Pico boot.
     return SIDETNFS_RTCCONFIG_STATUS_OK;
 }

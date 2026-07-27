@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_system_config.h
- * Description: Fase 2 -- independent, persistent SideTNFS system
+ * Description: -- independent, persistent SideTNFS system
  * configuration (WiFi + Network + RTC/NTP + reserved general settings),
  * in its own flash sector (SIDETNFS_SYSTEM_CONFIG_FLASH_OFFSET), with its
  * own magic/format-version/CRC32/structure validation -- same design
@@ -21,7 +21,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Fase 2: placed in the next free 4KB-aligned sector right after the
+// Placed in the next free 4KB-aligned sector right after the
 // existing SIDETNFS drive-config sector (SIDETNFS_CONFIG_FLASH_OFFSET =
 // 0x100000, size 4096, see sidetnfs_config.h) -- confirmed free against
 // the linker script (romemul/memmap_romemul.ld): FLASH spans
@@ -47,7 +47,7 @@
 #define SIDETNFS_SYS_UTC_OFFSET_LEN  4
 
 // One persistent record for everything sidetnfs_netconfig.c and
-// sidetnfs_rtcconfig.c together used to keep in ConfigEntry. Fase 2
+// sidetnfs_rtcconfig.c together used to keep in ConfigEntry.
 // deliberately does NOT split this into three separate flash sectors --
 // one sector, one magic/version/CRC, matching "eventuele toekomstige
 // algemene instellingen" (the trailing reserved bytes) living alongside
@@ -97,7 +97,7 @@ typedef enum
     SIDETNFS_SYSCONFIG_STATUS_UNSUPPORTED_VERSION = 4
 } sidetnfs_system_config_status_t;
 
-// Fase 2: same fallback design as sidetnfs_config_init() -- checks magic,
+// Same fallback design as sidetnfs_config_init -- checks magic,
 // then format version, then CRC32, then structure (NUL-termination/basic
 // range sanity only; semantic validation, e.g. country-code allow-lists
 // or IPv4 parsing, stays the responsibility of sidetnfs_netconfig.c/
@@ -119,7 +119,7 @@ void sidetnfs_system_config_init(void);
 // to tell those two apart).
 bool sidetnfs_system_config_loaded_from_flash(void);
 
-// Fase 2B: true iff this boot's active settings were migrated (RAM only)
+// True iff this boot's active settings were migrated (RAM only)
 // from GENUINE, real legacy ConfigEntry flash data (config.c's own
 // config_loaded_from_real_flash() must also be true) because no valid
 // sidetnfs_system_config flash block existed yet. False in every other

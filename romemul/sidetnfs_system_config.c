@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_system_config.c
- * Description: Fase 2 -- see sidetnfs_system_config.h. Only
+ * Description: -- see sidetnfs_system_config.h. Only
  * sidetnfs_system_config_save() ever touches flash (erase+program);
  * every other function here only ever mutates the RAM copy. The only
  * dependency on the old ConfigEntry store (romemul/config.c) is the
@@ -17,7 +17,7 @@
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 
-// Fase 2: read-only legacy bridge, used exactly once per boot (inside
+// Read-only legacy bridge, used exactly once per boot (inside
 // sidetnfs_system_config_init(), only when no valid flash block exists
 // yet) to migrate PARAM_WIFI_*/PARAM_GEMDRIVE_RTC/PARAM_RTC_* out of the
 // old ConfigEntry store. This is the ONLY file in the sidetnfs_system_config/
@@ -25,7 +25,7 @@
 // config.h, and it never writes through it.
 #include "include/config.h"
 
-// Fase 2: same built-in defaults romemul/config.c's own defaultEntries[]
+// Same built-in defaults romemul/config.c's own defaultEntries[]
 // table ships (PARAM_WIFI_DHCP=true, PARAM_WIFI_DNS=8.8.8.8,
 // PARAM_GEMDRIVE_RTC=true, PARAM_RTC_NTP_SERVER_HOST=pool.ntp.org,
 // PARAM_RTC_UTC_OFFSET=+1, everything else empty) -- used only when
@@ -80,7 +80,7 @@ static void sidetnfs_system_config_force_nul_termination(sidetnfs_system_setting
     s->utc_offset[sizeof(s->utc_offset) - 1] = '\0';
 }
 
-// Fase 2: deliberately light -- NUL-termination and basic range sanity
+// Deliberately light -- NUL-termination and basic range sanity
 // only. Semantic validation (country allow-list, IPv4 parsing, ntp_server
 // character rules, utc_offset numeric range) is sidetnfs_netconfig.c's/
 // sidetnfs_rtcconfig.c's own existing job, run on their own wire structs
@@ -106,15 +106,15 @@ static bool sidetnfs_system_config_validate_structure(const sidetnfs_system_sett
     return true;
 }
 
-// Fase 2: one-time, read-only migration from the old ConfigEntry store
+// One-time, read-only migration from the old ConfigEntry store
 // (romemul/config.c) -- mirrors sidetnfs_netconfig_get()'s/
 // sidetnfs_rtcconfig_get()'s own existing field-by-field reads exactly
 // (including their same fallback values), so a board upgrading from a
-// pre-Fase-2 build sees byte-for-byte the same effective settings it had
+// Pre-build sees byte-for-byte the same effective settings it had
 // before, just now sourced from configData instead of a valid
 // sidetnfs_system_flash_t. Returns false (out untouched) if the legacy
 // store was never actually configured -- see main.c's load_all_entries()
-// call, which must run before this. Fase 2B: uses
+// call, which must run before this. uses
 // config_loaded_from_real_flash() (config.c), NOT configData.count -- the
 // latter is always nonzero regardless (load_all_entries() unconditionally
 // seeds every PARAM_* key with its own default before ever attempting to
@@ -216,7 +216,7 @@ void sidetnfs_system_config_init(void)
         return;
     }
 
-    // Fase 2: never a partial recovery -- either a full legacy migration
+    // Never a partial recovery -- either a full legacy migration
     // (RAM only) or full factory defaults, never a mix.
     if (sidetnfs_system_config_migrate_from_legacy(&g_settings))
     {

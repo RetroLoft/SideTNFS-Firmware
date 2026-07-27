@@ -1,7 +1,7 @@
 /**
  * File: sidetnfs_config.h
- * Description: Fase 9C -- persistent SideTNFS drive-list flash config.
- * Replaces the Fase 9B2 max-8-servers model (never committed) with one
+ * Description: -- persistent SideTNFS drive-list flash config.
+ * Replaces the max-8-servers model (never committed) with one
  * mandatory config drive (letter only, kept outside this array) plus up to
  * SIDETNFS_MAX_DRIVES ordinary SD/TNFS drives. Read/write from the Atari
  * side via GET_CONFIG_INFO/GET_DRIVE/SET_DRIVE/DELETE_DRIVE/
@@ -18,12 +18,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Fase 9B2/9C: dedicated 4KB flash sector for the SideTNFS config, re-proven
+// Dedicated 4KB flash sector for the SideTNFS config, re-proven
 // free against the current linker script (romemul/memmap_romemul.ld) --
 // ROM_FLASH ends at exactly XIP_BASE + 0x100000 (0x100E0000, length 128k),
 // and CONFIG_FLASH/ROM_FLASH are the only other reserved flash regions,
 // both < 0x100000. See docs/sidetnfs-config-protocol.md for the full
-// evidence trail (unchanged since Fase 9B2).
+// evidence trail (unchanged.
 #define SIDETNFS_CONFIG_FLASH_OFFSET 0x100000u
 #define SIDETNFS_CONFIG_FLASH_SIZE 4096u
 
@@ -42,8 +42,8 @@ typedef enum
     SIDETNFS_DRIVE_TNFS = 2
 } sidetnfs_drive_type_t;
 
-// Fase 12B: the three-state model for each of the SIDETNFS_MAX_DRIVES
-// ordinary slots -- replaces the Fase 9C..12A binary `used` flag. EMPTY
+// The three-state model for each of the SIDETNFS_MAX_DRIVES
+// ordinary slots -- replaces the ..12A binary `used` flag. EMPTY
 // means the slot holds no stored configuration at all (all other fields
 // are meaningless/zeroed); DISABLED means a fully valid, stored
 // configuration that is deliberately not published as a GEMDOS drive;
@@ -74,7 +74,7 @@ typedef enum
 #define SIDETNFS_CONFIG_MAGIC 0x53544446u // "STDF"
 #define SIDETNFS_CONFIG_FLASH_VERSION 3u
 
-// Fase 12B: the record layout itself did NOT change size or field offsets
+// The record layout itself did NOT change size or field offsets
 // from flash format version 2 -- only the first field's name and value
 // range changed (used: uint8_t, 0/1 -> state: uint8_t, 0/1/2, see
 // sidetnfs_drive_slot_state_t above). sidetnfs_config.c's migration path
@@ -103,7 +103,7 @@ typedef struct
     char sd_path[SIDETNFS_SDPATH_LEN];        // SD only
 } sidetnfs_drive_config_t;
 
-// Fase 12B: single source of truth for "does this slot hold a stored
+// Single source of truth for "does this slot hold a stored
 // configuration" / "will this slot be published as a GEMDOS drive" --
 // never check `state != SIDETNFS_DRIVE_SLOT_EMPTY` or similar ad hoc
 // comparisons elsewhere; use these so the three-state semantics stay
@@ -128,7 +128,7 @@ typedef struct
     uint32_t magic;
     uint32_t version;
     uint8_t config_drive_letter; // e.g. 'S'; never A/B, never equal to any DISABLED/ENABLED drives[] letter
-    uint8_t drive_count;         // Fase 12B: number of CONFIGURED records in drives[] -- DISABLED + ENABLED, excludes EMPTY and excludes the config drive. See sidetnfs_config_get_enabled_drive_count() for ENABLED-only.
+    uint8_t drive_count;         // number of CONFIGURED records in drives[] -- DISABLED + ENABLED, excludes EMPTY and excludes the config drive. See sidetnfs_config_get_enabled_drive_count() for ENABLED-only.
     uint8_t reserved[2];
     sidetnfs_drive_config_t drives[SIDETNFS_MAX_DRIVES];
     uint32_t crc32;
@@ -157,14 +157,14 @@ typedef enum
     SIDETNFS_CONFIG_STATUS_FLASH_WRITE_FAILED = 12,
     SIDETNFS_CONFIG_STATUS_CRC_MISMATCH = 13,
     SIDETNFS_CONFIG_STATUS_UNSUPPORTED_VERSION = 14,
-    // Fase 12B: appended (never renumbered an existing value -- the
+    // Appended (never renumbered an existing value -- the
     // protocol layer mirrors these numerically on the Atari side too).
     // A drives[] record's `state` byte was outside
     // sidetnfs_drive_slot_state_t's 0/1/2 range.
     SIDETNFS_CONFIG_STATUS_INVALID_DRIVE_STATE = 15
 } sidetnfs_config_status_t;
 
-// Fase 12A: which check (if any) made sidetnfs_config_init() fall back to
+// Which check (if any) made sidetnfs_config_init fall back to
 // the built-in factory default instead of trusting the flash block.
 // Deliberately coarse-grained at the top level (magic/version/CRC/
 // structure) -- when the reason is STRUCTURE_INVALID, the specific
@@ -175,7 +175,7 @@ typedef enum
 // checked here or anywhere else in this module -- see report ("why no
 // firmware hash").
 //
-// Fase 12B: UNSUPPORTED_VERSION is now only reached for a version this
+// UNSUPPORTED_VERSION is now only reached for a version this
 // firmware cannot even migrate (i.e. neither the current
 // SIDETNFS_CONFIG_FLASH_VERSION nor the one older version this firmware
 // knows how to migrate from -- see sidetnfs_config_migrated_from_version()
@@ -184,13 +184,13 @@ typedef enum
 typedef enum
 {
     SIDETNFS_CONFIG_FALLBACK_NONE = 0,       // flash config loaded and trusted -- no fallback happened
-    SIDETNFS_CONFIG_FALLBACK_BAD_MAGIC = 1,  // blank/erased flash, or a foreign/pre-Fase-9C block
+    SIDETNFS_CONFIG_FALLBACK_BAD_MAGIC = 1,  // blank/erased flash, or a foreign or legacy block
     SIDETNFS_CONFIG_FALLBACK_UNSUPPORTED_VERSION = 2,
     SIDETNFS_CONFIG_FALLBACK_CRC_MISMATCH = 3,
     SIDETNFS_CONFIG_FALLBACK_STRUCTURE_INVALID = 4
 } sidetnfs_config_fallback_reason_t;
 
-// Fase 9C: load and validate the flash config block exactly once at boot
+// Load and validate the flash config block exactly once at boot
 // (magic, flash-format version, CRC32 over the whole block, then
 // config_drive_letter/drive_count range checks, then every configured
 // record's own fields and letter-uniqueness against every other
@@ -202,7 +202,7 @@ typedef enum
 // any check. Never writes to flash. Must be called before GEMDRVEMUL can
 // process any of the SIDETNFS config commands (see main.c).
 //
-// Fase 12B: a flash block whose version is the previous flash format
+// A flash block whose version is the previous flash format
 // (see sidetnfs_config_migrated_from_version() below) is migrated to the
 // current layout in RAM first (used=0/1 -> state EMPTY/ENABLED), then
 // validated exactly like a current-version block -- a migrated block that
@@ -211,14 +211,14 @@ typedef enum
 // this function; only an explicit SAVE_CONFIG persists it.
 void sidetnfs_config_init(void);
 
-// Fase 12B: the flash format version sidetnfs_config_init() actually
+// The flash format version sidetnfs_config_init actually
 // migrated FROM this boot, or 0 if the active config either came straight
 // from a current-version flash block or is the built-in factory default
 // (no migration happened either way). Only meaningful together with
 // sidetnfs_config_loaded_from_flash() == true.
 uint32_t sidetnfs_config_migrated_from_version(void);
 
-// Fase 12A: true iff the currently-active config (see the getters above)
+// True iff the currently-active config (see the getters above)
 // came from a validated flash block -- false means sidetnfs_config_init()
 // fell back to the built-in factory default (see
 // sidetnfs_config_get_fallback_reason() for why). Always call this (or
@@ -228,13 +228,13 @@ uint32_t sidetnfs_config_migrated_from_version(void);
 // user's first real configuration, not an overwrite.
 bool sidetnfs_config_loaded_from_flash(void);
 
-// Fase 12A: see sidetnfs_config_fallback_reason_t above. Always
+// See sidetnfs_config_fallback_reason_t above. Always
 // SIDETNFS_CONFIG_FALLBACK_NONE when sidetnfs_config_loaded_from_flash()
 // is true. Persists only for this boot -- sidetnfs_config_init() is the
 // only writer, and it runs exactly once (see its own doc comment).
 sidetnfs_config_fallback_reason_t sidetnfs_config_get_fallback_reason(void);
 
-// Fase 12A: meaningful only when sidetnfs_config_get_fallback_reason() ==
+// Meaningful only when sidetnfs_config_get_fallback_reason ==
 // SIDETNFS_CONFIG_FALLBACK_STRUCTURE_INVALID -- the exact
 // sidetnfs_config_validate_structure() failure code (e.g.
 // SIDETNFS_CONFIG_STATUS_INVALID_DRIVE_LETTER,
@@ -245,14 +245,14 @@ sidetnfs_config_status_t sidetnfs_config_get_fallback_structure_status(void);
 
 uint32_t sidetnfs_config_get_max_drives(void);
 
-// Fase 12B: number of CONFIGURED ordinary slots -- DISABLED + ENABLED,
+// Number of CONFIGURED ordinary slots -- DISABLED + ENABLED,
 // excludes EMPTY. This is the same value persisted as
 // sidetnfs_drive_flash_t.drive_count and transported as
 // GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT. For ENABLED-only, see
 // sidetnfs_config_get_enabled_drive_count() below.
 uint8_t sidetnfs_config_get_drive_count(void);
 
-// Fase 12B: number of ENABLED ordinary slots only (a subset of
+// Number of ENABLED ordinary slots only (a subset of
 // sidetnfs_config_get_drive_count() above). Not persisted -- always
 // recomputed from the live drives[] array; add a stored field only if a
 // future caller needs this without an O(SIDETNFS_MAX_DRIVES) scan.
@@ -263,13 +263,13 @@ uint8_t sidetnfs_config_get_config_drive_letter(void);
 // GET_DRIVE: fills *out with drives[index] (zeroed first, so a non-OK
 // result always leaves *out fully zeroed). INVALID_INDEX if index >=
 // SIDETNFS_MAX_DRIVES; otherwise always OK, for EMPTY as much as for
-// DISABLED/ENABLED (Fase 12B: EMPTY is a normal, valid record state, not
+// DISABLED/ENABLED (EMPTY is a normal, valid record state, not
 // an error -- *out->state tells the caller which of the three it is).
 // All strings are guaranteed NUL-terminated.
 sidetnfs_config_status_t sidetnfs_config_get_drive(uint8_t index, sidetnfs_drive_config_t *out);
 
 // SET_DRIVE: RAM only, no flash write. INVALID_INDEX if index >=
-// SIDETNFS_MAX_DRIVES. Fase 12B, dispatches on in->state:
+// SIDETNFS_MAX_DRIVES. , dispatches on in->state:
 //   EMPTY:              the slot is fully cleared (equivalent to
 //                        sidetnfs_config_delete_drive()) -- no
 //                        type-specific field validation applies.
@@ -287,7 +287,7 @@ sidetnfs_config_status_t sidetnfs_config_get_drive(uint8_t index, sidetnfs_drive
 // drive_count (DISABLED + ENABLED) is recomputed after every call.
 sidetnfs_config_status_t sidetnfs_config_set_drive(uint8_t index, const sidetnfs_drive_config_t *in);
 
-// Fase 12B: change only a slot's state, preserving every other stored
+// Change only a slot's state, preserving every other stored
 // field for a DISABLED<->ENABLED transition. Internally delegates to
 // sidetnfs_config_set_drive() -- never duplicates its validation.
 //   -> EMPTY:              clears the slot completely (same as SET_DRIVE
@@ -308,8 +308,8 @@ sidetnfs_config_status_t sidetnfs_config_set_drive_state(uint8_t index, sidetnfs
 sidetnfs_config_status_t sidetnfs_config_delete_drive(uint8_t index);
 
 // SET_CONFIG_DRIVE: RAM only, no flash write. Rejects A/B and any letter
-// already used by a DISABLED or ENABLED ordinary drive (Fase 12B: a
-// disabled drive still reserves its letter -- see report).
+// already used by a DISABLED or ENABLED ordinary drive (a
+// disabled drive still reserves its letter.
 sidetnfs_config_status_t sidetnfs_config_set_config_drive_letter(uint8_t new_letter);
 
 // SAVE_CONFIG: validates the full RAM config (config drive letter, every
@@ -328,10 +328,10 @@ sidetnfs_config_status_t sidetnfs_config_set_config_drive_letter(uint8_t new_let
 // config "pending" (see sidetnfs_config_is_pending() below) -- writing
 // flash alone never changes the currently active TNFS session/drive
 // letter/open handles/DTAs; a reboot is required for that, and an Atari
-// RESET does not reboot the Pico (see report, Fase 9E).
+// RESET does not reboot the Pico.
 sidetnfs_config_status_t sidetnfs_config_save(void);
 
-// Fase 9E: true from the moment a SAVE_CONFIG succeeds until the newly
+// True from the moment a SAVE_CONFIG succeeds until the newly
 // saved configuration has actually been adopted by the running GEMDRIVE
 // session (see sidetnfs_probe_reinit_active_server() in sidetnfs_probe.c,
 // invoked from the proven Atari-reset boundary in gemdrvemul.c --
@@ -339,13 +339,13 @@ sidetnfs_config_status_t sidetnfs_config_save(void);
 // Pico boot). Always false before the first SAVE_CONFIG this boot.
 bool sidetnfs_config_is_pending(void);
 
-// Fase 9E: clear the pending flag. Must only be called once the new
+// Clear the pending flag. Must only be called once the new
 // configuration has been safely read back into the active server/drive
 // state -- never on a failed or skipped reinit attempt, so a later Atari
 // reset still retries.
 void sidetnfs_config_clear_pending(void);
 
-// Fase 12B2 (SELECT 10s factory reset / noodherstel): loads the built-in
+// Loads the built-in
 // factory defaults (same content sidetnfs_config_init() falls back to on
 // a bad/corrupt flash block -- config drive 'S', one TNFS drive
 // 'N'/RetroLoft/.../ENABLED, all other ordinary slots EMPTY) into the RAM
@@ -361,7 +361,7 @@ void sidetnfs_config_clear_pending(void);
 // does not depend on WiFi/TNFS/GEMDOS in any way.
 sidetnfs_config_status_t sidetnfs_config_factory_reset(void);
 
-// Fase 12B2 (SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM diagnostic build only):
+//
 // overwrites the RAM config with the built-in factory defaults, exactly
 // like sidetnfs_config_factory_reset() above, but NEVER touches flash --
 // whatever is actually stored on flash is left completely untouched, so
@@ -371,7 +371,7 @@ sidetnfs_config_status_t sidetnfs_config_factory_reset(void);
 // real flash content) and before sidetnfs_probe_load_active_server().
 void sidetnfs_config_force_factory_ram(void);
 
-// Fase 12B5 (SIDETNFS_FORCE_CONFIG_RECOVERY): true iff the raw flash
+// True iff the raw flash
 // block, read directly via XIP (never via sidetnfs_config_init()'s
 // migration/fallback path -- this check never invokes migration at
 // all), is magic/version/CRC-valid AND byte-for-byte matches exactly
@@ -385,7 +385,7 @@ void sidetnfs_config_force_factory_ram(void);
 bool sidetnfs_config_flash_matches_factory_defaults(void);
 
 #if SIDETNFS_ENABLE_DIAG_UART
-// Fase 12B2: read-only boot-time diagnostic dump over UART (printf) of
+// Read-only boot-time diagnostic dump over UART (printf) of
 // the raw flash header (magic/version/stored+recomputed CRC/drive_count/
 // settings letter), the load result (native v3 / migrated from v2 /
 // factory fallback + reason), and all eight raw + interpreted drive

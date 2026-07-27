@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_config.c
- * Description: Fase 9C -- load/validate/mutate/persist the SideTNFS
+ * Description: -- load/validate/mutate/persist the SideTNFS
  * drive-list flash sector (SIDETNFS_CONFIG_FLASH_OFFSET, see
  * sidetnfs_config.h). Only sidetnfs_config_save() ever touches flash
  * (erase+program); every other function here only ever mutates the RAM
@@ -15,7 +15,7 @@
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 
-// Fase 9C: built-in default whenever flash is blank/corrupt/unknown-version.
+// Built-in default whenever flash is blank/corrupt/unknown-version.
 // Mirrors the hardcoded TNFS server sidetnfs_probe.c still uses to actually
 // connect this phase (SIDETNFS_SERVER_IP/PORT/MOUNT_NAME there) -- kept in
 // sync by hand for now. This module never changes the active runtime.
@@ -36,21 +36,21 @@ static const sidetnfs_drive_config_t SIDETNFS_DEFAULT_DRIVE = {
 
 static sidetnfs_drive_flash_t g_config;
 static bool g_config_ready = false;
-static bool g_config_pending = false; // Fase 9E: see sidetnfs_config_is_pending()
+static bool g_config_pending = false; // see sidetnfs_config_is_pending()
 
-// Fase 12A: set exactly once, by sidetnfs_config_init(), never touched
+// Set exactly once, by sidetnfs_config_init, never touched
 // anywhere else -- see sidetnfs_config_fallback_reason_t's own doc comment.
 static bool g_config_loaded_from_flash = false;
 static sidetnfs_config_fallback_reason_t g_config_fallback_reason = SIDETNFS_CONFIG_FALLBACK_NONE;
 static sidetnfs_config_status_t g_config_fallback_structure_status = SIDETNFS_CONFIG_STATUS_OK;
 
-// Fase 12B: set exactly once, by sidetnfs_config_init(), never touched
+// Set exactly once, by sidetnfs_config_init, never touched
 // anywhere else -- see sidetnfs_config_migrated_from_version()'s own doc
 // comment. 0 means "no migration happened this boot".
 static uint32_t g_config_migrated_from_version = 0;
 
 // Standard bit-by-bit CRC32 (IEEE 802.3 / zlib polynomial 0xEDB88320, init
-// and final XOR 0xFFFFFFFF). Same method as Fase 9B2 -- no table, this only
+// and final XOR 0xFFFFFFFF). Same method as -- no table, this only
 // ever runs at boot and at SAVE_CONFIG time over a ~1.5KB block.
 static uint32_t sidetnfs_crc32(const uint8_t *data, size_t len)
 {
@@ -137,7 +137,7 @@ static void sidetnfs_config_force_nul_termination(sidetnfs_drive_flash_t *config
     }
 }
 
-// Fase 12B: counts CONFIGURED slots (DISABLED + ENABLED), not just
+// Counts CONFIGURED slots (DISABLED + ENABLED), not just
 // ENABLED ones -- see sidetnfs_drive_flash_t.drive_count's own comment.
 static void sidetnfs_config_recompute_drive_count(void)
 {
@@ -174,7 +174,7 @@ static void sidetnfs_config_load_defaults(void)
 // drive_count range, every slot's own `state` value, every
 // DISABLED/ENABLED record's own fields, and full letter-uniqueness (every
 // DISABLED/ENABLED record against every other DISABLED/ENABLED record and
-// against config_drive_letter). Fase 12B: EMPTY slots are fully skipped --
+// against config_drive_letter). EMPTY slots are fully skipped --
 // they never participate in duplicate-letter checks or drive_count.
 static sidetnfs_config_status_t sidetnfs_config_validate_structure(const sidetnfs_drive_flash_t *config)
 {
@@ -233,7 +233,7 @@ static sidetnfs_config_status_t sidetnfs_config_validate_structure(const sidetnf
     return SIDETNFS_CONFIG_STATUS_OK;
 }
 
-// Fase 12B: byte-for-byte identical to sidetnfs_drive_config_t /
+// Byte-for-byte identical to sidetnfs_drive_config_t /
 // sidetnfs_drive_flash_t -- the record layout never changed size or field
 // offsets between flash format version 2 and 3, only the meaning/range of
 // the first record field (used: 0/1 -> state: 0/1/2). These historical
@@ -276,7 +276,7 @@ _Static_assert(offsetof(sidetnfs_drive_flash_v2_t, crc32) == offsetof(sidetnfs_d
 
 #define SIDETNFS_CONFIG_FLASH_VERSION_V2 2u
 
-// Fase 12B: migrates a magic-checked version-2 block to the current
+// Migrates a magic-checked version-2 block to the current
 // (version 3) layout, entirely in RAM. Returns false (*new_config left
 // untouched) if the v2 block's own CRC -- computed over its own bytes
 // using the v2 layout, which is byte-identical to v3's, so this is
@@ -350,7 +350,7 @@ void sidetnfs_config_init(void)
     static sidetnfs_drive_flash_t candidate;
     memcpy(&candidate, flash_ptr, sizeof(candidate));
 
-    // Fase 12A: each check now records WHICH reason a fallback would be
+    // Each check now records WHICH reason a fallback would be
     // for, before any of them are actually acted on -- see
     // sidetnfs_config_fallback_reason_t's own doc comment. The pass/fail
     // outcome and ordering are unchanged from before this phase; only the
@@ -367,7 +367,7 @@ void sidetnfs_config_init(void)
 
     if (valid && candidate.version == SIDETNFS_CONFIG_FLASH_VERSION_V2)
     {
-        // Fase 12B: migrate in RAM before any further validation --
+        // Migrate in RAM before any further validation --
         // sidetnfs_config_migrate_v2_to_v3() checks the v2 block's own CRC
         // internally and refuses to migrate a corrupt block. The raw
         // flash bytes read into `candidate` above are byte-identical to
@@ -388,10 +388,10 @@ void sidetnfs_config_init(void)
     }
     else if (valid && candidate.version != SIDETNFS_CONFIG_FLASH_VERSION)
     {
-        // Fase 12A/12B: a genuinely unsupported format version -- neither
+        // A genuinely unsupported format version -- neither
         // the current layout nor the one older version this firmware
         // knows how to migrate from. Never a firmware/UF2 build hash
-        // check (see report). A future format revision should extend the
+        // check. A future format revision should extend the
         // migration chain above rather than widen this check.
         valid = false;
         reason = SIDETNFS_CONFIG_FALLBACK_UNSUPPORTED_VERSION;
@@ -399,7 +399,7 @@ void sidetnfs_config_init(void)
 
     if (valid)
     {
-        // Fase 12B: for a migrated block this re-verifies the CRC
+        // For a migrated block this re-verifies the CRC
         // sidetnfs_config_migrate_v2_to_v3() itself just computed over the
         // new (v3) layout -- always true for a correctly implemented
         // migration, kept as the same defensive, uniform check every
@@ -427,7 +427,7 @@ void sidetnfs_config_init(void)
         // Never trust a block that failed any check, even partially --
         // fall back to the full built-in default rather than salvaging
         // individual records out of it. This also transparently covers
-        // pre-Fase-9C flash (old "STNF" magic/version 1): it simply fails
+        // a legacy flash block (old "STNF" magic/version 1): it simply fails
         // the magic check above and falls through to defaults here. A v2
         // block that failed migration (bad CRC) or whose migrated result
         // failed structure validation falls back the exact same way --
@@ -500,7 +500,7 @@ sidetnfs_config_status_t sidetnfs_config_get_drive(uint8_t index, sidetnfs_drive
         return SIDETNFS_CONFIG_STATUS_INVALID_INDEX;
     }
 
-    // Fase 12B: EMPTY is a normal, valid record state, not an error --
+    // EMPTY is a normal, valid record state, not an error --
     // *out is already fully zeroed (state == SIDETNFS_DRIVE_SLOT_EMPTY ==
     // 0) by the memset above, matching an EMPTY slot's actual content
     // exactly, whether or not g_config_ready yet.
@@ -525,7 +525,7 @@ sidetnfs_config_status_t sidetnfs_config_set_drive(uint8_t index, const sidetnfs
         // Clearing via SET_DRIVE(state=EMPTY) is equivalent to
         // DELETE_DRIVE -- no type-specific field validation applies to a
         // slot being emptied, and every other byte is wiped, not just the
-        // state (Fase 12B: a slot going EMPTY must never leave stale
+        // state (a slot going EMPTY must never leave stale
         // nickname/host/mount_path/sd_path behind).
         memset(&g_config.drives[index], 0, sizeof(g_config.drives[index]));
         sidetnfs_config_recompute_drive_count();
@@ -545,8 +545,8 @@ sidetnfs_config_status_t sidetnfs_config_set_drive(uint8_t index, const sidetnfs
     candidate.mount_path[SIDETNFS_MOUNTPATH_LEN - 1] = '\0';
     candidate.sd_path[SIDETNFS_SDPATH_LEN - 1] = '\0';
 
-    // Fase 12B: DISABLED requires exactly the same fully-valid record as
-    // ENABLED (see report, section 8) -- a disabled drive must be able to
+    // DISABLED requires exactly the same fully-valid record as
+    // ENABLED -- a disabled drive must be able to
     // become enabled again later without re-entering any data, and two
     // stored configs sharing a letter are unwanted even if one of them is
     // currently disabled.
@@ -591,7 +591,7 @@ sidetnfs_config_status_t sidetnfs_config_set_drive(uint8_t index, const sidetnfs
     return SIDETNFS_CONFIG_STATUS_OK;
 }
 
-// Fase 12B: state-only mutation, delegating entirely to
+// State-only mutation, delegating entirely to
 // sidetnfs_config_set_drive() above so validation never diverges between
 // the two entry points. See sidetnfs_config.h's own doc comment for the
 // exact per-target-state contract.
@@ -654,7 +654,7 @@ sidetnfs_config_status_t sidetnfs_config_set_config_drive_letter(uint8_t new_let
         return SIDETNFS_CONFIG_STATUS_INVALID_DRIVE_LETTER;
     }
 
-    // Fase 12B: a DISABLED slot still reserves its letter against the
+    // A DISABLED slot still reserves its letter against the
     // settings drive -- see report ("conflict met SETTINGS-driveletter").
     for (uint8_t i = 0; i < SIDETNFS_MAX_DRIVES; i++)
     {
@@ -708,7 +708,7 @@ sidetnfs_config_status_t sidetnfs_config_save(void)
         {
             continue; // already zeroed by the memset above
         }
-        // Fase 12B: preserve whichever of DISABLED/ENABLED the slot
+        // Preserve whichever of DISABLED/ENABLED the slot
         // actually is -- clean.drives[i] = g_config.drives[i] already
         // copied the real .state, never force it to a fixed value.
         clean.drives[i] = g_config.drives[i];
@@ -761,7 +761,7 @@ sidetnfs_config_status_t sidetnfs_config_save(void)
     // Success -- mirror the exact persisted (clean) image in RAM too.
     g_config = clean;
     g_config_ready = true;
-    // Fase 9E: flash now holds the new config, but the active TNFS
+    // Flash now holds the new config, but the active TNFS
     // session/drive letter do not change here -- only the proven
     // Atari-reset boundary (sidetnfs_probe_reinit_active_server(), driven
     // from GEMDRVEMUL_PING in gemdrvemul.c) may clear this flag, once it
@@ -795,7 +795,7 @@ sidetnfs_config_status_t sidetnfs_config_get_fallback_structure_status(void)
     return g_config_fallback_structure_status;
 }
 
-// Fase 12B2: reuses sidetnfs_config_load_defaults() (same factory image
+// Reuses sidetnfs_config_load_defaults (same factory image
 // sidetnfs_config_init() falls back to) and the existing, already-safe
 // sidetnfs_config_save() -- no separate flash erase/program logic here.
 // See sidetnfs_config.h's own doc comment for the full contract.

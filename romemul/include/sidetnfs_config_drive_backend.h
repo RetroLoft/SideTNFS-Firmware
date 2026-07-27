@@ -6,8 +6,8 @@
 
 #include "sidetnfs_probe.h" // SidetnfsAtariDirEntry, SidetnfsDirSearchResult
 
-// Fase 10B: read-only, root-only virtual drive backend serving the two
-// Fase 10A flash-embedded files (SIDETNFS.PRG, README.TXT) directly from
+// Read-only, root-only virtual drive backend serving the two
+// Flash-embedded files (SIDETNFS.PRG, README.TXT) directly from
 // their existing const arrays (romemul/sidetnfs_config_drive.c) -- no RAM
 // copy, no SD/WiFi/TNFS access. Only reachable when SIDETNFS_CONFIG_DRIVE_ONLY
 // (see sidetnfs_probe.h, default 0) selects it as the sole GEMDRIVE backend
@@ -18,8 +18,8 @@
 // Number of fixed files this drive ever serves.
 #define SIDETNFS_CONFIG_DRIVE_FILE_COUNT 2
 
-// Fase 10B: fixed placeholder date/time (2026-07-20 12:00:00, DOS/GEMDOS
-// packed format) for both files -- the Fase 10A generator does not record
+// Fixed placeholder date/time (2026-07-20 12:00:00, DOS/GEMDOS
+// packed format) for both files -- the generator does not record
 // source mtimes, and these are build-time-embedded flash contents with no
 // single meaningful "file time" of their own. A valid, non-zero,
 // non-corrupt fixed value (rather than 0/0, which some GEMDOS software
@@ -50,7 +50,7 @@ bool sidetnfs_config_drive_lookup(const char *name83, const uint8_t **out_data, 
 // entry is considered, including the first; nothing here ever
 // synthesizes or skips a "."/".." entry, since there is no such entry to
 // begin with. Returns SIDETNFS_DIR_SEARCH_FOUND with *out_entry filled
-// in, SIDETNFS_DIR_SEARCH_NOT_FOUND if neither file matches, or (Fase
+// in, SIDETNFS_DIR_SEARCH_NOT_FOUND if neither file matches, or (
 // 10B2) SIDETNFS_DIR_SEARCH_ERROR if every search slot is already active
 // for other ndta's -- never evicts another ndta's in-progress search.
 SidetnfsDirSearchResult sidetnfs_config_drive_search_start(uint32_t ndta, const char *pattern, uint8_t attribs,
@@ -78,7 +78,7 @@ uint32_t sidetnfs_config_drive_search_count_active(void);
 
 // Close every active config-drive search slot, regardless of ndta. Mirrors
 // sidetnfs_tnfs_dta_release_all()/sidetnfs_fake_search_close_all() -- called
-// at every config-drive reset moment (first PING, Fase 9E reinit after a
+// at every config-drive reset moment (first PING, reinit after a
 // saved config change, and any other full DTA/file-handle cleanup) so a
 // search slot from a previous Atari session can never survive into a new
 // one.

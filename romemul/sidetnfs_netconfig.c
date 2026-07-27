@@ -1,6 +1,6 @@
 /**
  * File: sidetnfs_netconfig.c
- * Description: Fase 11A -- see sidetnfs_netconfig.h. Fase 2: storage
+ * Description: -- see sidetnfs_netconfig.h. storage
  * backend switched from the old ConfigEntry store (romemul/config.c) to
  * the independent sidetnfs_system_config module -- this file no longer
  * includes config.h or calls find_entry()/put_string()/put_bool()/
@@ -31,7 +31,7 @@ void sidetnfs_netconfig_get(sidetnfs_network_config_t *out)
     strncpy(out->ssid, sys.ssid, sizeof(out->ssid) - 1);
     strncpy(out->password, sys.password, sizeof(out->password) - 1);
 
-    // Fase 11A: an empty stored country means "never configured" --
+    // An empty stored country means "never configured" --
     // normalized to "XX" for display/editing (sidetnfs_system_config's
     // own factory defaults already store "XX" for this same reason, so
     // this only matters for a legacy-migrated value that happened to be
@@ -108,7 +108,7 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_validate(const sidetnfs_network_c
         return SIDETNFS_NETCONFIG_STATUS_INVALID_DHCP;
     }
 
-    // Fase 11A: with DHCP on, the four static-network fields are simply
+    // With DHCP on, the four static-network fields are simply
     // unused -- never re-validated (may be empty, stale, or anything
     // else). With DHCP off, every one of the four must be a real,
     // NUL-terminated IPv4 dotted-quad (ipaddr_aton(), the same lwIP
@@ -141,7 +141,7 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_stage(const sidetnfs_network_conf
     sidetnfs_netconfig_status_t result = sidetnfs_netconfig_validate(cfg);
     if (result != SIDETNFS_NETCONFIG_STATUS_OK)
     {
-        // Fase 11A: g_staging/g_staged are untouched on any failure -- the
+        // G_staging/g_staged are untouched on any failure -- the
         // previous staging copy (if any) survives exactly as it was.
         return result;
     }
@@ -162,7 +162,7 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
         return SIDETNFS_NETCONFIG_STATUS_NOT_STAGED;
     }
 
-    // Fase 11A: re-validate the staged copy in full before touching
+    // Re-validate the staged copy in full before touching
     // sidetnfs_system_config at all -- defense in depth, since stage()
     // already validated it once, but nothing else in this module can
     // have mutated g_staging in between.
@@ -186,7 +186,7 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
     clean.gateway[sizeof(clean.gateway) - 1] = '\0';
     clean.primary_dns[sizeof(clean.primary_dns) - 1] = '\0';
 
-    // Fase 2: read the current full system settings first, so the RTC
+    // Read the current full system settings first, so the RTC
     // fields (owned by sidetnfs_rtcconfig.c, sharing the same underlying
     // sidetnfs_system_flash_t) are preserved exactly as they were --
     // this SAVE only ever touches the WiFi/Network fields.
@@ -232,9 +232,9 @@ sidetnfs_netconfig_status_t sidetnfs_netconfig_save(void)
         return SIDETNFS_NETCONFIG_STATUS_FLASH_WRITE_FAILED;
     }
 
-    // Fase 11A: deliberately does NOT touch the active WiFi connection --
+    // Deliberately does NOT touch the active WiFi connection --
     // network_terminate()/network_init() are never called here. The new
     // configuration only takes effect on a later, separate apply/reinit
-    // path (not part of this phase). See docs/sidetnfs-config-protocol.md.
+    // path. See docs/sidetnfs-config-protocol.md.
     return SIDETNFS_NETCONFIG_STATUS_OK;
 }

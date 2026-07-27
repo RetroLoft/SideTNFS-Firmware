@@ -1,7 +1,7 @@
 /**
  * File: sidetnfs_config_drive_backend.c
- * Description: Fase 10B -- read-only, root-only virtual drive serving the
- * Fase 10A flash-embedded SIDETNFS.PRG/README.TXT directly from their
+ * Description: -- read-only, root-only virtual drive serving the
+ * Flash-embedded SIDETNFS.PRG/README.TXT directly from their
  * const arrays. No RAM copy of either file, no SD/WiFi/TNFS access, no
  * flash writes anywhere in this file.
  */
@@ -10,12 +10,12 @@
 #include <string.h>
 
 #include "include/filesys.h" // FS_ST_* Atari attribute bits
-#include "include/sidetnfs_config_drive.h" // sidetnfs_config_prg/readme + _length, Fase 10A
+#include "include/sidetnfs_config_drive.h" // sidetnfs_config_prg/readme + _length
 
 // SIDETNFS_CONFIG_DRIVE_DATE/TIME/ATTR are declared in the header (shared
 // with gemdrvemul.c's GEMDRVEMUL_FDATETIME_CALL/FATTRIB_CALL handling).
 
-// Fase 10B: exactly two fixed files, by design (see report) -- looked up
+// Exactly two fixed files, by design -- looked up
 // by index rather than a static table, since the flash arrays' _length
 // symbols are extern const (not compile-time constant expressions, so
 // they cannot populate a static/global initializer in this translation
@@ -103,7 +103,7 @@ static void build_entry(uint8_t index, SidetnfsAtariDirEntry *out)
     out->skipped = false;
 }
 
-// Fase 10B: small fixed-size ndta-keyed search registry, same shape as
+// Small fixed-size ndta-keyed search registry, same shape as
 // sidetnfs_probe.c's fake no-network search table (SIDETNFS_SEARCH_SLOTS)
 // -- only an index (0, 1, or SIDETNFS_CONFIG_DRIVE_FILE_COUNT == done) is
 // tracked per slot, no I/O, nothing that can fail.
@@ -132,7 +132,7 @@ static SidetnfsConfigDriveSearch *find_slot(uint32_t ndta)
     return NULL;
 }
 
-// Fase 10B2: unlike sidetnfs_probe.c's alloc_tnfs_dta_slot() (which evicts
+// Unlike sidetnfs_probe.c's alloc_tnfs_dta_slot (which evicts
 // slot 0 unconditionally when all slots are active), this never sacrifices
 // someone else's live search -- there is no meaningful "expired" state for
 // a config-drive slot (no handle, no timeout, nothing that can go stale on

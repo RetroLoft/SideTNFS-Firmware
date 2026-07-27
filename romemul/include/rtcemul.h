@@ -42,7 +42,7 @@
 #include "network.h"
 #include "filesys.h"
 
-// Fase 12: the RTCEMUL_* shared-memory offsets belonged to the standalone
+// The RTCEMUL_* shared-memory offsets belonged to the standalone
 // RTC emulator's own protocol and are gone with it. GEMDRIVE uses its own
 // GEMDRVEMUL_* layout (see gemdrvemul.h), which is untouched.
 
@@ -58,7 +58,7 @@ typedef struct NTP_TIME_T
     bool ntp_error;
 } NTP_TIME;
 
-// Fase 12: RTC_TYPE, DallasClock, the IRQInterceptionCallback/DMA-channel
+// RTC_TYPE, DallasClock, the IRQInterceptionCallback/DMA-channel
 // plumbing, rtcemul_dma_irq_handler_lookup_callback() and init_rtcemul()
 // are removed with the standalone RTC emulator. What remains is only the
 // NTP / Pico-RTC / Atari-time helper API the GEMDRIVE flow calls.

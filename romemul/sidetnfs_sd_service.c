@@ -1,9 +1,9 @@
 /**
  * File: sidetnfs_sd_service.c
- * Fase 6 (SD-service en SD_ERROR.TXT) -- see sidetnfs_sd_service.h for the
+ * (SD-service en SD_ERROR.TXT) -- see sidetnfs_sd_service.h for the
  * full design comment. Only touches the SD card/FatFS here at boot, at
  * most once (sidetnfs_sd_service_run()'s own guard) -- never a real
- * GEMDOS file/directory backend (Fase 7).
+ * GEMDOS file/directory backend .
  */
 #include "include/sidetnfs_sd_service.h"
 
@@ -51,7 +51,7 @@ void sidetnfs_sd_service_run(void)
     }
     s_service_ran = true;
 
-    // Fase 6 step 1+2: driver init + (best-effort) detection. sd_init_driver()
+    // Step 1+2: driver init + (best-effort) detection. sd_init_driver
     // only ever fails on a genuine driver/hardware-level problem (SPI bus
     // init) -- never "no card" on this board (SIDETNFS_ENABLE_SD_SUPPORT's
     // hw_config.c has use_card_detect=false, so there is no dedicated
@@ -64,7 +64,7 @@ void sidetnfs_sd_service_run(void)
     }
     else
     {
-        // Fase 6 step 3: single, immediate (opt=1) mount attempt -- never
+        // Step 3: single, immediate (opt=1) mount attempt -- never
         // retried. FR_NOT_READY is FatFS's own code for "the physical
         // drive cannot work" (no medium, or the media couldn't be
         // brought up) -- the closest honest, non-invented "no card"
@@ -91,7 +91,7 @@ void sidetnfs_sd_service_run(void)
         }
     }
 
-    // Fase 6 step 4: per-ENABLED-SD-drive directory check -- only reached
+    // Step 4: per-ENABLED-SD-drive directory check -- only reached
     // (and only meaningful) once the shared card/mount is READY; every
     // registered slot otherwise mirrors the same global status (a card
     // problem is never slot-specific -- see the header's own comment).
@@ -249,7 +249,7 @@ size_t sidetnfs_build_sd_error_text(int slot, char driveletter, char *out, size_
     return (size_t)n;
 }
 
-// Fase 6: dedicated, memory-only search-slot table for SD_ERROR.TXT --
+// Dedicated, memory-only search-slot table for SD_ERROR.TXT --
 // entirely separate from sidetnfs_probe.c's own fake/NET_ERR listing
 // tables (see this file's own header comment: "Routeer SD nooit via de
 // TNFS-foutbackend"). Same "4 concurrent searches" sizing rationale as

@@ -4,11 +4,11 @@
  * Date: July 2023
  * Copyright: 2023 - GOODDATA LABS SL
  * Description: C file that launches the SideTNFS/GEMDRIVE emulator.
- * Fase 3 (Boot altijd GEMDRIVE): production always boots straight into
+ * Production always boots straight into
  * GEMDRIVE now, unconditionally -- the old ROM_EMULATOR/FLOPPY_EMULATOR/
  * RTC_EMULATOR/configurator mode selection below main()'s GEMDRIVE block
  * is dead code in production (init_gemdrvemul() never returns), kept
- * compiling/linking only, see this phase's own report.
+ * compiling/linking only.
  */
 
 #include "include/romemul.h"
@@ -20,7 +20,7 @@
 #include "include/sidetnfs_probe.h"
 #include "include/sidetnfs_longpress.h"
 
-// Fase 12B2 (SELECT 10s factory reset / noodherstel): detects SELECT held
+// Detects SELECT held
 // continuously for SIDETNFS_FACTORY_RESET_HOLD_MS (10s) and, if so, wipes
 // the SideTNFS drive-list flash config back to factory defaults and
 // resets. Independent of WiFi/TNFS/GEMDOS/SIDETNFS.PRG and of whatever is
@@ -36,7 +36,7 @@
 // blink_morse()/blink_error() call in this codebase), so it cannot be lit
 // before cyw43 has been initialized -- there is no earlier point at which
 // this feature could give the user any visible feedback at all on this
-// hardware. Fase 4 (CYW43-initialisatie en WiFi-timeouts): load_all_entries()/
+// hardware. (CYW43-initialisatie en WiFi-timeouts): load_all_entries/
 // sidetnfs_system_config_init() now run BEFORE this check (moved up, so the
 // real country code is known before the single CYW43 init) -- this is safe
 // because neither of those two calls ever touches GEMDOS/runtime-drive code
@@ -50,9 +50,9 @@
 // instantaneous gpio_get() and an immediate return, no polling loop
 // entered. Continuous runtime (not just boot-time) SELECT monitoring
 // would require polling from inside the GEMDOS command-dispatch loop in
-// gemdrvemul.c, which is timing-critical cartridge-bus code this phase
+// gemdrvemul.c, which is timing
 // deliberately does not touch -- boot-time-only detection is the safe
-// tradeoff (see report).
+// tradeoff.
 // Number of CONSECUTIVE low samples required before SELECT counts as
 // genuinely released. sidetnfs_longpress_poll_step() documents that it
 // wants a *debounced* reading, but this call site used to hand it the raw
@@ -131,7 +131,7 @@ static void sidetnfs_check_select_factory_reset(void)
         }
     }
 
-    // Fase 12B2: never reset as if it succeeded when it didn't -- the
+    // Never reset as if it succeeded when it didn't -- the
     // existing configuration (whatever it was) was never actually
     // overwritten in this failure branch (sidetnfs_config_save() never
     // partially erases/programs, see its own doc comment), so looping
@@ -149,7 +149,7 @@ static void sidetnfs_check_select_factory_reset(void)
 }
 
 #if SIDETNFS_FORCE_CONFIG_RECOVERY
-// Fase 12B5: one-shot, unconditional recovery build -- forcibly rewrites
+// One-shot, unconditional recovery build -- forcibly rewrites
 // the SideTNFS drive-list flash sector to clean native-v3 factory
 // defaults (S:/N: only) unless it already exactly matches those defaults
 // (see sidetnfs_config_flash_matches_factory_defaults()). No UART: no
@@ -208,7 +208,7 @@ static void sidetnfs_force_config_recovery(void)
 }
 #endif // SIDETNFS_FORCE_CONFIG_RECOVERY
 
-// Fase 10 (Morse-LED en oude productstates verwijderen): the only LED
+// The only LED
 // signal left on the normal boot path. Three short flashes, purely as
 // physical "the Pico came up / restarted" feedback for user and
 // developer -- deliberately NOT a Morse character and NOT a status code:
@@ -219,7 +219,7 @@ static void sidetnfs_force_config_recovery(void)
 // rather than routed through blink_morse() so nothing on the production
 // boot path depends on the Morse alphabet any more; blink_morse()/
 // blink_error() themselves stay compiled for the retained floppy
-// emulation code (see report).
+// emulation code.
 //
 // Requires cyw43 to be initialized already -- the Pico W's onboard LED is
 // wired through the CYW43 chip, so this can only run after
@@ -231,7 +231,7 @@ static void sidetnfs_force_config_recovery(void)
 // Settle time given to CYW43/lwIP after the boot flashes, before the first
 // DNS/NTP and TNFS activity in init_gemdrvemul() below.
 //
-// Not cosmetic: hardware isolation (see report) proved this is required.
+// Not cosmetic: hardware isolation proved this is required.
 // The old blink_morse('H') that used to sit at this point spent ~1200ms
 // here ("H" = four Morse dots); boot_led_flash() spends ~900ms. Removing
 // those ~300ms made the boot-time NTP sync fail with a timeout on every
@@ -281,14 +281,14 @@ int main()
     DPRINTF("Voltage: %s\n", current_voltage);
 #endif
 
-    // Fase 4 (opschonen): force_configurator (SELECT held at boot forcing
-    // the old configurator) is removed -- Fase 3 already made GEMDRIVE the
+    // Force_configurator (SELECT held at boot forcing
+    // the old configurator) is removed
     // sole reachable production path regardless of SELECT/BOOT_FEATURE, so
     // this boot-time GPIO read had no remaining effect on anything
     // reachable. The three legacy (already unreachable) mode blocks below
     // no longer reference it either -- see their own updated conditions.
 
-    // Fase 4 (CYW43-initialisatie en WiFi-timeouts): load_all_entries()/
+    // Load_all_entries/
     // sidetnfs_system_config_init() moved here (from their old position
     // after the factory-reset checks below) so the real WiFi country code
     // is known BEFORE the one, single CYW43 init call -- see that call's
@@ -296,7 +296,7 @@ int main()
     // factory-reset/force-config-recovery safety guarantees.
     load_all_entries();
 
-    // Fase 2: load/validate the independent SideTNFS system config
+    // Load/validate the independent SideTNFS system config
     // (WiFi/Network/RTC) exactly once, before anything (including the
     // CYW43 init right below) needs sys.country/sys.ssid/etc. Never writes
     // to flash itself; only an explicit SAVE from SIDETNFS.PRG persists a
@@ -306,7 +306,7 @@ int main()
     sidetnfs_system_settings_t boot_sys;
     sidetnfs_system_config_get(&boot_sys);
 
-    // Fase 4: the single, sole CYW43 init call for the entire boot --
+    // The single, sole CYW43 init call for the entire boot --
     // resolves country from sys.country and calls
     // cyw43_arch_init_with_country() exactly once (see that function's own
     // comment in network.h/network.c). Replaces the old
@@ -320,20 +320,20 @@ int main()
     }
 
 #if SIDETNFS_FORCE_CONFIG_RECOVERY
-    // Fase 12B5: one-shot, unconditional flash-config recovery -- runs
+    // One-shot, unconditional flash-config recovery -- runs
     // before the SELECT long-press check below (and before everything
     // else), see the function's own doc comment.
     sidetnfs_force_config_recovery();
 #endif
 
-    // Fase 12B2: SELECT held 10s -> factory reset (see the function's own
+    // SELECT held 10s -> factory reset (see the function's own
     // doc comment for exact placement reasoning). Must run before
     // sidetnfs_config_init()/any SideTNFS-drive-list-dependent code below.
     sidetnfs_check_select_factory_reset();
 
-    // Fase 10 (Morse-LED en oude productstates verwijderen): the
+    // The
     // PARAM_BOOT_FEATURE read that used to be here is gone. Boot dispatch
-    // no longer consults it (Fase 3 already made GEMDRIVE the sole
+    // no longer consults it (already made GEMDRIVE the sole
     // reachable production path), so reading it only produced a log line
     // describing a decision nothing acts on. The config entry itself and
     // its flash layout/offsets are deliberately left untouched -- see
@@ -344,9 +344,9 @@ int main()
 
     bool safe_config_reboot = default_config_reboot_mode->value[0] == 't' || default_config_reboot_mode->value[0] == 'T';
 
-    // Fase 3 (Boot altijd GEMDRIVE): production always boots straight into
+    // Production always boots straight into
     // SideTNFS/GEMDRIVE now -- no more BOOT_FEATURE string comparison, no
-    // more SELECT-at-boot override (Fase 4 removed the force_configurator
+    // more SELECT-at-boot override (removed the force_configurator
     // variable entirely -- see this file's own history). This used to be
     // the last of four mutually-exclusive `if (strcmp(...))` blocks below
     // (ROM_EMULATOR/FLOPPY_EMULATOR/RTC_EMULATOR/GEMDRIVE_EMULATOR, in
@@ -382,7 +382,7 @@ int main()
 
     DPRINTF("Ready to accept commands.\n");
 
-    // Fase 10: three short LED flashes -- physical boot/restart feedback
+    // Three short LED flashes -- physical boot/restart feedback
     // only (see boot_led_flash()'s own comment). Replaces the old
     // blink_morse('H') product-mode status code.
     boot_led_flash();
@@ -391,25 +391,25 @@ int main()
     // required and not cosmetic.
     sleep_ms(SIDETNFS_WIFI_SETTLE_DELAY_MS);
 
-    // Fase 9C: load/validate the persistent SideTNFS drive-list flash
+    // Load/validate the persistent SideTNFS drive-list flash
     // config exactly once, before GEMDRIVE can process any of the
     // GEMDRVEMUL_SIDETNFS_* configuration commands. Read-only here --
     // only SAVE_CONFIG (via SIDETNFS.PRG) ever writes to flash.
     sidetnfs_config_init();
 
-    // Fase 4: sidetnfs_system_config_init() moved to run early, before the
+    // Sidetnfs_system_config_init moved to run early, before the
     // single CYW43 init call near the top of main() -- no longer called a
     // second time here (an _init() function should only ever run once per
     // boot; sidetnfs_system_config_get() below and inside init_gemdrvemul()
     // is the cheap, repeatable, read-only way to consult its result).
 
 #if SIDETNFS_ENABLE_DIAG_UART && !SIDETNFS_ENABLE_SLOT_DIAG
-    // Fase 12B2: read-only boot-time config diagnosis -- must run
+    // Read-only boot-time config diagnosis -- must run
     // before sidetnfs_probe_load_active_server()/init_gemdrvemul()
     // (i.e. before any TNFS session or runtime-drive-table code),
     // and before the SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM override
     // below, so it always reports the REAL flash-derived config for
-    // this boot regardless of that override. Fase 12B3: automatically
+    // this boot regardless of that override. automatically
     // suppressed when SIDETNFS_ENABLE_SLOT_DIAG is on, so the two
     // diagnostics never both fire and clutter the boot log -- see
     // this phase's own compact Dump A below instead.
@@ -417,13 +417,13 @@ int main()
 #endif
 
 #if SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
-    // Fase 12B4: explicitly requires SIDETNFS_ENABLE_DIAG_UART too --
+    // Explicitly requires SIDETNFS_ENABLE_DIAG_UART too --
     // SIDETNFS_ENABLE_SLOT_DIAG alone must never pull in any
     // UART/printf code path (see SIDETNFS_ENABLE_SD_SLOT_DUMP for the
     // UART-free, SD-only equivalent).
-    // Fase 12B3, Dump A -- compact, per-slot summary of the loaded
+    // , Dump A -- compact, per-slot summary of the loaded
     // configuration (short strings only: state/letter/type, never
-    // host/mount_path/sd_path). Independent of the larger Fase 12B2
+    // host/mount_path/sd_path). Independent of the larger
     // dump above (see SIDETNFS_ENABLE_SLOT_DIAG's own CMake comment).
     printf("\r\n--- SLOTDIAG A: loaded config slots ---\r\n");
     for (uint8_t _sd_i = 0; _sd_i < SIDETNFS_MAX_DRIVES; _sd_i++)
@@ -446,7 +446,7 @@ int main()
 #endif
 
 #if SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM
-    // Fase 12B2 (safe-factory-in-RAM diagnostic recovery build): the
+    // The
     // real flash config was just read (and, if diag UART is also on,
     // dumped above) -- now discard it for RUNTIME purposes only.
     // Never writes to flash, so whatever is actually stored survives
@@ -455,7 +455,7 @@ int main()
     sidetnfs_config_force_factory_ram();
 #endif
 
-    // Fase 9D: pick the first usable (used, TNFS, UDP) drive from that
+    // Pick the first usable (used, TNFS, UDP) drive from that
     // same config as the active server for the real TNFS connection,
     // replacing the old hardcoded IP/port/mount-name constants in
     // sidetnfs_probe.c. Must run after sidetnfs_config_init() and
@@ -479,11 +479,11 @@ int main()
         tight_loop_contents();
     }
 
-    // Fase 10 (Morse-LED en oude productstates verwijderen): the four
+    // The four
     // legacy mode-selection blocks that used to follow here are gone --
     // ROM_EMULATOR, FLOPPY_EMULATOR, RTC_EMULATOR and the final
     // "fall through to the old configurator" default, each dispatched on
-    // a PARAM_BOOT_FEATURE strcmp(). Fase 3 already made GEMDRIVE the
+    // a PARAM_BOOT_FEATURE strcmp. already made GEMDRIVE the
     // sole reachable production path (init_gemdrvemul() above never
     // returns), so all of it was provably dead boot dispatch, together
     // with the blink_morse() product-mode status codes it carried

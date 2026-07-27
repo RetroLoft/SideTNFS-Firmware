@@ -117,7 +117,7 @@ typedef struct connection_data
     int16_t rssi;                                   // Received Signal Strength Indicator
 } ConnectionData;
 
-// Fase 12: RomInfo/FloppyImageInfo/UrlParts removed -- they described the
+// RomInfo/FloppyImageInfo/UrlParts removed -- they described the
 // ROM catalogue, floppy database and URL parser of the deleted configurator.
 
 extern WifiScanData wifiScanData;
@@ -138,10 +138,10 @@ void network_terminate();
 // ConfigEntry store (romemul/config.c) via a thin adapter, then
 // delegates to network_init_with_settings() below. Used by the old
 // configurator/floppy-emulator/standalone RTC-emulator (romloader.c/
-// floppyemul.c/rtcemul.c) -- never by GEMDRIVE/SideTNFS as of Fase 2B.
+// floppyemul.c/rtcemul.c) -- never by GEMDRIVE/SideTNFS.
 int network_init(bool force, bool async, char **pass);
 
-// Fase 2B: the real implementation -- takes WiFi/network settings
+// The real implementation -- takes WiFi/network settings
 // explicitly instead of reading them from ConfigEntry itself. This is
 // the ONLY entry point GEMDRIVE/SideTNFS boot code (gemdrvemul.c) calls,
 // with *settings from sidetnfs_system_config_get() -- no hidden global
@@ -149,7 +149,7 @@ int network_init(bool force, bool async, char **pass);
 // legacy adapter calling this with settings built from ConfigEntry.
 int network_init_with_settings(bool force, bool async, char **pass, const sidetnfs_system_settings_t *settings);
 
-// Fase 4 (CYW43-initialisatie en WiFi-timeouts): the single, sole CYW43
+// The single, sole CYW43
 // hardware init call for the entire boot -- resolves country from
 // *settings and calls cyw43_arch_init_with_country() exactly once.
 // main() calls this exactly once, early (right after
@@ -166,7 +166,7 @@ int network_wifi_init_for_settings(const sidetnfs_system_settings_t *settings);
 u_int32_t get_ip_address();
 u_int32_t get_netmask();
 u_int32_t get_gateway();
-// Fase 11B: was previously only ever called from within network.c itself
+// Was previously only ever called from within network.c itself
 // (before its own definition needed no prototype) -- now also called from
 // sidetnfs_netconfig.c's country validation, which needs a real
 // declaration here instead of triggering an implicit-declaration warning.
@@ -181,7 +181,7 @@ uint16_t get_wifi_scan_poll_secs();
 uint32_t get_network_status_polling_ms();
 void wait_cyw43_with_polling(uint32_t milliseconds);
 
-// Fase 12: URL/HTTP-download layer removed together with the configurator,
+// URL/HTTP-download layer removed together with the configurator,
 // ROM loader and floppy emulator -- see network.c.
 
 int time_passed(absolute_time_t *t, uint32_t ms);

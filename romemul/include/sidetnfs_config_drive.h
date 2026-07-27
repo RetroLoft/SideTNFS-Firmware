@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-// Fase 10A: byte-exact copies of the SideTNFS configuration drive's
+// Byte-exact copies of the SideTNFS configuration drive's
 // contents (SIDETNFS.PRG and README.TXT), embedded in Pico flash so this
 // drive is always available -- no SD card, no TNFS server needed. Plain
 // const uint8_t arrays: no endian conversion, no word-packing (unlike
@@ -13,7 +13,7 @@
 // sidetnfs_config_drive.c, which -- like firmware.c -- is committed so
 // offline builds stay reproducible; the generator is not run
 // automatically by the build. No GEMDRIVE/configdrive backend reads these
-// yet (Fase 10A only proves the bytes reach flash intact) -- nothing in
+// yet (only proves the bytes reach flash intact) -- nothing in
 // this phase copies these arrays to RAM.
 extern const uint8_t sidetnfs_config_prg[];
 extern const uint32_t sidetnfs_config_prg_length;
