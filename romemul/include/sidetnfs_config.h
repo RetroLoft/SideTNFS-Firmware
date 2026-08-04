@@ -361,16 +361,6 @@ void sidetnfs_config_clear_pending(void);
 // does not depend on WiFi/TNFS/GEMDOS in any way.
 sidetnfs_config_status_t sidetnfs_config_factory_reset(void);
 
-//
-// overwrites the RAM config with the built-in factory defaults, exactly
-// like sidetnfs_config_factory_reset() above, but NEVER touches flash --
-// whatever is actually stored on flash is left completely untouched, so
-// the board can boot safely without destroying evidence needed to
-// diagnose it. Call after sidetnfs_config_init() (and after
-// sidetnfs_config_dump_uart(), if used, so the dump still reflects the
-// real flash content) and before sidetnfs_probe_load_active_server().
-void sidetnfs_config_force_factory_ram(void);
-
 // True iff the raw flash
 // block, read directly via XIP (never via sidetnfs_config_init()'s
 // migration/fallback path -- this check never invokes migration at
@@ -384,7 +374,7 @@ void sidetnfs_config_force_factory_ram(void);
 // to verify it actually took effect.
 bool sidetnfs_config_flash_matches_factory_defaults(void);
 
-#if SIDETNFS_ENABLE_DIAG_UART
+#if SIDETNFS_ENABLE_DIAG
 // Read-only boot-time diagnostic dump over UART (printf) of
 // the raw flash header (magic/version/stored+recomputed CRC/drive_count/
 // settings letter), the load result (native v3 / migrated from v2 /
@@ -392,7 +382,7 @@ bool sidetnfs_config_flash_matches_factory_defaults(void);
 // records. Never mutates g_config or flash. Call once, synchronously,
 // after sidetnfs_config_init() and before any TNFS/runtime-drive code
 // runs (see main.c). Compiled out entirely (zero cost) unless
-// SIDETNFS_ENABLE_DIAG_UART is set -- see CMakeLists.txt.
+// SIDETNFS_ENABLE_DIAG is set -- see CMakeLists.txt.
 void sidetnfs_config_dump_uart(void);
 #endif
 

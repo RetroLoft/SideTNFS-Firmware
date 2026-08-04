@@ -403,56 +403,12 @@ int main()
     // boot; sidetnfs_system_config_get() below and inside init_gemdrvemul()
     // is the cheap, repeatable, read-only way to consult its result).
 
-#if SIDETNFS_ENABLE_DIAG_UART && !SIDETNFS_ENABLE_SLOT_DIAG
-    // Read-only boot-time config diagnosis -- must run
-    // before sidetnfs_probe_load_active_server()/init_gemdrvemul()
-    // (i.e. before any TNFS session or runtime-drive-table code),
-    // and before the SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM override
-    // below, so it always reports the REAL flash-derived config for
-    // this boot regardless of that override. automatically
-    // suppressed when SIDETNFS_ENABLE_SLOT_DIAG is on, so the two
-    // diagnostics never both fire and clutter the boot log -- see
-    // this phase's own compact Dump A below instead.
+#if SIDETNFS_ENABLE_DIAG
+    // Read-only boot-time config diagnosis -- must run before
+    // sidetnfs_probe_load_active_server()/init_gemdrvemul() (i.e. before
+    // any TNFS session or runtime-drive-table code), so it always reports
+    // the REAL flash-derived config for this boot.
     sidetnfs_config_dump_uart();
-#endif
-
-#if SIDETNFS_ENABLE_DIAG_UART && SIDETNFS_ENABLE_SLOT_DIAG
-    // Explicitly requires SIDETNFS_ENABLE_DIAG_UART too --
-    // SIDETNFS_ENABLE_SLOT_DIAG alone must never pull in any
-    // UART/printf code path (see SIDETNFS_ENABLE_SD_SLOT_DUMP for the
-    // UART-free, SD-only equivalent).
-    // , Dump A -- compact, per-slot summary of the loaded
-    // configuration (short strings only: state/letter/type, never
-    // host/mount_path/sd_path). Independent of the larger
-    // dump above (see SIDETNFS_ENABLE_SLOT_DIAG's own CMake comment).
-    printf("\r\n--- SLOTDIAG A: loaded config slots ---\r\n");
-    for (uint8_t _sd_i = 0; _sd_i < SIDETNFS_MAX_DRIVES; _sd_i++)
-    {
-        sidetnfs_drive_config_t _sd_d;
-        sidetnfs_config_get_drive(_sd_i, &_sd_d);
-        if (sidetnfs_drive_slot_is_empty(&_sd_d))
-        {
-            printf("CFG slot=%u state=EMPTY\r\n", (unsigned)_sd_i);
-        }
-        else
-        {
-            printf("CFG slot=%u state=%s letter=%c type=%u\r\n", (unsigned)_sd_i,
-                   sidetnfs_drive_slot_is_enabled(&_sd_d) ? "ENABLED" : "DISABLED",
-                   (char)_sd_d.drive_letter, (unsigned)_sd_d.type);
-        }
-    }
-    printf("SETTINGS letter=%c\r\n", (char)sidetnfs_config_get_config_drive_letter());
-    printf("--- END SLOTDIAG A ---\r\n\r\n");
-#endif
-
-#if SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM
-    // The
-    // real flash config was just read (and, if diag UART is also on,
-    // dumped above) -- now discard it for RUNTIME purposes only.
-    // Never writes to flash, so whatever is actually stored survives
-    // untouched for later diagnosis. Boots with the factory-default
-    // N: + SETTINGS S: only.
-    sidetnfs_config_force_factory_ram();
 #endif
 
     // Pick the first usable (used, TNFS, UDP) drive from that

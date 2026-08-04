@@ -151,8 +151,8 @@ static void test_full_protocol_sequence(void)
     const uint32_t ndta = 0x1000;
 
     /* FSETDTA itself never touches the config-drive registry (see
-     * gemdrvemul.c's GEMDRVEMUL_FSETDTA_CALL under SIDETNFS_CONFIG_DRIVE_ONLY)
-     * -- nothing to call here, but the registry must still be empty. */
+     * gemdrvemul.c's GEMDRVEMUL_FSETDTA_CALL) -- nothing to call here,
+     * but the registry must still be empty. */
     CHECK(!sidetnfs_config_drive_search_is_active(ndta));
 
     SidetnfsAtariDirEntry entry;

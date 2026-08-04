@@ -805,17 +805,6 @@ sidetnfs_config_status_t sidetnfs_config_factory_reset(void)
     return sidetnfs_config_save();
 }
 
-void sidetnfs_config_force_factory_ram(void)
-{
-    sidetnfs_config_load_defaults();
-    g_config_ready = true;
-    // Deliberately NOT touching g_config_loaded_from_flash/
-    // g_config_fallback_reason/g_config_migrated_from_version here --
-    // sidetnfs_config_dump_uart() (called before this, in main.c) already
-    // reported the REAL flash-derived values for this boot; overwriting
-    // them here would erase that diagnostic evidence for no benefit.
-}
-
 bool sidetnfs_config_flash_matches_factory_defaults(void)
 {
     const sidetnfs_drive_flash_t *flash_ptr =
@@ -851,7 +840,7 @@ bool sidetnfs_config_flash_matches_factory_defaults(void)
     return memcmp(&raw, &expected, offsetof(sidetnfs_drive_flash_t, crc32)) == 0;
 }
 
-#if SIDETNFS_ENABLE_DIAG_UART
+#if SIDETNFS_ENABLE_DIAG
 static const char *sidetnfs_diag_state_name(uint8_t state)
 {
     switch (state)
@@ -954,4 +943,4 @@ void sidetnfs_config_dump_uart(void)
     }
     printf("===== END CONFIG DUMP =====\r\n\r\n");
 }
-#endif // SIDETNFS_ENABLE_DIAG_UART
+#endif // SIDETNFS_ENABLE_DIAG

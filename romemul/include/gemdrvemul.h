@@ -407,9 +407,9 @@ typedef enum
     GEMDRIVE_FILE_BACKEND_TNFS,
     // Read-only, root-only virtual drive serving the
     // flash-embedded SIDETNFS.PRG/README.TXT directly from their const
-    // arrays -- see romemul/sidetnfs_config_drive_backend.c. Only reached
-    // when SIDETNFS_CONFIG_DRIVE_ONLY (compile-time, default 0) selects it
-    // as the sole GEMDRIVE backend for a temporary test build.
+    // arrays -- see romemul/sidetnfs_config_drive_backend.c. This is the
+    // always-present SETTINGS disk's backend (sidetnfs_runtime_drives_init()),
+    // never gated by a build-time switch.
     GEMDRIVE_FILE_BACKEND_CONFIG_FLASH,
     // Read-only, root-only virtual
     // file for an ENABLED TNFS drive whose backend isn't ready right now

@@ -377,9 +377,8 @@ TNFS-drive) en wijzigt geen open handles, DTA's, TNFS-sessies of
 `hd_folder` tijdens een lopende sessie — een wijziging via `SIDETNFS.PRG`
 (`SET_DRIVE`/`SAVE_CONFIG`) wordt pas bij de eerstvolgende boot opgepikt,
 omdat `sidetnfs_probe_load_active_server()` alleen bij boot draait.
-`SIDETNFS_ENABLE_SD_SUPPORT` blijft een onafhankelijke compile-time schakelaar
-(SD/FatFS-toegang voor WiFi-wachtwoord/DEBUG.TXT), losstaand van deze
-TNFS-serverkeuze.
+SD/FatFS-toegang (WiFi-wachtwoordbestand, EVENTLOG.TXT/SNAPSHOT.TXT) is altijd
+aanwezig en losstaand van deze TNFS-serverkeuze.
 
 # WiFi/netwerkconfiguratie via GEMDRIVE (Fase 11A)
 

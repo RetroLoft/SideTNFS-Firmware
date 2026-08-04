@@ -109,8 +109,8 @@ static GemdriveFileBackend backend_for_type(uint8_t type)
 }
 
 /* ---- mirror of sidetnfs_runtime_drives_init()'s three-step publication
- * rule, minus shared-memory publish / DPRINTF / SIDETNFS_ENABLE_DIAG_UART
- * logging / SIDETNFS_UART_DIAG_DUMP_ON_SELECT snapshot bookkeeping (none
+ * rule, minus shared-memory publish / DPRINTF / SIDETNFS_ENABLE_DIAG
+ * logging / SIDETNFS_DIAG_DUMP_ON_SELECT snapshot bookkeeping (none
  * of that affects g_runtime_drives[] itself). ---- */
 static void runtime_drives_init_mirror(char active_drive_letter, uint32_t active_drive_number)
 {

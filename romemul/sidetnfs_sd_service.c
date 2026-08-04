@@ -53,10 +53,10 @@ void sidetnfs_sd_service_run(void)
 
     // Step 1+2: driver init + (best-effort) detection. sd_init_driver
     // only ever fails on a genuine driver/hardware-level problem (SPI bus
-    // init) -- never "no card" on this board (SIDETNFS_ENABLE_SD_SUPPORT's
-    // hw_config.c has use_card_detect=false, so there is no dedicated
-    // card-detect GPIO; "no card" can only be observed once f_mount()
-    // actually tries to talk to it, via FR_NOT_READY below).
+    // init) -- never "no card" on this board (hw_config.c has
+    // use_card_detect=false, so there is no dedicated card-detect GPIO;
+    // "no card" can only be observed once f_mount() actually tries to
+    // talk to it, via FR_NOT_READY below).
     if (!sd_init_driver())
     {
         s_global_status = SIDETNFS_SD_STATUS_INIT_FAILED;

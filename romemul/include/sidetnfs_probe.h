@@ -14,6 +14,7 @@
 
 #include "sidetnfs_config.h"
 #include "sidetnfs_resolve.h" // sidetnfs_drive_config_t -- see sidetnfs_slot_tnfs_context_t below
+#include "debug.h" // SIDETNFS_DIAG_MAX_EVENTS/SIDETNFS_DEBUG_FOCUS_*/SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
 
 // Central backend choice for GEMDRIVE directory listing.
 // Replaced the old on/off SIDETNFS_EXPERIMENTAL_FS_LISTING switch (removed
@@ -52,34 +53,15 @@
 // once TNFS listing became the proven, stable default (see
 // SIDETNFS_PHASE5_DIRECTORY_LISTING.md).
 
-// Two central, single-purpose compile-time options for building a
-// strict TNFS-only firmware image with no SD/FatFS touch at all (Falcon
-// diagnostic build). Passed through from build.sh/CMakeLists.txt the same
-// way _DEBUG already is (env var -> add_definitions()) -- see CMakeLists.txt.
-// Deliberately just two macros, each with one clear meaning, instead of
-// scattered booleans (SIDETNFS_ENABLE_SD_SUPPORT covers every SD/FatFS
-// touch anywhere in the GEMDRIVE/TNFS trap-handling path;
-// SIDETNFS_ENABLE_DEBUG covers the DEBUG.TXT/SELECT-button snapshot).
-// Both default to 1 (today's existing behavior, completely unchanged for
-// every normal build) -- only the explicit diagnostic build sets
-// either to 0.
-#ifndef SIDETNFS_ENABLE_SD_SUPPORT
-#define SIDETNFS_ENABLE_SD_SUPPORT 1
-#endif
-
+// The one build-time switch this firmware ships with two variants for:
+// off in Production, on in Debug (see build.sh/CMakeLists.txt, which derive
+// it from the build type so a plain `./build.sh pico_w` vs.
+// `./build.sh pico_w debug` needs no other flag). Gates the SELECT-button
+// EVENTLOG.TXT/SNAPSHOT.TXT dump (see SIDETNFS_ENABLE_DIAG below, which
+// moves in lockstep with this one) and the retired sidetnfs_debug_file_service()
+// no-op below.
 #ifndef SIDETNFS_ENABLE_DEBUG
-#define SIDETNFS_ENABLE_DEBUG 1
-#endif
-
-// Temporary test-build switch. When 1, GEMDRIVE offers ONLY the
-// read-only configuration drive (GEMDRIVE_FILE_BACKEND_CONFIG_FLASH,
-// romemul/sidetnfs_config_drive_backend.c) serving the
-// flash-embedded SIDETNFS.PRG/README.TXT -- no SD, WiFi or TNFS access is
-// attempted or needed for GEMDRIVE to become ready. Existing SD/TNFS code
-// is not removed or rewritten; it is simply not reached while this is 1.
-// Default 0 (normal behavior, unchanged).
-#ifndef SIDETNFS_CONFIG_DRIVE_ONLY
-#define SIDETNFS_CONFIG_DRIVE_ONLY 0
+#define SIDETNFS_ENABLE_DEBUG 0
 #endif
 
 // Compile-time switch for all DEBUG.TXT
@@ -89,10 +71,10 @@
 // isolate whether the SD/FatFS DEBUG.TXT write itself is a source of
 // timing instability. When 0, sidetnfs_debug_file_service() returns
 // immediately -- no f_open/f_write ever happens, DEBUG.TXT is neither
-// created nor overwritten. this function is retired/never called
-//, but the macro is kept working and now also follows
-// SIDETNFS_ENABLE_DEBUG by default, same as SIDETNFS_DEBUG_DUMP_ON_SELECT
-// below.
+// created nor overwritten. This function itself is retired/never called
+// any more (see its own doc comment), but the macro is kept working and
+// follows SIDETNFS_ENABLE_DEBUG by default, same as
+// SIDETNFS_DEBUG_DUMP_ON_SELECT below.
 #ifndef SIDETNFS_DEBUG_FILE_ENABLED
 #define SIDETNFS_DEBUG_FILE_ENABLED SIDETNFS_ENABLE_DEBUG
 #endif
@@ -138,8 +120,27 @@
 // match the requested pattern/attribs, requiring another round). Prevents
 // scanning a large/mismatched directory from ever becoming an unbounded
 // loop. Renamed from SIDETNFS_LIVE_SEARCH_MAX_ROUNDS .
+//
+// Was 32, sized only for Fsnext's one-step-at-a-time usage (GEMDOS/Desktop
+// supplies the "advance one entry" loop externally, one Fsnext call per
+// visible entry, so that path only ever needs ~1 round per call). An
+// EXACT, non-wildcard Fsfirst (a single filename, no '*'/'?') has no such
+// external loop -- it must walk however many non-matching entries precede
+// the target ENTIRELY inside this one call. With "." and ".." as the
+// first two raw TNFS entries, a target at real directory position 30
+// already needs 32 rounds just to reach it, i.e. the OLD cap could fail on
+// a single 30-entry directory. Confirmed on real hardware: an exact
+// Fsfirst on a file at raw position 30 of a 51-entry directory
+// (WordPlus's EPSLQ folder) returned GEMDOS EFILNF from this cap, even
+// though the file opened and read back perfectly -- see
+// tests/host_config/test_tnfs_dta_large_dir.c, which reproduces the exact
+// round-accounting and fails without this larger value. 512 gives
+// headroom for any directory size a GEMDOS 8.3 filesystem realistically
+// has, while staying a bounded, finite loop (same "never unbounded"
+// contract as before, just correctly sized for BOTH callers of this
+// shared loop, not only Fsnext's).
 #ifndef SIDETNFS_TNFS_DTA_MAX_ROUNDS
-#define SIDETNFS_TNFS_DTA_MAX_ROUNDS 32
+#define SIDETNFS_TNFS_DTA_MAX_ROUNDS 512
 #endif
 
 // /6D: a real TNFS CLOSEDIR is always sent for every OPENDIRX
@@ -154,13 +155,17 @@
 // correct and required, so the switch was removed.
 
 // The RAM-only Fsfirst/Fsnext diagnostic eventlog
-// (sidetnfs_diag_log(), see SidetnfsDiagEvent below) is now always on --
-// the SIDETNFS_FS_DIAG_ENABLED on/off switch was removed, since
-// the eventlog is what the SELECT-button DEBUG.TXT dump is built from, and
-// that dump stays useful for diagnosing the next phases (Fopen/Fread, file
-// handles, path mapping, TNFS errors). Each call records one fixed-size
-// event into a bounded RAM array; never touches SD, never touches UART,
-// never blocks.
+// (sidetnfs_diag_log(), see SidetnfsDiagEvent below) is gated by
+// SIDETNFS_ENABLE_DIAG -- the same switch that already controlled whether
+// it could ever be dumped to a file. A Production build (SIDETNFS_ENABLE_DIAG=0)
+// must have zero logging of any kind, so the recording side has to be
+// genuinely absent there too, not merely never-dumped: when the switch is
+// off, sidetnfs_diag_log() is a static inline no-op (see below), so every
+// one of its ~130 call sites compiles away to nothing under optimization --
+// no RAM array, no per-call argument marshaling, no debug-only state left
+// in a Production image. When the switch is on, each call records one
+// fixed-size event into a bounded RAM array; never touches SD, never
+// touches UART, never blocks.
 
 // Compile-time switch for dumping the diagnostic eventlog to
 // <hd_folder>/DEBUG.TXT when the SELECT button is pressed (edge-triggered,
@@ -177,61 +182,10 @@
 #define SIDETNFS_DEBUG_DUMP_ON_SELECT SIDETNFS_ENABLE_DEBUG
 #endif
 
-// Temporary file-I/O diagnosis focus mode -- NOT meant to stay on
-// permanently. When 1: per-round TNFS READ detail
-// (SIDETNFS_DIAG_FREAD_TNFS_READ/READ_BUFF_TNFS_RC inside the internal
-// chunk-loop) is logged in full, and the per-entry directory-listing detail
-// events (TNFS_READDIRX_ONE/ENTRY/SKIP/MATCH) are additionally suppressed
-// to make room in the fixed SIDETNFS_DIAG_MAX_EVENTS budget. When 0
-// (default): file-I/O events are still logged, but only one summary per
-// GEMDRVEMUL_READ_BUFF_CALL, and
-// directory-listing detail events log normally.
-#ifndef SIDETNFS_DEBUG_FOCUS_FILE_IO
-#define SIDETNFS_DEBUG_FOCUS_FILE_IO 0
-#endif
-
-// Temporary Fseek diagnosis focus mode -- NOT meant to
-// stay on permanently. Defaults ON for this phase (unlike
-// SIDETNFS_DEBUG_FOCUS_FILE_IO) since seeing FSEEK_* events was the whole
-// point. When 1: GEMDRVEMUL_COMMAND_ENTER is only logged for the small set
-// of commands relevant to Fopen/Fread/Fclose/Fseek/Fattrib/Fdatetime/
-// Dgetpath/Dsetpath (see the GEMDRVEMUL_COMMAND_ENTER call site in
-// gemdrvemul.c), and directory-listing per-entry detail events
-// (TNFS_READDIRX_ONE/ENTRY/SKIP/MATCH/EOF, TNFS_OPENDIRX_OK) are
-// additionally suppressed -- same reasoning and same "logging only, no
-// control-flow change" contract as SIDETNFS_DEBUG_FOCUS_FILE_IO.
-#ifndef SIDETNFS_DEBUG_FOCUS_FSEEK
-#define SIDETNFS_DEBUG_FOCUS_FSEEK 1
-#endif
-
-// Temporary Fdelete diagnosis focus mode -- same style/contract as
-// SIDETNFS_DEBUG_FOCUS_FSEEK, not meant to stay on permanently. Defaults
-// ON. When 1: GEMDRVEMUL_COMMAND_ENTER also includes GEMDRVEMUL_FDELETE_CALL
-// in its whitelist (composed with SIDETNFS_DEBUG_FOCUS_FSEEK's own
-// whitelist -- either focus mode being on is enough to show its own
-// commands), and directory-listing detail events are suppressed the same
-// way (see SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL in sidetnfs_probe.c).
-#ifndef SIDETNFS_DEBUG_FOCUS_FDELETE
-#define SIDETNFS_DEBUG_FOCUS_FDELETE 1
-#endif
-
-// Temporary Frename diagnosis focus mode -- same style/contract as
-// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE. Defaults ON.
-#ifndef SIDETNFS_DEBUG_FOCUS_FRENAME
-#define SIDETNFS_DEBUG_FOCUS_FRENAME 1
-#endif
-
-// Temporary Dcreate diagnosis focus mode -- same style/contract as
-// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE/FRENAME. Defaults ON.
-#ifndef SIDETNFS_DEBUG_FOCUS_DCREATE
-#define SIDETNFS_DEBUG_FOCUS_DCREATE 1
-#endif
-
-// Temporary Ddelete diagnosis focus mode -- same style/contract as
-// SIDETNFS_DEBUG_FOCUS_FSEEK/FDELETE/FRENAME/DCREATE. Defaults ON.
-#ifndef SIDETNFS_DEBUG_FOCUS_DDELETE
-#define SIDETNFS_DEBUG_FOCUS_DDELETE 1
-#endif
+// SIDETNFS_DIAG_MAX_EVENTS and the six SIDETNFS_DEBUG_FOCUS_* switches
+// that tune what the eventlog records are now in debug.h, alongside
+// DPRINTF -- a more logical shared home for every debug-build-only knob,
+// not scattered across whichever .h happened to introduce the next one.
 
 // Repeated-Fsfirst-as-continuation was a
 // diagnostic workaround for GEMDRVEMUL_FSNEXT_CALL never being dispatched --
@@ -744,8 +698,12 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_create(int runtime_slot, const char *t
 // handle numbers are per-session and can collide between slots (slot 0
 // handle 2 and slot 1 handle 2 are different files), so this was a
 // genuine cross-session misrouting risk, not just cosmetic.
+// out_last_rc (may be NULL) receives the most recent TNFS response code
+// seen across this call's internal read rounds -- for sidetnfs_mindiag's
+// "last TNFS rc" field. Purely additive: does not change the return value
+// or *out_actual for any existing caller that still passes NULL.
 bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, uint8_t *out_buf,
-                              uint16_t requested, uint16_t *out_actual);
+                              uint16_t requested, uint16_t *out_actual, uint8_t *out_last_rc);
 
 // Write up to requested bytes (internally chunked and bounded --
 // see SIDETNFS_TNFS_WRITE_CHUNK_MAX in sidetnfs_probe.c) from data (the
@@ -1470,7 +1428,7 @@ typedef enum
     SIDETNFS_DIAG_DFREE_SYNTHETIC,
 } SidetnfsDiagEventType;
 
-#define SIDETNFS_DIAG_MAX_EVENTS 256
+// SIDETNFS_DIAG_MAX_EVENTS itself is defined in debug.h.
 
 typedef struct
 {
@@ -1492,38 +1450,62 @@ typedef struct
 // SIDETNFS_DIAG_MAX_EVENTS is reached (keeps the earliest events, which
 // matter most for a boot/cold-start diagnosis
 // wrapping as a ring buffer.
+//
+// Gated by SIDETNFS_ENABLE_DIAG (see comment above): with the switch off,
+// this is a static inline no-op right here in the header, so every call
+// site (gemdrvemul.c and this file) compiles it away under optimization --
+// a Production build carries none of the s_diag_events RAM array, the
+// function body, or the per-call argument setup.
+#if SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
 void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *path,
                         const char *pattern, const char *name, uint16_t index,
                         uint16_t count, uint8_t result, uint8_t attr);
+#else
+static inline void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *path,
+                                       const char *pattern, const char *name, uint16_t index,
+                                       uint16_t count, uint8_t result, uint8_t attr)
+{
+    (void)event;
+    (void)ndta;
+    (void)path;
+    (void)pattern;
+    (void)name;
+    (void)index;
+    (void)count;
+    (void)result;
+    (void)attr;
+}
+#endif
 
 // Write the diagnostic eventlog plus a short cache/search-slot
-// summary to <hd_folder>/DEBUG.TXT. Call only from the SELECT-button
+// summary to <hd_folder>/EVENTLOG.TXT. Call only from the SELECT-button
 // edge-handler in gemdrvemul.c (never automatically, never from
 // Fsfirst/Fsnext, never from a network callback). Silently does nothing if
 // hd_folder is NULL or the SD write fails -- never crashes.
-void sidetnfs_diag_dump_on_select(const char *hd_folder);
+void sidetnfs_eventlog_dump_to_file(const char *hd_folder);
 
-// Temporary diagnostic build: enable/disable everything below (the
-// SidetnfsUartDiagSnapshot struct updates, and the UART dump itself) with a
-// single compile-time switch, same pattern as SIDETNFS_DEBUG_DUMP_ON_SELECT
-// above. Defaults to SIDETNFS_ENABLE_DIAG_UART (passed from CMakeLists.txt,
-// itself defaulting to 0) so an ordinary build is entirely unaffected --
-// every update site below compiles to nothing and this is not linked in.
-#ifndef SIDETNFS_UART_DIAG_DUMP_ON_SELECT
-#define SIDETNFS_UART_DIAG_DUMP_ON_SELECT SIDETNFS_ENABLE_DIAG_UART
+// Debug build only: enable/disable everything below (the
+// SidetnfsDiagSnapshot struct updates, and sidetnfs_snapshot_dump_to_file()
+// itself) with a single compile-time switch, same pattern as
+// SIDETNFS_DEBUG_DUMP_ON_SELECT above. Defaults to SIDETNFS_ENABLE_DIAG
+// (see build.sh/CMakeLists.txt: 0 in Production, 1 in Debug) so Production
+// is entirely unaffected -- every update site below compiles to nothing
+// and this is not linked in.
+#ifndef SIDETNFS_DIAG_DUMP_ON_SELECT
+#define SIDETNFS_DIAG_DUMP_ON_SELECT SIDETNFS_ENABLE_DIAG
 #endif
 
-#if SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+#if SIDETNFS_DIAG_DUMP_ON_SELECT
 #include "filesys.h" // MAX_FOLDER_LENGTH
 
-// Temporary diagnostic build only: a compact, fixed-size RAM
+// Debug build only: a compact, fixed-size RAM
 // snapshot of runtime state, deliberately separate from
 // SidetnfsDiagEvent/sidetnfs_diag_log() above (a detailed 256-entry event
-// history dumped to DEBUG.TXT via FatFS). This is a handful of
+// history dumped to EVENTLOG.TXT via FatFS). This is a handful of
 // counters/last-values, updated in RAM only during normal GEMDOS/bus
 // handling -- no I/O, no printf, no dynamic allocation anywhere except in
-// sidetnfs_uart_diag_dump() itself, which is only ever called from the
-// physical SELECT-button edge-handler in gemdrvemul.c.
+// sidetnfs_snapshot_dump_to_file() itself, which is only ever called from
+// the physical SELECT-button edge-handler in gemdrvemul.c.
 //
 // Fsfirst validation-phase codes (fsfirst_last_validation_phase):
 //   1 = invalid slot (out of [0, GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES) range)
@@ -1834,31 +1816,24 @@ typedef struct
     uint8_t settings_fallback_reason;
     char settings_drive_letter;
     int32_t settings_runtime_slot;
-} SidetnfsUartDiagSnapshot;
+} SidetnfsDiagSnapshot;
 
 // Returns a pointer to the single static instance -- callers in
 // gemdrvemul.c write individual fields directly (plain scalar/array
 // stores, no function-call overhead beyond this one deref).
-SidetnfsUartDiagSnapshot *sidetnfs_uart_diag(void);
+SidetnfsDiagSnapshot *sidetnfs_diag_snapshot(void);
 
 // Find the s_tnfs_dta_searches[] slot index actually holding ndta's active
 // TNFS DTA search (read-only, for the Fsnext "gevonden DTA-slot" field), or
 // -1 if none. Purely informational -- does not affect DTA-registry
 // behavior.
-int sidetnfs_uart_diag_find_dta_slot(uint32_t ndta);
+int sidetnfs_diag_snapshot_find_dta_slot(uint32_t ndta);
 
-// Print the current snapshot over UART (stdio/printf -- see CMakeLists.txt,
-// SIDETNFS_ENABLE_DIAG_UART also forces pico_enable_stdio_uart on for this
-// build regardless of the DPRINTF/_DEBUG level, so DPRINTF itself can stay
-// off). Call only from the SELECT-button edge-handler.
-void sidetnfs_uart_diag_dump(void);
-
-// Same snapshot, same content/format, written to <hd_folder>/DEBUG.TXT via
-// FatFS instead of UART -- fallback for hardware where the physical UART
-// isn't usable. Call only from the SELECT-button edge-handler. Silently
-// does nothing if hd_folder is NULL or the SD write fails -- never
-// crashes, same contract as sidetnfs_diag_dump_on_select() above.
-void sidetnfs_uart_diag_dump_to_file(const char *hd_folder);
+// Writes the current snapshot to <hd_folder>/SNAPSHOT.TXT via FatFS.
+// Call only from the SELECT-button edge-handler. Silently does nothing if
+// hd_folder is NULL or the SD write fails -- never crashes, same contract
+// as sidetnfs_eventlog_dump_to_file() above.
+void sidetnfs_snapshot_dump_to_file(const char *hd_folder);
 
 // Temporary diagnostic build (BUGGYBGX/BULGX investigation
 // fixed-size, 16-entry RING buffer (oldest entry overwritten first, unlike
@@ -1871,8 +1846,8 @@ void sidetnfs_uart_diag_dump_to_file(const char *hd_folder);
 // populate_dta_from_sidetnfs_entry() (name actually written into the
 // 44-byte GEMDOS DTA, which is also exactly the name Fsnext/Fsfirst
 // returns to the Atari -- there is no further transformation after that
-// point). Dumped to SD (DEBUG.TXT) only, via
-// sidetnfs_uart_diag_dump_to_file() above -- never to UART.
+// point). Dumped to SD (SNAPSHOT.TXT) only, via
+// sidetnfs_snapshot_dump_to_file() above.
 typedef enum
 {
     SIDETNFS_NAME_EVT_READDIRX_NORMALIZE = 0, // raw_name/converted_name valid
@@ -1906,6 +1881,18 @@ void sidetnfs_name_trace_log(SidetnfsNameTraceEventType event_type, uint32_t ndt
 // gemdrvemul.c where runtime_slot itself isn't otherwise in scope.
 int sidetnfs_tnfs_dta_get_runtime_slot(uint32_t ndta);
 
-#endif // SIDETNFS_UART_DIAG_DUMP_ON_SELECT
+#endif // SIDETNFS_DIAG_DUMP_ON_SELECT
+
+// The SELECT button's single diagnostic entry point -- call this, and only
+// this, from the one edge-handler in gemdrvemul.c. Always declared,
+// regardless of build variant, so that call site never needs its own
+// #if: writes <hd_folder>/EVENTLOG.TXT first, then, only when
+// SIDETNFS_DIAG_DUMP_ON_SELECT is also on, <hd_folder>/SNAPSHOT.TXT and
+// blinks the onboard LED twice as the only feedback this hardware has that
+// the dump actually ran (there is no serial port to print a confirmation
+// to). Each half is independently silent-safe (NULL hd_folder, SD write
+// failure) -- see sidetnfs_eventlog_dump_to_file()/
+// sidetnfs_snapshot_dump_to_file()'s own contracts.
+void sidetnfs_diag_dump_on_select(const char *hd_folder);
 
 #endif // SIDETNFS_PROBE_H

@@ -50,6 +50,7 @@ target_sources(${PROJECT_NAME} PRIVATE network.c)
 target_sources(${PROJECT_NAME} PRIVATE filesys.c)
 target_sources(${PROJECT_NAME} PRIVATE scfs.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_probe.c)
+target_sources(${PROJECT_NAME} PRIVATE sidetnfs_mindiag.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_resolve.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_system_config.c)
@@ -132,122 +133,52 @@ if (NOT _DEBUG)
         set(_DEBUG 0)
 endif()
 
-# Fase 8B: SIDETNFS_ENABLE_SD_SUPPORT/SIDETNFS_ENABLE_DEBUG -- same
-# env-var-to-add_definitions() passthrough as _DEBUG above. Both default to
-# 1 (unchanged behavior) unless explicitly overridden, e.g.:
-#   SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+# Two officially supported build variants, selected by build.sh's build-type
+# argument alone (`./build.sh pico_w` -> Production, `./build.sh pico_w
+# debug` -> Debug -- see build.sh, which sets _DEBUG from that same
+# argument): SIDETNFS_ENABLE_DEBUG and SIDETNFS_ENABLE_DIAG both default to
+# _DEBUG's own value, so a plain build of either variant needs no other
+# flag. Each can still be overridden independently via its own env var, same
+# passthrough pattern as _DEBUG above, e.g. to get the eventlog without the
+# heavier snapshot instrumentation:
+#   SIDETNFS_ENABLE_DEBUG=1 SIDETNFS_ENABLE_DIAG=0 ./build.sh pico_w debug
 # NOTE: deliberately checked against the empty string, not `if(NOT ...)` --
 # CMake treats the literal string "0" itself as boolean-false, so
-# `if(NOT _VAR)` would be true (and clobber an explicit "0" back to "1")
-# exactly when the env var is set to the value we most need to respect.
-# _DEBUG above gets away with the simpler NOT-check only because its own
-# default already happens to be 0.
-if("$ENV{SIDETNFS_ENABLE_SD_SUPPORT}" STREQUAL "")
-        set(_SIDETNFS_ENABLE_SD_SUPPORT 1)
-else()
-        set(_SIDETNFS_ENABLE_SD_SUPPORT $ENV{SIDETNFS_ENABLE_SD_SUPPORT})
-endif()
-
+# `if(NOT _VAR)` would be true (and clobber an explicit "0" back to the
+# default) exactly when the env var is set to the value we most need to
+# respect.
 if("$ENV{SIDETNFS_ENABLE_DEBUG}" STREQUAL "")
-        set(_SIDETNFS_ENABLE_DEBUG 1)
+        set(_SIDETNFS_ENABLE_DEBUG ${_DEBUG})
 else()
         set(_SIDETNFS_ENABLE_DEBUG $ENV{SIDETNFS_ENABLE_DEBUG})
 endif()
 
-# Diagnostic build: SIDETNFS_ENABLE_DIAG_UART -- same passthrough
-# pattern, default 0 (unchanged behavior/no code compiled in) unless
-# explicitly overridden, e.g.:
-#   SIDETNFS_ENABLE_DIAG_UART=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
-# Deliberately independent of _DEBUG/SIDETNFS_ENABLE_DEBUG: this build keeps
-# DPRINTF (and the DEBUG.TXT dump-on-select) exactly as they'd otherwise be,
-# but still needs the physical UART wired up for the new, separate
-# SELECT-triggered snapshot dump -- see the pico_enable_stdio_uart() call
-# below.
-if("$ENV{SIDETNFS_ENABLE_DIAG_UART}" STREQUAL "")
-        set(_SIDETNFS_ENABLE_DIAG_UART 0)
+if("$ENV{SIDETNFS_ENABLE_DIAG}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_DIAG ${_DEBUG})
 else()
-        set(_SIDETNFS_ENABLE_DIAG_UART $ENV{SIDETNFS_ENABLE_DIAG_UART})
+        set(_SIDETNFS_ENABLE_DIAG $ENV{SIDETNFS_ENABLE_DIAG})
 endif()
 
-# Buildvarianten vereenvoudigen en logisch hernoemen: SIDETNFS_BUILD_DIAGNOSTIC
-# is the new, user-facing name for asking for the "Diagnostic" build
-# variant (see build.sh/report). It is a pure alias on top of the
-# existing SIDETNFS_ENABLE_DIAG_UART macro above, not a second,
-# independent switch -- union/OR semantics only:
-# SIDETNFS_BUILD_DIAGNOSTIC=1 always turns Diagnostic mode on (forcing
-# _SIDETNFS_ENABLE_DIAG_UART to 1), even if SIDETNFS_ENABLE_DIAG_UART
-# itself was left at its 0 default. There is no way to use this alias to
-# force Diagnostic mode back OFF -- if either switch says "on", the build
-# is Diagnostic -- so the two can never contradict each other. All
-# existing SIDETNFS_ENABLE_DIAG_UART-gated code (see gemdrvemul.c,
-# sidetnfs_probe.c, main.c) is completely unaffected: it still only ever
-# checks _SIDETNFS_ENABLE_DIAG_UART, never this alias directly.
-if("$ENV{SIDETNFS_BUILD_DIAGNOSTIC}" STREQUAL "1")
-        set(_SIDETNFS_ENABLE_DIAG_UART 1)
-endif()
-
-if(${_SIDETNFS_ENABLE_DIAG_UART} STREQUAL "0")
+if(${_SIDETNFS_ENABLE_DIAG} STREQUAL "0")
         set(_SIDETNFS_BUILD_VARIANT "Production")
 else()
-        set(_SIDETNFS_BUILD_VARIANT "Diagnostic")
+        set(_SIDETNFS_BUILD_VARIANT "Debug")
 endif()
 
-# Fase 10B: SIDETNFS_CONFIG_DRIVE_ONLY -- same passthrough pattern, default
-# 0 (unchanged behavior) unless explicitly overridden, e.g.:
-#   SIDETNFS_CONFIG_DRIVE_ONLY=1 SIDETNFS_ENABLE_SD_SUPPORT=0 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
-if("$ENV{SIDETNFS_CONFIG_DRIVE_ONLY}" STREQUAL "")
-        set(_SIDETNFS_CONFIG_DRIVE_ONLY 0)
-else()
-        set(_SIDETNFS_CONFIG_DRIVE_ONLY $ENV{SIDETNFS_CONFIG_DRIVE_ONLY})
-endif()
-
-# Fase 12B2: SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM -- same passthrough
-# pattern, default 0 (unchanged behavior). When 1: sidetnfs_config_init()
-# still reads and (if SIDETNFS_ENABLE_DIAG_UART) dumps the REAL flash
-# config exactly as normal, but main.c then overwrites the RAM config
-# with factory defaults via sidetnfs_config_force_factory_ram() before
-# any TNFS/runtime-drive code runs -- never writes to flash. Diagnostic
-# recovery build only, e.g.:
-#   SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM=1 SIDETNFS_ENABLE_DIAG_UART=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
-if("$ENV{SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM}" STREQUAL "")
-        set(_SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM 0)
-else()
-        set(_SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM $ENV{SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM})
-endif()
-
-# Fase 12B3: SIDETNFS_ENABLE_SLOT_DIAG -- same passthrough pattern,
-# default 0. Independent of the (larger, verbose) Fase 12B2
-# sidetnfs_config_dump_uart()/runtime-table dump -- when this is 1, that
-# older, more verbose dump is automatically suppressed (see
-# gemdrvemul.c/main.c) so boot output stays compact, and this phase's own
-# three-block Dump A/B/C fires instead. Still requires
-# SIDETNFS_ENABLE_DIAG_UART=1 for the physical UART/stdio to actually be
-# enabled -- this flag alone only controls whether the dump CODE is
-# compiled in, e.g.:
-#   SIDETNFS_ENABLE_DIAG_UART=1 SIDETNFS_ENABLE_SLOT_DIAG=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
-if("$ENV{SIDETNFS_ENABLE_SLOT_DIAG}" STREQUAL "")
-        set(_SIDETNFS_ENABLE_SLOT_DIAG 0)
-else()
-        set(_SIDETNFS_ENABLE_SLOT_DIAG $ENV{SIDETNFS_ENABLE_SLOT_DIAG})
-endif()
-
-# Fase 12B4: SIDETNFS_ENABLE_SD_SLOT_DUMP -- same passthrough pattern,
-# default 0. Completely independent of SIDETNFS_ENABLE_DIAG_UART/the
-# UART-based SLOTDIAG A/B/C dumps above -- writes the same kind of
-# information (plus file-handle/DTA/call-counter detail) to
-# <hd_folder>/SLOTDIAG.TXT on SD instead, triggered by a SHORT SELECT
-# press during normal operation (same edge-triggered pattern as the
-# existing DEBUG.TXT dump), never at boot, never the 10s factory-reset
-# long-press. No UART/stdio code is compiled in because of this flag --
-# see gemdrvemul.c/sidetnfs_probe.c for the exact gating, e.g.:
-#   SIDETNFS_ENABLE_DIAG_UART=0 SIDETNFS_ENABLE_SLOT_DIAG=1 SIDETNFS_ENABLE_SD_SLOT_DUMP=1 SIDETNFS_ENABLE_SD_SUPPORT=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+# SIDETNFS_ENABLE_SD_SLOT_DUMP -- same passthrough pattern, default 0.
+# Independent of SIDETNFS_ENABLE_DIAG/the EVENTLOG.TXT/SNAPSHOT.TXT dumps
+# above -- writes the same kind of information (plus file-handle/DTA/
+# call-counter detail) to <hd_folder>/SLOTDIAG.TXT on SD instead, triggered
+# by a SHORT SELECT press during normal operation, never at boot, never the
+# 10s factory-reset long-press. E.g.:
+#   SIDETNFS_ENABLE_SD_SLOT_DUMP=1 ./build.sh pico_w debug
 if("$ENV{SIDETNFS_ENABLE_SD_SLOT_DUMP}" STREQUAL "")
         set(_SIDETNFS_ENABLE_SD_SLOT_DUMP 0)
 else()
         set(_SIDETNFS_ENABLE_SD_SLOT_DUMP $ENV{SIDETNFS_ENABLE_SD_SLOT_DUMP})
 endif()
 
-# Fase 12B5: SIDETNFS_FORCE_CONFIG_RECOVERY -- same passthrough pattern,
+# SIDETNFS_FORCE_CONFIG_RECOVERY -- same passthrough pattern,
 # default 0. One-shot recovery build: as early as possible after minimal
 # init, forcibly rewrites the SideTNFS drive-list flash sector to clean
 # native-v3 factory defaults (S:/N: only) IF it doesn't already exactly
@@ -255,22 +186,37 @@ endif()
 # and main.c's own recovery function for the full contract, including the
 # reset-loop-avoidance check. No UART, no SD diagnosis of any kind -- see
 # main.c for the exact zero-UART guarantee. E.g.:
-#   SIDETNFS_FORCE_CONFIG_RECOVERY=1 SIDETNFS_ENABLE_SD_SUPPORT=1 SIDETNFS_ENABLE_DEBUG=0 ./build.sh pico_w
+#   SIDETNFS_FORCE_CONFIG_RECOVERY=1 ./build.sh pico_w
 if("$ENV{SIDETNFS_FORCE_CONFIG_RECOVERY}" STREQUAL "")
         set(_SIDETNFS_FORCE_CONFIG_RECOVERY 0)
 else()
         set(_SIDETNFS_FORCE_CONFIG_RECOVERY $ENV{SIDETNFS_FORCE_CONFIG_RECOVERY})
 endif()
 
+# SIDETNFS_ENABLE_MINDIAG -- same passthrough pattern, default 0.
+# Independent of SIDETNFS_ENABLE_DIAG/SIDETNFS_ENABLE_DEBUG: a fixed, tiny
+# set of plain static-RAM counters/last-values for the Fopen/Fread/Fclose
+# path (see sidetnfs_mindiag.h), updated only by simple assignments and
+# increments -- no ring buffer, no snprintf/file-I/O/dynamic processing
+# during a GEMDOS call. Dumped to <hd_folder>/COPYTRACE.TXT by the SELECT
+# edge-handler, same as SIDETNFS_ENABLE_DIAG's EVENTLOG.TXT/SNAPSHOT.TXT,
+# but independently so it can be built on top of an otherwise-plain
+# Production image (SIDETNFS_ENABLE_DEBUG=0, SIDETNFS_ENABLE_DIAG=0). E.g.:
+#   SIDETNFS_ENABLE_MINDIAG=1 ./build.sh pico_w
+if("$ENV{SIDETNFS_ENABLE_MINDIAG}" STREQUAL "")
+        set(_SIDETNFS_ENABLE_MINDIAG 0)
+else()
+        set(_SIDETNFS_ENABLE_MINDIAG $ENV{SIDETNFS_ENABLE_MINDIAG})
+endif()
+
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
-# Workaround to disable USB output in release builds. SIDETNFS_ENABLE_DIAG_UART
-# additionally forces the physical UART on even at _DEBUG=0, for the
-# temporary diagnostic build's SELECT-triggered snapshot dump -- DPRINTF
-# itself stays gated on _DEBUG alone (unchanged), so a diag-UART build with
-# _DEBUG=0 gets a live UART port but zero DPRINTF chatter during GEMDOS/bus
-# handling.
-if(${_DEBUG} STREQUAL "0" AND ${_SIDETNFS_ENABLE_DIAG_UART} STREQUAL "0")
+# Workaround to disable USB output in release builds. SIDETNFS_ENABLE_DIAG
+# additionally forces the physical UART on even at _DEBUG=0 (reachable only
+# via the independent-override form above), so the SELECT-triggered
+# snapshot dump's own instrumentation has a live stdio backend to sit
+# behind -- DPRINTF itself stays gated on _DEBUG alone (unchanged).
+if(${_DEBUG} STREQUAL "0" AND ${_SIDETNFS_ENABLE_DIAG} STREQUAL "0")
     pico_enable_stdio_uart(${PROJECT_NAME} 0)
 else()
     pico_enable_stdio_uart(${PROJECT_NAME} 1)
@@ -289,27 +235,19 @@ add_definitions(-DRELEASE_VERSION="${RELEASE_VERSION}")
 add_definitions(-DRELEASE_DATE="${RELEASE_DATE}")
 add_definitions(-DLATEST_RELEASE_URL="${LATEST_RELEASE_URL}")
 
-# Pass the _DEBUG flag to the C compiler
+# Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
 
-# Fase 8B: pass SIDETNFS_ENABLE_SD_SUPPORT/SIDETNFS_ENABLE_DEBUG to the C
-# compiler, same as _DEBUG above.
-message("SIDETNFS_ENABLE_SD_SUPPORT: " ${_SIDETNFS_ENABLE_SD_SUPPORT})
 message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
-message("SIDETNFS_CONFIG_DRIVE_ONLY: " ${_SIDETNFS_CONFIG_DRIVE_ONLY})
-message("SIDETNFS_ENABLE_DIAG_UART: " ${_SIDETNFS_ENABLE_DIAG_UART})
-message("SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM: " ${_SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM})
-message("SIDETNFS_ENABLE_SLOT_DIAG: " ${_SIDETNFS_ENABLE_SLOT_DIAG})
+message("SIDETNFS_ENABLE_DIAG: " ${_SIDETNFS_ENABLE_DIAG})
 message("SIDETNFS_ENABLE_SD_SLOT_DUMP: " ${_SIDETNFS_ENABLE_SD_SLOT_DUMP})
 message("SIDETNFS_FORCE_CONFIG_RECOVERY: " ${_SIDETNFS_FORCE_CONFIG_RECOVERY})
-add_definitions(-DSIDETNFS_ENABLE_SD_SUPPORT=${_SIDETNFS_ENABLE_SD_SUPPORT})
+message("SIDETNFS_ENABLE_MINDIAG: " ${_SIDETNFS_ENABLE_MINDIAG})
 add_definitions(-DSIDETNFS_ENABLE_DEBUG=${_SIDETNFS_ENABLE_DEBUG})
-add_definitions(-DSIDETNFS_CONFIG_DRIVE_ONLY=${_SIDETNFS_CONFIG_DRIVE_ONLY})
-add_definitions(-DSIDETNFS_ENABLE_DIAG_UART=${_SIDETNFS_ENABLE_DIAG_UART})
-add_definitions(-DSIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM=${_SIDETNFS_FORCE_FACTORY_CONFIG_IN_RAM})
-add_definitions(-DSIDETNFS_ENABLE_SLOT_DIAG=${_SIDETNFS_ENABLE_SLOT_DIAG})
+add_definitions(-DSIDETNFS_ENABLE_DIAG=${_SIDETNFS_ENABLE_DIAG})
 add_definitions(-DSIDETNFS_ENABLE_SD_SLOT_DUMP=${_SIDETNFS_ENABLE_SD_SLOT_DUMP})
 add_definitions(-DSIDETNFS_FORCE_CONFIG_RECOVERY=${_SIDETNFS_FORCE_CONFIG_RECOVERY})
+add_definitions(-DSIDETNFS_ENABLE_MINDIAG=${_SIDETNFS_ENABLE_MINDIAG})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")

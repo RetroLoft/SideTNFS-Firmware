@@ -9,11 +9,10 @@
 // Read-only, root-only virtual drive backend serving the two
 // Flash-embedded files (SIDETNFS.PRG, README.TXT) directly from
 // their existing const arrays (romemul/sidetnfs_config_drive.c) -- no RAM
-// copy, no SD/WiFi/TNFS access. Only reachable when SIDETNFS_CONFIG_DRIVE_ONLY
-// (see sidetnfs_probe.h, default 0) selects it as the sole GEMDRIVE backend
-// for a temporary test build. Mirrors the shape (not the storage) of
-// sidetnfs_probe.c's TNFS DTA registry / fake no-network search table, so
-// gemdrvemul.c's existing Fsfirst/Fsnext call sites need no new pattern.
+// copy, no SD/WiFi/TNFS access. This is the always-present SETTINGS disk's
+// backend. Mirrors the shape (not the storage) of sidetnfs_probe.c's TNFS
+// DTA registry / fake no-network search table, so gemdrvemul.c's existing
+// Fsfirst/Fsnext call sites need no new pattern.
 
 // Number of fixed files this drive ever serves.
 #define SIDETNFS_CONFIG_DRIVE_FILE_COUNT 2
