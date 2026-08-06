@@ -1,1 +1,0 @@
-../../../../romemul/include/sidetnfs_mindiag.h

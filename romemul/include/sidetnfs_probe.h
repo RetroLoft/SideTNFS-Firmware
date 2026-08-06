@@ -698,12 +698,8 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_create(int runtime_slot, const char *t
 // handle numbers are per-session and can collide between slots (slot 0
 // handle 2 and slot 1 handle 2 are different files), so this was a
 // genuine cross-session misrouting risk, not just cosmetic.
-// out_last_rc (may be NULL) receives the most recent TNFS response code
-// seen across this call's internal read rounds -- for sidetnfs_mindiag's
-// "last TNFS rc" field. Purely additive: does not change the return value
-// or *out_actual for any existing caller that still passes NULL.
 bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, uint8_t *out_buf,
-                              uint16_t requested, uint16_t *out_actual, uint8_t *out_last_rc);
+                              uint16_t requested, uint16_t *out_actual);
 
 // Write up to requested bytes (internally chunked and bounded --
 // see SIDETNFS_TNFS_WRITE_CHUNK_MAX in sidetnfs_probe.c) from data (the

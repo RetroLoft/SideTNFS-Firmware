@@ -50,7 +50,6 @@ target_sources(${PROJECT_NAME} PRIVATE network.c)
 target_sources(${PROJECT_NAME} PRIVATE filesys.c)
 target_sources(${PROJECT_NAME} PRIVATE scfs.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_probe.c)
-target_sources(${PROJECT_NAME} PRIVATE sidetnfs_mindiag.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_resolve.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_system_config.c)
@@ -193,22 +192,6 @@ else()
         set(_SIDETNFS_FORCE_CONFIG_RECOVERY $ENV{SIDETNFS_FORCE_CONFIG_RECOVERY})
 endif()
 
-# SIDETNFS_ENABLE_MINDIAG -- same passthrough pattern, default 0.
-# Independent of SIDETNFS_ENABLE_DIAG/SIDETNFS_ENABLE_DEBUG: a fixed, tiny
-# set of plain static-RAM counters/last-values for the Fopen/Fread/Fclose
-# path (see sidetnfs_mindiag.h), updated only by simple assignments and
-# increments -- no ring buffer, no snprintf/file-I/O/dynamic processing
-# during a GEMDOS call. Dumped to <hd_folder>/COPYTRACE.TXT by the SELECT
-# edge-handler, same as SIDETNFS_ENABLE_DIAG's EVENTLOG.TXT/SNAPSHOT.TXT,
-# but independently so it can be built on top of an otherwise-plain
-# Production image (SIDETNFS_ENABLE_DEBUG=0, SIDETNFS_ENABLE_DIAG=0). E.g.:
-#   SIDETNFS_ENABLE_MINDIAG=1 ./build.sh pico_w
-if("$ENV{SIDETNFS_ENABLE_MINDIAG}" STREQUAL "")
-        set(_SIDETNFS_ENABLE_MINDIAG 0)
-else()
-        set(_SIDETNFS_ENABLE_MINDIAG $ENV{SIDETNFS_ENABLE_MINDIAG})
-endif()
-
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
 # Workaround to disable USB output in release builds. SIDETNFS_ENABLE_DIAG
@@ -242,12 +225,10 @@ message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
 message("SIDETNFS_ENABLE_DIAG: " ${_SIDETNFS_ENABLE_DIAG})
 message("SIDETNFS_ENABLE_SD_SLOT_DUMP: " ${_SIDETNFS_ENABLE_SD_SLOT_DUMP})
 message("SIDETNFS_FORCE_CONFIG_RECOVERY: " ${_SIDETNFS_FORCE_CONFIG_RECOVERY})
-message("SIDETNFS_ENABLE_MINDIAG: " ${_SIDETNFS_ENABLE_MINDIAG})
 add_definitions(-DSIDETNFS_ENABLE_DEBUG=${_SIDETNFS_ENABLE_DEBUG})
 add_definitions(-DSIDETNFS_ENABLE_DIAG=${_SIDETNFS_ENABLE_DIAG})
 add_definitions(-DSIDETNFS_ENABLE_SD_SLOT_DUMP=${_SIDETNFS_ENABLE_SD_SLOT_DUMP})
 add_definitions(-DSIDETNFS_FORCE_CONFIG_RECOVERY=${_SIDETNFS_FORCE_CONFIG_RECOVERY})
-add_definitions(-DSIDETNFS_ENABLE_MINDIAG=${_SIDETNFS_ENABLE_MINDIAG})
 
 # Optimization Flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -ffunction-sections -fdata-sections")

@@ -8,7 +8,6 @@
 
 #include "include/gemdrvemul.h"
 #include "include/sidetnfs_probe.h"
-#include "include/sidetnfs_mindiag.h"
 #include "include/sidetnfs_config_drive_backend.h"
 #include "include/sidetnfs_sd_service.h"
 
@@ -638,7 +637,6 @@ static void __not_in_flash_func(populate_dta)(uint32_t memory_address_dta, uint3
 static void __not_in_flash_func(populate_dta_from_sidetnfs_entry)(uint32_t memory_address_dta,
                                                                     const SidetnfsAtariDirEntry *entry)
 {
-    sidetnfs_mindiag_note_dta_entry(entry->name, entry->size);
     nullify_dta(memory_address_dta);
     *((volatile uint16_t *)(memory_address_dta + GEMDRVEMUL_DTA_F_FOUND)) = 0;
 
@@ -2517,7 +2515,6 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
         sidetnfs_diag_snapshot()->fopen_last_tnfs_rc = 0xFFu;
         sidetnfs_diag_snapshot()->fopen_last_result = (uint16_t)gemdos_rc;
 #endif
-        sidetnfs_mindiag_note_fopen(0, 0xFFu, 0xFFu, gemdos_rc);
         return;
     }
     uint16_t fd_counter = get_first_available_fd(fdescriptors);
@@ -2533,7 +2530,6 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
         sidetnfs_diag_snapshot()->fopen_last_result = (uint16_t)GEMDOS_EINTRN;
 #endif
-        sidetnfs_mindiag_note_fopen(fd_counter, tnfs_handle, 0xFFu, GEMDOS_EINTRN);
         return;
     }
     add_tnfs_file(&fdescriptors, newFDescriptor, tmp_filepath, tnfs_handle, fd_counter, fopen_mode != 0, runtime_slot);
@@ -2546,7 +2542,6 @@ static void gemdrive_backend_fopen(uint16_t fopen_mode, const char *tmp_filepath
     sidetnfs_diag_snapshot()->fopen_last_stored_slot = runtime_slot;
     sidetnfs_diag_snapshot()->fopen_last_result = (uint16_t)GEMDOS_EOK;
 #endif
-    sidetnfs_mindiag_note_fopen(fd_counter, tnfs_handle, 0, GEMDOS_EOK);
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FOPEN_HANDLE, fd_counter);
 #else
     (void)runtime_slot;         // SD/FatFS backend has no slot concept
@@ -2660,7 +2655,6 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
         sidetnfs_diag_snapshot()->fclose_last_backend = file ? (uint8_t)file->backend : 0xFFu;
         sidetnfs_diag_snapshot()->fclose_last_result = (uint16_t)GEMDOS_EIHNDL;
 #endif
-        sidetnfs_mindiag_note_fclose(fclose_fd, file ? file->tnfs_handle : 0xFFu, GEMDOS_EIHNDL, file != NULL);
         *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EIHNDL;
         return;
     }
@@ -2709,14 +2703,12 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
     }
     // Removing the entry here is also what prevents a double-close: a
     // second FCLOSE with the same fd finds file == NULL above.
-    uint8_t mindiag_fclose_tnfs_handle = file->tnfs_handle;
     delete_file_by_fdesc(&fdescriptors, fclose_fd);
     DPRINTF("TNFS file closed\n");
     sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_RETURN, fclose_fd, NULL, NULL, NULL, 0, 0, (uint8_t)GEMDOS_EOK, 0);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     fclose_diag->fclose_last_result = (uint16_t)GEMDOS_EOK;
 #endif
-    sidetnfs_mindiag_note_fclose(fclose_fd, mindiag_fclose_tnfs_handle, GEMDOS_EOK, true);
     *((volatile uint16_t *)(memory_shared_address + GEMDRVEMUL_FCLOSE_STATUS)) = GEMDOS_EOK;
 #else
     FileDescriptors *file = get_file_by_fdesc(fdescriptors, fclose_fd);
@@ -2846,7 +2838,6 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
         sidetnfs_diag_snapshot()->fread_last_backend = file ? (uint8_t)file->backend : 0xFFu;
         sidetnfs_diag_snapshot()->fread_last_result = (uint16_t)GEMDOS_EIHNDL;
 #endif
-        sidetnfs_mindiag_note_fread(readbuff_fd, file ? file->tnfs_handle : 0xFFu, 0, 0, 0xFFu, GEMDOS_EIHNDL);
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
         return;
     }
@@ -2876,7 +2867,6 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
         fread_diag->fread_last_result = (uint16_t)GEMDOS_EIHNDL;
 #endif
-        sidetnfs_mindiag_note_fread(readbuff_fd, file->tnfs_handle, 0, 0, 0xFFu, GEMDOS_EIHNDL);
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
         return;
     }
@@ -2897,10 +2887,8 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
         memset((void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), 0, DEFAULT_FOPEN_READ_BUFFER_SIZE);
     }
     uint16_t actual = 0;
-    uint8_t mindiag_tnfs_rc = 0xFFu;
     bool ok = sidetnfs_tnfs_file_read(readbuff_fd, file->tnfs_handle, file->runtime_slot,
-                                       (uint8_t *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), buff_size, &actual,
-                                       &mindiag_tnfs_rc);
+                                       (uint8_t *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), buff_size, &actual);
     if (!ok)
     {
         DPRINTF("ERROR: Could not read TNFS file (fd %x)\n", readbuff_fd);
@@ -2909,7 +2897,6 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
         fread_diag->fread_last_result = (uint16_t)GEMDOS_EINTRN;
 #endif
-        sidetnfs_mindiag_note_fread(readbuff_fd, file->tnfs_handle, buff_size, 0, mindiag_tnfs_rc, GEMDOS_EINTRN);
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EINTRN);
         return;
     }
@@ -2928,7 +2915,6 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
     fread_diag->fread_last_actual = actual;
     fread_diag->fread_last_result = (uint16_t)GEMDOS_EOK;
 #endif
-    sidetnfs_mindiag_note_fread(readbuff_fd, file->tnfs_handle, buff_size, actual, mindiag_tnfs_rc, GEMDOS_EOK);
     CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_READ_BUFF, actual + (actual % 2));
     WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, (uint32_t)actual);
 #else
@@ -3564,7 +3550,7 @@ static void sidetnfs_slot_diag_dump_to_file(const char *hd_folder)
 // stays 0 (unchanged meaning), exactly as when RTC/NTP was never enabled;
 // the existing 68k-side wait_rtc timeout (gemdrive.s, untouched) already
 // handles that case as before.
-#define SIDETNFS_NTP_INITIAL_TIMEOUT_MS 3000
+#define SIDETNFS_NTP_INITIAL_TIMEOUT_MS 15000
 
 void init_gemdrvemul(bool safe_config_reboot)
 {
@@ -3952,7 +3938,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             bool ntp_request_sent = false;
 
             // A single, short
-            // (~3s) attempt -- replaces the old, up-to-45s
+            // (~15s) attempt -- replaces the old, up-to-45s
             // PARAM_GEMDRIVE_TIMEOUT_SEC-bounded wait. On timeout, boot
             // continues immediately below regardless (see the RTC-status
             // handling and the unconditional WiFi/TNFS readiness further
@@ -4074,7 +4060,7 @@ void init_gemdrvemul(bool safe_config_reboot)
             }
             else
             {
-                // The ~3s
+                // The ~15s
                 // attempt above timed out (or an invalid/erroring NTP
                 // response never set get_rtc_time()->year) --
                 // GEMDRVEMUL_RTC_STATUS simply stays 0 (unchanged
@@ -6128,7 +6114,6 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_FOPEN_CALL:
         {
-            sidetnfs_mindiag_note_dispatch(SIDETNFS_MINDIAG_OP_FOPEN);
             uint16_t fopen_mode = payloadPtr[0]; // d3 register (low word)
 #if SIDETNFS_USE_TNFS_LISTING
             // The ROM's .Fopen (gemdrive.s)
@@ -6224,7 +6209,6 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_FCLOSE_CALL:
         {
-            sidetnfs_mindiag_note_dispatch(SIDETNFS_MINDIAG_OP_FCLOSE);
             uint16_t fclose_fd = payloadPtr[0]; // d3 register
             DPRINTF("Closing file with fd: %x\n", fclose_fd);
             gemdrive_backend_fclose(fclose_fd, memory_shared_address);
@@ -7849,7 +7833,6 @@ void init_gemdrvemul(bool safe_config_reboot)
 
         case GEMDRVEMUL_READ_BUFF_CALL:
         {
-            sidetnfs_mindiag_note_dispatch(SIDETNFS_MINDIAG_OP_FREAD);
             uint16_t readbuff_fd = payloadPtr[0];                                                      // d3 register
             payloadPtr += 2;                                                                           // Skip two words
             uint32_t readbuff_bytes_to_read = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];         // d4 register constains the number of bytes to read

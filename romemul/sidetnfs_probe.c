@@ -21,7 +21,6 @@
 #include "include/commands.h" // GEMDRVEMUL_*_CALL ids -- for COMMAND_ENTER name decode only
 #include "include/rtcemul.h"  // get_utc_offset_seconds() -- same local-time policy as NTP->RTC
 #include "include/sidetnfs_config.h" // sidetnfs_config_get_drive() -- source of the active server
-#include "include/sidetnfs_mindiag.h"
 
 // These used to be hardcoded compile-time constants. They are now
 // runtime state, loaded once at boot from the first usable (used, TNFS,
@@ -4803,7 +4802,7 @@ SidetnfsFileOpenResult sidetnfs_tnfs_file_create(int runtime_slot, const char *t
 // returns false, same as f_read() reporting FR_* failure regardless of
 // bytes already read internally by FatFS.
 bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime_slot, uint8_t *out_buf,
-                              uint16_t requested, uint16_t *out_actual, uint8_t *out_last_rc)
+                              uint16_t requested, uint16_t *out_actual)
 {
     s_state.tnfs_fread_calls++;
     s_state.debug_dirty = true;
@@ -4812,10 +4811,6 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
     if (!sidetnfs_probe_get_slot_context(runtime_slot, &ctx))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
-        if (out_last_rc != NULL)
-        {
-            *out_last_rc = 0xFFu;
-        }
         return false;
     }
 
@@ -4833,10 +4828,6 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
         if (!fslisting_send_read(&ctx, tnfs_handle, chunk, &seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
-            if (out_last_rc != NULL)
-            {
-                *out_last_rc = 0xFFu;
-            }
             return false;
         }
 #if SIDETNFS_DEBUG_FOCUS_FILE_IO
@@ -4846,10 +4837,6 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
         if (!fslisting_wait_for(TNFS_CMD_READ, seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
-            if (out_last_rc != NULL)
-            {
-                *out_last_rc = 0xFFu;
-            }
             return false;
         }
         uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
@@ -4879,10 +4866,6 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
         {
             s_fslisting_resp.response_ready = false;
             sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, rc, 0);
-            if (out_last_rc != NULL)
-            {
-                *out_last_rc = rc;
-            }
             return false;
         }
         if (actual > 0)
@@ -4911,10 +4894,6 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
     else
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_OK, guest_fd, NULL, NULL, NULL, tnfs_handle, total, 0, 0);
-    }
-    if (out_last_rc != NULL)
-    {
-        *out_last_rc = last_rc;
     }
     return true;
 }
@@ -6727,13 +6706,6 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
     sidetnfs_eventlog_dump_to_file(hd_folder);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     sidetnfs_snapshot_dump_to_file(hd_folder);
-#endif
-    // Independent of SIDETNFS_ENABLE_DIAG -- sidetnfs_mindiag_dump_to_file()
-    // is itself a no-op when SIDETNFS_ENABLE_MINDIAG is off, so this can be
-    // called unconditionally, including on top of an otherwise-plain
-    // Production build.
-    sidetnfs_mindiag_dump_to_file(hd_folder);
-#if SIDETNFS_DIAG_DUMP_ON_SELECT || SIDETNFS_ENABLE_MINDIAG
     // Visual confirmation the dump was written -- there is no serial
     // feedback on this hardware, so blink the Pico W's onboard LED twice
     // (0.5s on / 0.5s off each). Blocking sleep_ms() here is the same
