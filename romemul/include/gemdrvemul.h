@@ -15,6 +15,7 @@
 #include "sidetnfs_config.h"
 #include "sidetnfs_netconfig.h"
 #include "sidetnfs_rtcconfig.h"
+#include "sidetnfs_update_check.h" // SIDETNFS_UPDATE_VERSION_LEN -- see GEMDRVEMUL_SIDETNFS_UPDATE below
 #include "sidetnfs_probe.h" // SIDETNFS_NET_ERR_TEXT_MAX -- see FileDescriptors.net_err_text below
 #include "sidetnfs_sd_service.h" // SIDETNFS_SD_ERROR_TEXT_MAX -- see FileDescriptors.sd_error_text below
 
@@ -308,6 +309,27 @@ _Static_assert(SIDETNFS_RTC_NTP_SERVER_LEN % 2 == 0, "SIDETNFS_RTC_NTP_SERVER_LE
 _Static_assert(SIDETNFS_RTC_UTC_OFFSET_LEN % 2 == 0, "SIDETNFS_RTC_UTC_OFFSET_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET + SIDETNFS_RTC_UTC_OFFSET_LEN) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_RTC block must fit within the 64KB ROM3 window");
 _Static_assert((2 + SIDETNFS_RTC_NTP_SERVER_LEN + SIDETNFS_RTC_UTC_OFFSET_LEN) == 70, "SET_RTC_CONFIG request payload (enabled + ntp_server + utc_offset) must be exactly 70 bytes");
+
+// GEMDRVEMUL_SIDETNFS_CHECK_UPDATE (commands.h) response block --
+// read-only, no request payload. STATUS is one of
+// SIDETNFS_UPDATE_STATUS_UP_TO_DATE/AVAILABLE/ERROR
+// (sidetnfs_update_check.h); LATEST_VERSION is only meaningful when
+// STATUS is AVAILABLE or UP_TO_DATE (the version string actually read
+// from version.txt, e.g. "v1.0.2"), left as an empty string on ERROR.
+// INSTALLED_VERSION is always this build's own RELEASE_VERSION
+// (CMakeLists.txt, from version.txt at build time) -- included so the
+// caller can show "installed vs. latest" without a second command.
+#define GEMDRVEMUL_SIDETNFS_UPDATE SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_RTC_UTC_OFFSET + SIDETNFS_RTC_UTC_OFFSET_LEN)
+#define GEMDRVEMUL_SIDETNFS_UPDATE_STATUS (GEMDRVEMUL_SIDETNFS_UPDATE + 0)                          // uint32_t, swapped long
+#define GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION (GEMDRVEMUL_SIDETNFS_UPDATE_STATUS + 4)           // char[SIDETNFS_UPDATE_VERSION_LEN] (16)
+#define GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION (GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION + SIDETNFS_UPDATE_VERSION_LEN) // char[SIDETNFS_UPDATE_VERSION_LEN] (16)
+// Block ends at GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN (36 bytes total).
+
+_Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_STATUS % 4 == 0, "GEMDRVEMUL_SIDETNFS_UPDATE_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION % 2 == 0, "GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION % 2 == 0, "GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_UPDATE_VERSION_LEN % 2 == 0, "SIDETNFS_UPDATE_VERSION_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_UPDATE block must fit within the 64KB ROM3 window");
 
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00

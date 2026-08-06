@@ -4862,6 +4862,37 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_SIDETNFS_CHECK_UPDATE:
+        {
+            // Blocking, bounded by SIDETNFS_UPDATE_CHECK_TIMEOUT_MS --
+            // see sidetnfs_update_check.c. Request: none. Response:
+            // status + the version string actually read (empty on
+            // error).
+            char latest_version[SIDETNFS_UPDATE_VERSION_LEN];
+            uint32_t update_status = sidetnfs_update_check_run(latest_version, sizeof(latest_version));
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_UPDATE_STATUS, update_status);
+            // Pico->Atari string transfer: same byte-copy +
+            // CHANGE_ENDIANESS_BLOCK16 pattern the RTC/network blocks
+            // above use.
+            memset((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION), 0,
+                   SIDETNFS_UPDATE_VERSION_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION), latest_version,
+                   strnlen(latest_version, SIDETNFS_UPDATE_VERSION_LEN - 1));
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION,
+                                      SIDETNFS_UPDATE_VERSION_LEN);
+            // INSTALLED_VERSION: this build's own RELEASE_VERSION
+            // (compile-time string, CMakeLists.txt), so the caller can
+            // show "installed vs. latest" without a second command.
+            memset((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION), 0,
+                   SIDETNFS_UPDATE_VERSION_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION), RELEASE_VERSION,
+                   strnlen(RELEASE_VERSION, SIDETNFS_UPDATE_VERSION_LEN - 1));
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION,
+                                      SIDETNFS_UPDATE_VERSION_LEN);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
         case GEMDRVEMUL_DFREE_CALL:
         {
             // CMD_DFREE_CALL is a `send_sync ..., 2` call: the 68k side

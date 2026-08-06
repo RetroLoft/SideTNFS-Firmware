@@ -198,6 +198,20 @@
 // short fixed delay and watchdog_reboot() -- see gemdrvemul.c's handler.
 #define GEMDRVEMUL_REBOOT_PICO (APP_GEMDRVEMUL << 8 | 0x1B) // Reboot the Pico (ACK first, no SAVE)
 
+// Firmware-update version check. Subcommand 0x1C, re-verified free (see
+// GEMDRVEMUL_REBOOT_PICO's own comment above -- 0x1C-0x35 still free after
+// REBOOT_PICO took 0x1B). Fetches
+// https://raw.githubusercontent.com/RetroLoft/SideTNFS-Firmware/refs/heads/main/version.txt
+// (TLS, certificate verification intentionally off -- see
+// sidetnfs_update_check.c) and compares it against this firmware's own
+// RELEASE_VERSION. Blocking, bounded by
+// SIDETNFS_UPDATE_CHECK_TIMEOUT_MS -- DNS + TLS handshake + a tiny HTTP GET
+// all happen inside this one command, same "blocks the GEMDOS command loop
+// for its own bounded budget" contract the boot-time NTP wait already
+// uses. No request payload. Response: see GEMDRVEMUL_SIDETNFS_UPDATE_STATUS
+// in gemdrvemul.h.
+#define GEMDRVEMUL_SIDETNFS_CHECK_UPDATE (APP_GEMDRVEMUL << 8 | 0x1C) // Check github for a newer firmware version
+
 typedef struct
 {
     unsigned int value;
