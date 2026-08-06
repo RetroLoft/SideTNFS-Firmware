@@ -66,6 +66,8 @@ The latest firmware, documentation and configuration utility can always be found
 
 https://retroloft.net/sidetnfs
 
+[How to update the SideTNFS firmware](UPDATE.md)
+
 ---
 
 ## Community
