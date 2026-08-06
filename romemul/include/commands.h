@@ -200,12 +200,10 @@
 
 // Firmware-update version check. Subcommand 0x1C, re-verified free (see
 // GEMDRVEMUL_REBOOT_PICO's own comment above -- 0x1C-0x35 still free after
-// REBOOT_PICO took 0x1B). Fetches
-// https://raw.githubusercontent.com/RetroLoft/SideTNFS-Firmware/refs/heads/main/version.txt
-// (TLS, certificate verification intentionally off -- see
-// sidetnfs_update_check.c) and compares it against this firmware's own
-// RELEASE_VERSION. Blocking, bounded by
-// SIDETNFS_UPDATE_CHECK_TIMEOUT_MS -- DNS + TLS handshake + a tiny HTTP GET
+// REBOOT_PICO took 0x1B). Fetches http://retroloft.net/sidetnfs/version.txt
+// (plain HTTP -- see sidetnfs_update_check.c) and compares it against this
+// firmware's own RELEASE_VERSION. Blocking, bounded by
+// SIDETNFS_UPDATE_CHECK_TIMEOUT_MS -- DNS + TCP connect + a tiny HTTP GET
 // all happen inside this one command, same "blocks the GEMDOS command loop
 // for its own bounded budget" contract the boot-time NTP wait already
 // uses. No request payload. Response: see GEMDRVEMUL_SIDETNFS_UPDATE_STATUS

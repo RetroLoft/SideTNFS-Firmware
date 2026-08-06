@@ -2,9 +2,9 @@
  * File: sidetnfs_update_check.h
  * Description: Firmware-update version check, triggered on demand by
  * SIDETNFS.PRG (GEMDRVEMUL_SIDETNFS_CHECK_UPDATE, commands.h). Fetches
- * https://raw.githubusercontent.com/RetroLoft/SideTNFS-Firmware/refs/heads/main/version.txt
- * over TLS and compares it against this firmware's own RELEASE_VERSION
- * (baked in at build time from version.txt -- see CMakeLists.txt).
+ * http://retroloft.net/sidetnfs/version.txt over plain HTTP and compares
+ * it against this firmware's own RELEASE_VERSION (baked in at build time
+ * from version.txt -- see CMakeLists.txt).
  */
 #ifndef SIDETNFS_UPDATE_CHECK_H
 #define SIDETNFS_UPDATE_CHECK_H
@@ -22,7 +22,7 @@
 #define SIDETNFS_UPDATE_STATUS_AVAILABLE 1u
 #define SIDETNFS_UPDATE_STATUS_ERROR 2u
 
-// Runs the whole check synchronously: DNS resolve, TLS connect, HTTP GET,
+// Runs the whole check synchronously: DNS resolve, TCP connect, HTTP GET,
 // response parse, version compare -- bounded by
 // SIDETNFS_UPDATE_CHECK_TIMEOUT_MS total (sidetnfs_update_check.c), same
 // "blocks the caller for its own fixed budget" contract already used by

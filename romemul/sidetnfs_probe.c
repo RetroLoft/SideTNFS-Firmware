@@ -1256,6 +1256,22 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "FDATIME_SET_UNSUPPORTED";
     case SIDETNFS_DIAG_DFREE_SYNTHETIC:
         return "DFREE_SYNTHETIC";
+    case SIDETNFS_DIAG_UPDATE_START:
+        return "UPDATE_START";
+    case SIDETNFS_DIAG_UPDATE_DNS_FAIL:
+        return "UPDATE_DNS_FAIL";
+    case SIDETNFS_DIAG_UPDATE_CONNECT_FAIL:
+        return "UPDATE_CONNECT_FAIL";
+    case SIDETNFS_DIAG_UPDATE_TIMEOUT:
+        return "UPDATE_TIMEOUT";
+    case SIDETNFS_DIAG_UPDATE_NO_RESPONSE:
+        return "UPDATE_NO_RESPONSE";
+    case SIDETNFS_DIAG_UPDATE_HEADERS_INCOMPLETE:
+        return "UPDATE_HEADERS_INCOMPLETE";
+    case SIDETNFS_DIAG_UPDATE_EMPTY_VERSION:
+        return "UPDATE_EMPTY_VERSION";
+    case SIDETNFS_DIAG_UPDATE_RESULT:
+        return "UPDATE_RESULT";
     default:
         return "UNKNOWN";
     }

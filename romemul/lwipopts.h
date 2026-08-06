@@ -104,17 +104,14 @@
 // the floppy web UI that used them are gone, and pico_lwip_http is no
 // longer linked.
 
-// TLS client for the firmware-update version check
-// (sidetnfs_update_check.c) -- a single short-lived HTTPS GET to
-// raw.githubusercontent.com. LWIP_ALTCP wraps a plain tcp_pcb so the
-// existing tcp.c call sites elsewhere in this codebase are unaffected;
-// only sidetnfs_update_check.c ever asks for a TLS-backed altcp_pcb.
-// Certificate verification is deliberately off (ALTCP_MBEDTLS_AUTHMODE)
-// -- see sidetnfs_update_check.c's own doc comment for why -- so no root
-// CA certificate needs to be embedded/maintained in this firmware.
+// altcp for the firmware-update version check (sidetnfs_update_check.c)
+// -- a single short-lived plain HTTP GET to retroloft.net. LWIP_ALTCP
+// wraps a plain tcp_pcb (altcp_tcp_new_ip_type()) so the existing tcp.c
+// call sites elsewhere in this codebase are unaffected; only
+// sidetnfs_update_check.c ever asks for an altcp_pcb. No TLS backend --
+// version.txt is public, non-secret data, and the original SidecarT
+// firmware's own update check uses plain HTTP against its own domain
+// the same way (see sidetnfs_update_check.c's own doc comment).
 #define LWIP_ALTCP 1
-#define LWIP_ALTCP_TLS 1
-#define LWIP_ALTCP_TLS_MBEDTLS 1
-#define ALTCP_MBEDTLS_AUTHMODE MBEDTLS_SSL_VERIFY_NONE
 
 #endif /* __LWIPOPTS_H__ */

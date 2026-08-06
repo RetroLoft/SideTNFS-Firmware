@@ -1,23 +1,25 @@
 /**
  * File: sidetnfs_update_check.c
  * Description: See include/sidetnfs_update_check.h. Fetches version.txt
- * from the SideTNFS-Firmware GitHub repo over TLS and compares it against
- * this build's own RELEASE_VERSION.
+ * from retroloft.net over plain HTTP and compares it against this
+ * build's own RELEASE_VERSION.
  *
- * Certificate verification is intentionally OFF (ALTCP_MBEDTLS_AUTHMODE,
- * lwipopts.h). This connection only ever reads a short, public,
- * non-secret version string -- no credentials, no write, no code ever
- * executed from the response -- so the worst case of a spoofed response
- * is a wrong "update available"/"up to date" verdict, not a security
- * compromise. Skipping verification avoids embedding (and having to keep
- * current) a root CA certificate purely for this one low-stakes check.
+ * Plain HTTP, deliberately: version.txt is public, non-secret data -- no
+ * credentials, no write, no code ever executed from the response, so the
+ * worst case of a spoofed/tampered response is a wrong "update
+ * available"/"up to date" verdict, not a security compromise. This
+ * matches how the original (pre-fork) SidecarT firmware's own update
+ * check works (plain HTTP against its own domain,
+ * atarist.sidecartridge.com) rather than reinventing it with TLS.
  *
- * No TLS Server Name Indication (SNI) either: confirmed against the real
- * server that raw.githubusercontent.com's HTTP virtual-hosting is driven
- * entirely by the request's Host: header, not by SNI -- the connection
- * and response work identically with or without it, so the extra
- * complexity of reaching into lwIP's altcp_tls-internal mbedtls context
- * to set a hostname was not worth adding.
+ * An earlier version of this file used TLS against
+ * raw.githubusercontent.com (GitHub's own hosting requires HTTPS, see
+ * git history) -- real-hardware testing turned that into a fight against
+ * a real-world CDN's SNI/certificate-chain requirements for a check that
+ * never needed confidentiality or authentication in the first place.
+ * Hosting version.txt on a domain we control (retroloft.net) instead
+ * removes the TLS stack from this firmware entirely: no mbedTLS, no
+ * altcp_tls, no cert/SNI concerns.
  */
 #include "include/sidetnfs_update_check.h"
 
@@ -26,7 +28,7 @@
 #include <string.h>
 
 #include "lwip/altcp.h"
-#include "lwip/altcp_tls.h"
+#include "lwip/altcp_tcp.h"
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
 #include "pico/cyw43_arch.h"
@@ -34,15 +36,17 @@
 
 #include "include/debug.h"
 #include "include/network.h" // network_safe_poll()
+#include "include/sidetnfs_probe.h" // sidetnfs_diag_log() -- SD-based EVENTLOG.TXT trace, DPRINTF alone never reaches it
 
-#define SIDETNFS_UPDATE_CHECK_HOST "raw.githubusercontent.com"
-#define SIDETNFS_UPDATE_CHECK_PATH "/RetroLoft/SideTNFS-Firmware/refs/heads/main/version.txt"
-#define SIDETNFS_UPDATE_CHECK_PORT 443u
+#define SIDETNFS_UPDATE_CHECK_HOST "retroloft.net"
+#define SIDETNFS_UPDATE_CHECK_PATH "/sidetnfs/version.txt"
+#define SIDETNFS_UPDATE_CHECK_PORT 80u
 
-// Whole check (DNS + TLS handshake + HTTP GET + response) bounded to
-// this, in one shot -- there is no background retry, matching the same
-// "one bounded attempt, no generation mechanism" contract the boot-time
-// NTP wait already uses (gemdrvemul.c).
+// Whole check (DNS + TCP connect + HTTP GET + response) bounded to this,
+// in one shot -- there is no background retry, matching the same "one
+// bounded attempt, no generation mechanism" contract the boot-time NTP
+// wait already uses (gemdrvemul.c). Generous for plain HTTP (a TLS
+// handshake would have needed most of this budget on its own).
 #define SIDETNFS_UPDATE_CHECK_TIMEOUT_MS 15000u
 #define SIDETNFS_UPDATE_CHECK_POLL_STEP_US 1000u
 
@@ -60,6 +64,7 @@ typedef struct
     volatile bool request_sent;
     volatile bool closed;
     volatile bool error;
+    err_t last_err; // set by update_err_cb()/update_connected_cb() -- logged on the NO_RESPONSE path
 
     char resp[SIDETNFS_UPDATE_RESP_BUF_SIZE];
     uint16_t resp_len;
@@ -112,10 +117,10 @@ static err_t update_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, er
 
 static void update_err_cb(void *arg, err_t err)
 {
-    (void)err;
     sidetnfs_update_ctx_t *ctx = (sidetnfs_update_ctx_t *)arg;
     // lwIP has already freed the pcb by the time this fires -- nothing
     // else to clean up here, just record it.
+    ctx->last_err = err;
     ctx->error = true;
     ctx->closed = true;
 }
@@ -125,6 +130,7 @@ static err_t update_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err)
     sidetnfs_update_ctx_t *ctx = (sidetnfs_update_ctx_t *)arg;
     if (err != ERR_OK)
     {
+        ctx->last_err = err;
         ctx->error = true;
         ctx->closed = true;
         return ERR_OK;
@@ -238,6 +244,8 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
         out_latest_version[0] = '\0';
     }
 
+    sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_START, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+
     sidetnfs_update_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
 
@@ -258,6 +266,7 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
     else if (dns_err != ERR_INPROGRESS)
     {
         DPRINTF("Update check: DNS lookup failed synchronously (%d)\n", (int)dns_err);
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_DNS_FAIL, (uint32_t)dns_err, "sync", NULL, NULL, 0, 0, 0, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
     while (!ctx.dns_done && !time_reached(deadline))
@@ -268,32 +277,28 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
     if (!ctx.dns_ok)
     {
         DPRINTF("Update check: DNS lookup did not resolve\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_DNS_FAIL, 0, ctx.dns_done ? "no_addr" : "poll_timeout", NULL, NULL, 0, 0, 0, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
 
-    // --- TLS connect ---
-    struct altcp_tls_config *tls_config = altcp_tls_create_config_client(NULL, 0);
-    if (tls_config == NULL)
-    {
-        DPRINTF("Update check: could not create TLS client config\n");
-        return SIDETNFS_UPDATE_STATUS_ERROR;
-    }
-    struct altcp_pcb *pcb = altcp_tls_new(tls_config, IPADDR_TYPE_V4);
+    // --- TCP connect (plain HTTP, no TLS) ---
+    struct altcp_pcb *pcb = altcp_tcp_new_ip_type(IPADDR_TYPE_V4);
     if (pcb == NULL)
     {
-        DPRINTF("Update check: could not allocate TLS pcb\n");
-        altcp_tls_free_config(tls_config);
+        DPRINTF("Update check: could not allocate TCP pcb\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_CONNECT_FAIL, 0, "pcb_alloc", NULL, NULL, 0, 0, 0, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
     altcp_arg(pcb, &ctx);
     altcp_recv(pcb, update_recv_cb);
     altcp_err(pcb, update_err_cb);
 
-    if (altcp_connect(pcb, &ctx.dns_addr, SIDETNFS_UPDATE_CHECK_PORT, update_connected_cb) != ERR_OK)
+    err_t connect_err = altcp_connect(pcb, &ctx.dns_addr, SIDETNFS_UPDATE_CHECK_PORT, update_connected_cb);
+    if (connect_err != ERR_OK)
     {
         DPRINTF("Update check: altcp_connect() failed\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_CONNECT_FAIL, (uint32_t)connect_err, "connect", NULL, NULL, 0, 0, 0, 0);
         altcp_close(pcb);
-        altcp_tls_free_config(tls_config);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
 
@@ -308,16 +313,19 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
         // and report the check as failed (never partially, silently
         // "successful" on a timeout).
         DPRINTF("Update check: timed out waiting for a response\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_TIMEOUT, 0, ctx.request_sent ? "after_request" : "before_request",
+                           NULL, NULL, 0, 0, 0, 0);
         altcp_close(pcb);
-        altcp_tls_free_config(tls_config);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
     altcp_close(pcb);
-    altcp_tls_free_config(tls_config);
 
     if (ctx.error || !ctx.request_sent || ctx.resp_len == 0)
     {
         DPRINTF("Update check: connection closed with no usable response\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_NO_RESPONSE, (uint32_t)ctx.last_err,
+                           ctx.error ? "err_cb" : (!ctx.request_sent ? "no_request" : "empty_resp"),
+                           NULL, NULL, 0, ctx.resp_len, (uint8_t)ctx.error, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
 
@@ -331,6 +339,7 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
     if (body == NULL)
     {
         DPRINTF("Update check: response headers never completed\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_HEADERS_INCOMPLETE, 0, ctx.resp, NULL, NULL, 0, ctx.resp_len, 0, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
 
@@ -348,6 +357,7 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
     if (i == 0)
     {
         DPRINTF("Update check: empty version string in response\n");
+        sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_EMPTY_VERSION, 0, body, NULL, NULL, 0, 0, 0, 0);
         return SIDETNFS_UPDATE_STATUS_ERROR;
     }
 
@@ -359,9 +369,8 @@ uint32_t sidetnfs_update_check_run(char *out_latest_version, size_t out_size)
 
     DPRINTF("Update check: remote=%s local=%s\n", version, RELEASE_VERSION);
 
-    if (update_is_newer(version, RELEASE_VERSION))
-    {
-        return SIDETNFS_UPDATE_STATUS_AVAILABLE;
-    }
-    return SIDETNFS_UPDATE_STATUS_UP_TO_DATE;
+    uint32_t status = update_is_newer(version, RELEASE_VERSION) ? SIDETNFS_UPDATE_STATUS_AVAILABLE
+                                                                  : SIDETNFS_UPDATE_STATUS_UP_TO_DATE;
+    sidetnfs_diag_log(SIDETNFS_DIAG_UPDATE_RESULT, 0, version, NULL, RELEASE_VERSION, 0, 0, (uint8_t)status, 0);
+    return status;
 }

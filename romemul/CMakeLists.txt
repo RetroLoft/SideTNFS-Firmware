@@ -76,8 +76,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         hardware_dma             # for DMA
         pico_cyw43_arch_lwip_poll
         tinyusb_device           # for USB
-        pico_mbedtls             # TLS 1.2 client -- firmware-update version check (raw.githubusercontent.com)
-        pico_lwip_mbedtls        # lwIP's altcp_tls glue on top of pico_mbedtls
         )
 
 # Link custom memmap with reserved memory for ROMs

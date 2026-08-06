@@ -1422,6 +1422,21 @@ typedef enum
     // (see GEMDRVEMUL_DFREE_CALL in gemdrvemul.c). Logged once per call,
     // purely informational -- Dfree still always reports GEMDOS_EOK.
     SIDETNFS_DIAG_DFREE_SYNTHETIC,
+    // Firmware-update check (GEMDRVEMUL_SIDETNFS_CHECK_UPDATE, see
+    // sidetnfs_update_check.c) -- one entry per attempt, plus exactly one
+    // of the outcome events below marking where it stopped. `path` carries
+    // a short free-text detail (e.g. an error code) where useful; the
+    // final SIDETNFS_DIAG_UPDATE_RESULT logs the remote version in `path`,
+    // the local RELEASE_VERSION in `name`, and the resulting
+    // SIDETNFS_UPDATE_STATUS_* in `result`.
+    SIDETNFS_DIAG_UPDATE_START,
+    SIDETNFS_DIAG_UPDATE_DNS_FAIL,
+    SIDETNFS_DIAG_UPDATE_CONNECT_FAIL,
+    SIDETNFS_DIAG_UPDATE_TIMEOUT,
+    SIDETNFS_DIAG_UPDATE_NO_RESPONSE,
+    SIDETNFS_DIAG_UPDATE_HEADERS_INCOMPLETE,
+    SIDETNFS_DIAG_UPDATE_EMPTY_VERSION,
+    SIDETNFS_DIAG_UPDATE_RESULT,
 } SidetnfsDiagEventType;
 
 // SIDETNFS_DIAG_MAX_EVENTS itself is defined in debug.h.
