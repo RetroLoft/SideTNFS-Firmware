@@ -15,10 +15,10 @@
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 
-// Built-in default whenever flash is blank/corrupt/unknown-version.
-// Mirrors the hardcoded TNFS server sidetnfs_probe.c still uses to actually
-// connect this phase (SIDETNFS_SERVER_IP/PORT/MOUNT_NAME there) -- kept in
-// sync by hand for now. This module never changes the active runtime.
+// Built-in default whenever flash is blank/corrupt/unknown-version --
+// the public RetroLoft TNFS server, reachable from any Atari with
+// internet access (no local-network setup required out of the box).
+// This module never changes the active runtime.
 static const sidetnfs_drive_config_t SIDETNFS_DEFAULT_DRIVE = {
     .state = SIDETNFS_DRIVE_SLOT_ENABLED,
     .drive_letter = 'N',
@@ -26,9 +26,9 @@ static const sidetnfs_drive_config_t SIDETNFS_DEFAULT_DRIVE = {
     .transport = SIDETNFS_TRANSPORT_UDP,
     .port = 16384,
     .reserved0 = {0},
-    .nickname = "RetroLoft",
-    .host = "192.168.178.10",
-    .mount_path = "Atari.ST",
+    .nickname = "Retroloft TNFS",
+    .host = "retroloft.net",
+    .mount_path = "/ATARI.ST",
     .sd_path = {0},
 };
 

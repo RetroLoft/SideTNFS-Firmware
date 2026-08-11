@@ -196,7 +196,7 @@ typedef enum
 // record's own fields and letter-uniqueness against every other
 // DISABLED/ENABLED record AND against config_drive_letter). Falls back to
 // the built-in default (config drive 'S', one TNFS drive
-// 'N'/RetroLoft/192.168.178.10:16384/Atari.ST, ENABLED -- see
+// 'N'/Retroloft TNFS/retroloft.net:16384 UDP//ATARI.ST, ENABLED -- see
 // sidetnfs_config.c) on blank/erased flash or ANY validation failure;
 // never attempts to salvage individual records out of a block that failed
 // any check. Never writes to flash. Must be called before GEMDRVEMUL can
@@ -366,7 +366,7 @@ sidetnfs_config_status_t sidetnfs_config_factory_reset(void);
 // migration/fallback path -- this check never invokes migration at
 // all), is magic/version/CRC-valid AND byte-for-byte matches exactly
 // what sidetnfs_config_load_defaults() would produce (settings 'S',
-// slot 0 the factory N:/RetroLoft/.../ENABLED drive, slots 1-7 fully
+// slot 0 the factory N:/Retroloft TNFS/.../ENABLED drive, slots 1-7 fully
 // zeroed/EMPTY, drive_count 1). Read-only -- never mutates flash or
 // g_config. Used both to decide whether a recovery write is needed at
 // all (skip it if this is already true, so a repeated boot of a

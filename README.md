@@ -13,7 +13,7 @@ Just power on and access your files.
 ## Features
 
 - TNFS network storage
-- Multiple network drives
+- Up to eight independent network drives
 - Built-in read-only Settings Disk
 - Configuration utility running directly on the Atari ST
 - Read and write support
@@ -47,7 +47,29 @@ SideTNFS runs on the Raspberry Pi Pico W version of the Atari Sidecartridge proj
 
 The firmware always provides a built-in read-only **Settings Disk**.
 
-From this disk you can run **SIDETNFS.PRG** to configure your cartridge. Settings are stored inside the Pico's internal flash memory and remain available after power-off.
+From this disk you can run **SIDETNFS.PRG** to configure your cartridge — add, edit, disable, or remove network drives, change Wi-Fi settings, and more. Settings are stored inside the Pico's internal flash memory and remain available after power-off. Installing a firmware update never overwrites an existing, saved configuration.
+
+### Default Server
+
+Out of the box, drive **N:** is pre-configured to connect to a public **RetroLoft TNFS server**, meant for quick tests and demonstrations of SideTNFS — no setup required to get started.
+
+- The server is **read-only**: you can browse, open, and download files, but you cannot modify, upload, rename, or delete anything on it.
+- This default drive is just a starting point. From **SIDETNFS.PRG** you can change its server settings, disable it, or remove it entirely, and configure your own TNFS server(s) instead.
+
+### Factory Reset
+
+If your configuration ever becomes unreachable or you just want to start over, you can reset it back to the factory default at any time — no computer or SIDETNFS.PRG needed:
+
+1. Switch the Atari off, then on again, so the Pico goes through a fresh boot.
+2. Press and hold the **SELECT** button on the SideTNFS cartridge as the Atari powers back on, and keep holding it.
+3. The onboard LED lights up to confirm the reset is in progress.
+4. Keep holding SELECT for a full **10 seconds**. SideTNFS then rewrites its configuration back to the factory default (drive N: → the public RetroLoft TNFS server) and restarts on its own.
+
+Releasing SELECT before the 10 seconds are up cancels the reset — nothing is changed.
+
+### A Note on TNFS Security
+
+TNFS is a lightweight protocol and does not offer encryption. Don't use it to store or transfer confidential or sensitive data, whether on the public RetroLoft server or your own.
 
 ---
 
