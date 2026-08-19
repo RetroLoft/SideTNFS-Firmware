@@ -3818,7 +3818,19 @@ void init_gemdrvemul(bool safe_config_reboot)
         // completely unchanged.
         bool network_ready = false;
         bool wifi_cancelled = false;
-        for (uint32_t attempt = 1; attempt <= SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS && !network_ready && !wifi_cancelled; attempt++)
+        // No SSID configured (blank/factory-reset config) -- there is
+        // nothing to connect to, so skip the whole
+        // SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS x SIDETNFS_WIFI_CONNECT_ATTEMPT_TIMEOUT_MS
+        // wait entirely instead of burning up to 15s discovering the same
+        // thing network_init_with_settings() already knows immediately
+        // (its own `strlen(settings->ssid) == 0` check, whose return value
+        // this loop never used to look at). [NA] Not available -- boot
+        // continues offline right away, same as a real connect failure.
+        if (strlen(sys.ssid) == 0)
+        {
+            DPRINTF("No SSID configured. [NA] Not available -- skipping WiFi connect, booting offline.\n");
+        }
+        for (uint32_t attempt = 1; strlen(sys.ssid) > 0 && attempt <= SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS && !network_ready && !wifi_cancelled; attempt++)
         {
             if (attempt > 1)
             {
@@ -3892,6 +3904,16 @@ void init_gemdrvemul(bool safe_config_reboot)
             network_terminate();
             DPRINTF("WiFi connect failed after %d attempt(s). Booting offline.\n", SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS);
             sidetnfs_mark_network_skipped();
+            // GEMDRVEMUL_NETWORK_STATUS was left at 0x0 (GEMDRV_STATUS_BUSY,
+            // set at this function's own init above) the whole time --
+            // nothing ever told the 68k boot ROM's own
+            // _wait_for_network_stack poll loop (gemdrive.s) that this side
+            // had already given up, so it just counted down its full local
+            // NETWORK_WAIT_SEC (18s) regardless of how fast this loop
+            // above finished. 1 (GEMDRV_STATUS_FAILED, gemdrive.s) makes
+            // that loop's very next one-second poll exit immediately
+            // instead.
+            *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0x1;
         }
         else
         {
@@ -4109,6 +4131,14 @@ void init_gemdrvemul(bool safe_config_reboot)
         network_terminate();
         DPRINTF("No wifi configured. Skipping network initialization.\n");
         sidetnfs_mark_network_skipped();
+        // Same reasoning as the other GEMDRVEMUL_NETWORK_STATUS write
+        // above: this is the actual path taken when there is no SSID at
+        // all (the outer `if` above requires strlen(sys.ssid) > 0), so
+        // this is the one that matters for that case. Without it, the
+        // 68k boot ROM's _wait_for_network_stack loop (gemdrive.s) has
+        // no way to know WiFi was never even attempted and counts down
+        // its full local NETWORK_WAIT_SEC (18s) regardless.
+        *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0x1;
     }
 
     DPRINTF("Waiting for commands...\n");
@@ -4867,9 +4897,22 @@ void init_gemdrvemul(bool safe_config_reboot)
             // Blocking, bounded by SIDETNFS_UPDATE_CHECK_TIMEOUT_MS --
             // see sidetnfs_update_check.c. Request: none. Response:
             // status + the version string actually read (empty on
-            // error).
+            // error). With no WiFi connection at all (e.g. a blank/
+            // factory-reset config), sidetnfs_update_check_run()'s own
+            // DNS resolve would otherwise still be attempted and could
+            // take a while to fail -- checked here first so that case
+            // returns immediately as an error instead.
             char latest_version[SIDETNFS_UPDATE_VERSION_LEN];
-            uint32_t update_status = sidetnfs_update_check_run(latest_version, sizeof(latest_version));
+            uint32_t update_status;
+            if (get_network_connection_status() != CONNECTED_WIFI_IP)
+            {
+                latest_version[0] = '\0';
+                update_status = SIDETNFS_UPDATE_STATUS_ERROR;
+            }
+            else
+            {
+                update_status = sidetnfs_update_check_run(latest_version, sizeof(latest_version));
+            }
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_UPDATE_STATUS, update_status);
             // Pico->Atari string transfer: same byte-copy +
             // CHANGE_ENDIANESS_BLOCK16 pattern the RTC/network blocks

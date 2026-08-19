@@ -32,7 +32,13 @@
 // neither a valid flash block nor a usable legacy ConfigEntry value
 // exists.
 static const sidetnfs_system_settings_t SIDETNFS_SYSTEM_DEFAULT_SETTINGS = {
-    .auth_mode = 0,
+    // WPA2/AES (3), not Open (0): the vast majority of home networks use
+    // WPA2, and defaulting to Open on a blank config just means the
+    // first connection attempt is guaranteed to fail against a real
+    // router anyway. Matches AtariConfig's own netconfig_init_defaults()
+    // fallback (netconfig.c), which independently reached the same
+    // choice for its own "no firmware answer yet" default.
+    .auth_mode = 3,
     .use_dhcp = 1,
     .ssid = {0},
     .password = {0},
