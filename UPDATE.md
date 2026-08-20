@@ -14,19 +14,16 @@ This guide walks you through updating the firmware on your SideTNFS cartridge, s
 
 ## 1. Download the Latest Release
 
-Go to the official releases page:
+Go to the official downloads page:
 
-**https://github.com/RetroLoft/SideTNFS-Firmware/releases**
+**https://retroloft.net/sidetnfs**
 
-- The newest version is at the top of the page and marked **Latest**.
-- If the files aren't visible right away, click **Assets** to expand the list for that release.
 - Download only the normal Production firmware file for the Raspberry Pi Pico W:
 
   **`sidetnfs_production.uf2`**
 
 **Do not download:**
-- "Source code (zip)" or "Source code (tar.gz)" — these are for developers, not for flashing.
-- Any file with **debug**, **diagnostic**, **mindiag**, **test**, or a similar word in its name. These are development builds and are not meant for everyday use.
+- Any file with **debug** or a similar word in its name. These are development builds and are not meant for everyday use.
 
 ---
 
@@ -63,7 +60,7 @@ BOOTSEL mode makes the Pico appear as a plain USB drive so you can copy the new 
 4. Unplug the USB cable.
 5. With the Atari still switched **off**, plug SideTNFS back into the cartridge port.
 6. Switch the Atari **on**.
-7. Check the version number shown on the Atari's boot screen when SideTNFS starts, and compare it with the version you just downloaded (see the release notes on the releases page).
+7. Check the version number shown on the Atari's boot screen when SideTNFS starts, and compare it with the version you just downloaded (see the release notes on the downloads page).
 
 > If **RPI-RP2** disappears while you're still in the middle of copying the file, that's expected — it almost always just means the Pico has already restarted into the new firmware.
 
