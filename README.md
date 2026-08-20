@@ -13,7 +13,7 @@ Just power on and access your files.
 ## Features
 
 - TNFS network storage
-- Up to eight independent network drives
+- Up to eight independent network and/or microSD card drives
 - Built-in read-only Settings Disk
 - Configuration utility running directly on the Atari ST
 - Read and write support
