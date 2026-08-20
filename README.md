@@ -68,6 +68,18 @@ https://github.com/FujiNetWIFI/tnfsd
 
 It runs on Linux, macOS, and Windows, and only needs a folder on your computer to share — point it at that folder, start it, and then add it as a drive from **SIDETNFS.PRG** using your computer's IP address on your LAN. See that project's own documentation for installation and configuration details.
 
+### Adding an SD Card Drive
+
+Besides TNFS network drives, SideTNFS can also read and write directly from a **microSD card** inserted in the cartridge — handy if you'd rather not depend on the network for a particular drive, or just want a fast local drive alongside your TNFS drives.
+
+- **Formatting:** format the card as **FAT16**, **FAT32**, or **exFAT** — FAT32 offers the widest compatibility with older Atari software, exFAT is a good choice for very large cards. A regular quick format from Windows, macOS, or Linux is enough, no Atari-specific tools needed. Use a single-partition layout; multi-partition cards are not supported.
+- **Adding the drive:** from **SIDETNFS.PRG**, add a new drive and choose **SD** as its type instead of TNFS, pick a free drive letter, and enter the folder on the card that drive should point to (`/` for the whole card, or a subfolder such as `/games`). Save, then restart the Atari for the change to take effect, same as for TNFS drives.
+- **Speed and compatibility:** the SD card is read over SPI at a configurable speed (`SD_BAUD_RATE_KB` in SIDETNFS.PRG, 12.5 MHz by default). If a particular card gives read/write errors or feels unreliable, try a different value here. In general, a modern, reputable-brand microSDHC/microSDXC card works best — very old or unbranded cards are more likely to cause trouble.
+
+### A Note on TNFS Security
+
+TNFS is a lightweight protocol and does not offer encryption. Don't use it to store or transfer confidential or sensitive data, whether on the public RetroLoft server or your own.
+
 ### Factory Reset
 
 If your configuration ever becomes unreachable or you just want to start over, you can reset it back to the factory default at any time — no computer or SIDETNFS.PRG needed:
@@ -78,10 +90,6 @@ If your configuration ever becomes unreachable or you just want to start over, y
 4. Keep holding SELECT for a full **10 seconds**. SideTNFS then rewrites its configuration back to the factory default (drive N: → the public RetroLoft TNFS server) and restarts on its own.
 
 Releasing SELECT before the 10 seconds are up cancels the reset — nothing is changed.
-
-### A Note on TNFS Security
-
-TNFS is a lightweight protocol and does not offer encryption. Don't use it to store or transfer confidential or sensitive data, whether on the public RetroLoft server or your own.
 
 ---
 
