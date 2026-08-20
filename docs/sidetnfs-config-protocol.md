@@ -1,4 +1,4 @@
-# SIDETNFS config-protocol — contract (protocolversie 2, Fase 9C/9D)
+# SIDETNFS config-protocol — contract (protocolversie 3, Fase 9C/9D)
 
 Status: **persistente drivelijst, sinds Fase 9D actief voor de eerste
 TNFS-drive**. Eén verplichte configdrive (alleen een driveletter) plus
@@ -6,7 +6,7 @@ maximaal acht gewone drives (SD of TNFS) leven in RAM en kunnen via
 `GET_CONFIG_INFO`/`GET_DRIVE`/`SET_DRIVE`/`DELETE_DRIVE`/
 `SET_CONFIG_DRIVE` gelezen en gewijzigd worden; `SAVE_CONFIG` is het enige
 commando dat ooit naar flash schrijft. Sinds Fase 9D bepaalt de eerste
-gebruikte TNFS/UDP-drive uit deze lijst bij boot de daadwerkelijke actieve
+**ENABLED** TNFS/UDP-drive uit deze lijst bij boot de daadwerkelijke actieve
 server EN de GEMDRIVE-driveletter (zie "Bestaande runtime" hieronder) —
 wijzigingen via `SIDETNFS.PRG` worden pas actief na een herstart. Nog niet
 geïmplementeerd: echte gelijktijdige multi-drive-emulatie (nog steeds maar
@@ -14,6 +14,22 @@ geïmplementeerd: echte gelijktijdige multi-drive-emulatie (nog steeds maar
 
 Dit vervangt het Fase 9B2-model (max. 8 servers, geen configdrive) volledig
 — dat model is nooit gecommit.
+
+**Update (protocolversie 2 → 3):** elk gewoon drive-record had een
+binaire `used`-vlag (0/1). Die is vervangen door een drie-staten
+`state`-veld (`EMPTY`/`DISABLED`/`ENABLED`, zie Datamodel hieronder) —
+`DISABLED` is een nieuwe, echte mogelijkheid: een volledig geldig,
+opgeslagen record dat bewust niet als actieve GEMDOS-drive gepubliceerd
+wordt (bruikbaar om een drive te bewaren zonder hem actief te maken). De
+byte-layout van een record bleef ongewijzigd (nog steeds 192/1552 bytes);
+alleen het waardebereik van dat eerste veld veranderde, en juist dat is
+onzichtbaar in een pure byte-layout-diff — een oude `used=1` zou anders
+stilzwijgend teruggelezen worden als het nieuwe `state=1` (`DISABLED`), niet
+`ENABLED`. Vandaar de protocolversie-ophoging: een oude `SIDETNFS.PRG` (die
+nog `protocol_version == 2` verwacht) faalt nu expliciet en zichtbaar in
+plaats van stilzwijgend elke drive als disabled terug te schrijven. Flash
+met de oude versie 2 wordt bij boot automatisch gemigreerd (zie "Laden en
+valideren" hieronder) — geen dataverlies voor bestaande devices.
 
 ## Command-ID's
 
@@ -78,17 +94,38 @@ typedef enum {
     SIDETNFS_DRIVE_TNFS = 2
 } sidetnfs_drive_type_t;
 
+// Drie-staten model per gewone drive-slot (vervangt de oude binaire
+// `used`-vlag uit protocolversie 2). EMPTY betekent geen opgeslagen
+// configuratie (overige velden betekenisloos/nul). DISABLED betekent een
+// volledig geldig, opgeslagen record dat bewust niet als GEMDOS-drive
+// gepubliceerd wordt. ENABLED betekent een volledig geldig record dat
+// (uiteindelijk) wél gepubliceerd wordt. DISABLED en ENABLED tellen beide
+// mee als "geconfigureerd" — voor drive_count en voor
+// driveletter-uniciteitscontrole. Alleen ENABLED-drives komen in
+// aanmerking als actieve TNFS-server bij boot (zie "Bestaande runtime"
+// hieronder).
+typedef enum {
+    SIDETNFS_DRIVE_SLOT_EMPTY    = 0,
+    SIDETNFS_DRIVE_SLOT_DISABLED = 1,
+    SIDETNFS_DRIVE_SLOT_ENABLED  = 2
+} sidetnfs_drive_slot_state_t;
+
 typedef enum {
     SIDETNFS_TRANSPORT_UDP = 0,
     SIDETNFS_TRANSPORT_TCP = 1  // opgeslagen als toekomstige waarde; nog niet functioneel, UI kiest alleen UDP
 } sidetnfs_transport_t;
 
 #define SIDETNFS_CONFIG_MAGIC         0x53544446u  // "STDF"
-#define SIDETNFS_CONFIG_FLASH_VERSION 2u
+#define SIDETNFS_CONFIG_FLASH_VERSION 3u
 
+// Recordlayout ONGEWIJZIGD qua grootte/veldoffsets t.o.v. flashformaat
+// versie 2 — alleen naam en waardebereik van het eerste veld veranderden
+// (used: uint8_t 0/1 -> state: uint8_t 0/1/2). De migratie
+// (sidetnfs_config_migrate_v2_to_v3(), zie "Laden en valideren")
+// vertrouwt op deze byte-voor-byte compatibiliteit.
 typedef struct {
-    uint8_t  used;
-    uint8_t  drive_letter;   // uppercase ASCII, bv. 'N'
+    uint8_t  state;          // sidetnfs_drive_slot_state_t: 0=EMPTY/1=DISABLED/2=ENABLED
+    uint8_t  drive_letter;   // uppercase ASCII, bv. 'N' — betekenisloos als state == EMPTY
     uint8_t  type;
     uint8_t  transport;
     uint16_t port;
@@ -104,7 +141,7 @@ typedef struct {
     uint32_t magic;
     uint32_t version;
     uint8_t  config_drive_letter;
-    uint8_t  drive_count;   // aantal used-records in drives[]; sluit de configdrive uit
+    uint8_t  drive_count;   // aantal geconfigureerde (DISABLED+ENABLED) records in drives[]; sluit EMPTY en de configdrive uit
     uint8_t  reserved[2];
     sidetnfs_drive_config_t drives[8];
     uint32_t crc32;
@@ -134,14 +171,26 @@ Validatievolgorde (bij één ongeldige stap wordt het **hele** blok verworpen
 1. `magic == SIDETNFS_CONFIG_MAGIC` (`"STDF"`) — oude Fase 9B2 `"STNF"`-flash
    (nooit gecommit, maar mogelijk al eens geflashed tijdens ontwikkeling)
    faalt hier vanzelf en valt terug op de defaults hieronder.
-2. `version == SIDETNFS_CONFIG_FLASH_VERSION` (`2`)
+2. `version == SIDETNFS_CONFIG_FLASH_VERSION` (`3`). Een block met
+   `version == 2` wordt **niet** direct afgekeurd: het wordt eerst in RAM
+   gemigreerd (`sidetnfs_config_migrate_v2_to_v3()`) — de v2-CRC wordt
+   gecontroleerd, elk `used`-record wordt `state = ENABLED` (een
+   versie-2-config kende alleen "aan of niets", nooit "opgeslagen maar
+   uit"), `used == 0` wordt `state = EMPTY`; daarna doorloopt het
+   gemigreerde blok exact dezelfde validatiestappen 3–6 hieronder als een
+   native versie-3 blok. Faalt die v2-CRC-check, dan telt dat als een
+   gewone CRC-mismatch (stap 3). Elke andere versie dan 2 of 3 is
+   onherstelbaar onbekend en valt terug op de defaults hieronder
+   (`SIDETNFS_CONFIG_STATUS_UNSUPPORTED_VERSION`, zie Statuscodes).
 3. CRC32 over het hele blok exclusief het `crc32`-veld zelf
 4. `config_drive_letter` geldig (hoofdletter, niet A/B) en
    `drive_count <= SIDETNFS_MAX_DRIVES`
-5. Voor iedere `used`-record: geldig type, type-specifieke velden geldig
-   (zie Validatie hieronder), driveletter geldig en niet gelijk aan
-   `config_drive_letter`, en uniek t.o.v. alle andere `used`-records
-6. `drive_count` == het werkelijke aantal `used`-records
+5. Voor ieder record met `state == DISABLED` of `state == ENABLED`: geldig
+   type, type-specifieke velden geldig (zie Validatie hieronder),
+   driveletter geldig en niet gelijk aan `config_drive_letter`, en uniek
+   t.o.v. alle andere geconfigureerde (DISABLED/ENABLED) records
+6. `drive_count` == het werkelijke aantal geconfigureerde
+   (DISABLED+ENABLED) records
 
 Bij een ongeldige of lege flashsector wordt in RAM deze standaardconfig
 opgebouwd (nooit automatisch naar flash geschreven):
@@ -150,7 +199,7 @@ opgebouwd (nooit automatisch naar flash geschreven):
 config_drive_letter: 'S'
 drive_count: 1
 drives[0]:
-  used:         1
+  state:        ENABLED (2)
   drive_letter: 'N'
   type:         TNFS
   nickname:     "RetroLoft"
@@ -179,7 +228,7 @@ zie Fase 9B1-fix).
 
 | Veld | Offset-macro | Betekenis |
 |---|---|---|
-| protocolversie | `GEMDRVEMUL_SIDETNFS_CONFIG_VERSION` | vast op `2` |
+| protocolversie | `GEMDRVEMUL_SIDETNFS_CONFIG_VERSION` | vast op `3` |
 | max. gewone drives | `GEMDRVEMUL_SIDETNFS_CONFIG_MAX_DRIVES` | vast op `8` |
 | huidig aantal gewone drives | `GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT` | uit RAM-config |
 | configdriveletter | `GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER` | ASCII-code, uit RAM-config |
@@ -199,7 +248,7 @@ wordt gedeeld door `GET_DRIVE` (volledig) en door
 | Veld | Offset-macro | Grootte | Woordvolgorde |
 |---|---|---|---|
 | status | `GEMDRVEMUL_SIDETNFS_DRIVE_STATUS` | 4 bytes | `uint32_t`, `WRITE_AND_SWAP_LONGWORD` |
-| used | `GEMDRVEMUL_SIDETNFS_DRIVE_USED` | 2 bytes | `uint16_t`, `WRITE_WORD` (los woord, geen swap nodig) |
+| state | `GEMDRVEMUL_SIDETNFS_DRIVE_STATE` | 2 bytes | `uint16_t`, `WRITE_WORD` (0=EMPTY/1=DISABLED/2=ENABLED, los woord, geen swap nodig; hernoemd van `GEMDRVEMUL_SIDETNFS_DRIVE_USED` op dezelfde offset, zie protocolversie-noot hierboven) |
 | drive_letter | `GEMDRVEMUL_SIDETNFS_DRIVE_LETTER` | 2 bytes | `uint16_t`, `WRITE_WORD` (ASCII-code) |
 | type | `GEMDRVEMUL_SIDETNFS_DRIVE_TYPE` | 2 bytes | `uint16_t`, `WRITE_WORD` (0=leeg/ongeldig, 1=SD, 2=TNFS) |
 | transport | `GEMDRVEMUL_SIDETNFS_DRIVE_TRANSPORT` | 2 bytes | `uint16_t`, `WRITE_WORD` |
@@ -232,29 +281,38 @@ Request: één `uint32_t index` (0–7, alleen gewone drives — de configdrive
 heeft geen index, zie `GET_CONFIG_INFO`'s `config_drive_letter`).
 
 Response: het volledige blok hierboven. `INVALID_INDEX` als
-`index >= SIDETNFS_MAX_DRIVES`; `EMPTY_SLOT` als de slot niet `used` is
-(blok dan volledig op nul); anders `OK` met het record ingevuld.
+`index >= SIDETNFS_MAX_DRIVES`; anders altijd `OK` — ook voor een lege
+slot (`state == EMPTY`, blok dan volledig op nul). Een out-of-range index
+is de enige situatie die nog een niet-OK status oplevert; de aanroeper
+onderscheidt EMPTY/DISABLED/ENABLED zelf via het `state`-veld in het
+responseblok.
 
 ## `SET_DRIVE` (`0x040F`)
 
 Wijzigt uitsluitend de RAM-kopie — geen flashwrite.
 
 Requestpayload: `uint32_t index`, gevolgd door exact dezelfde veldvolgorde
-als `GET_DRIVE`'s response (zonder `status`): `used`, `drive_letter`,
+als `GET_DRIVE`'s response (zonder `status`): `state`, `drive_letter`,
 `type`, `transport`, `port` (elk één 16-bit woord), dan `nickname`/`host`/
 `mount_path`/`sd_path` (woord-voor-woord, zelfde
 `COPY_AND_CHANGE_ENDIANESS_BLOCK16`-conventie als
 `GEMDRVEMUL_FOPEN_CALL`/`DSETPATH_CALL` al gebruiken om Atari→Pico-strings
 te lezen — geen nieuw mechanisme).
 
-Gedrag:
+Gedrag (dispatcht op het gevraagde `state`):
 - `index >= SIDETNFS_MAX_DRIVES` → `INVALID_INDEX`.
-- `used == 0` → de slot wordt volledig gewist (equivalent aan
-  `DELETE_DRIVE` voor die index); geen type-specifieke veldvalidatie.
-- `used != 0` → volledige validatie (zie Validatie hieronder) plus
-  uniciteitscontrole van `drive_letter` tegen alle andere `used`-drives
-  én tegen de huidige configdriveletter; bij succes worden
-  niet-relevante velden voor het type op nul gezet vóór opslag in RAM.
+- `state == EMPTY` → de slot wordt volledig gewist (equivalent aan
+  `DELETE_DRIVE` voor die index); geen type-specifieke veldvalidatie, elk
+  ander veld in de payload wordt genegeerd.
+- `state == DISABLED` of `state == ENABLED` → exact dezelfde volledige
+  validatie voor beide (zie Validatie hieronder) plus uniciteitscontrole
+  van `drive_letter` tegen alle andere geconfigureerde
+  (DISABLED/ENABLED) drives én tegen de huidige configdriveletter; bij
+  succes worden niet-relevante velden voor het type op nul gezet vóór
+  opslag in RAM. Een `DISABLED`-drive vereist dus een even volledig
+  geldig record als een `ENABLED`-drive — hij moet later zonder opnieuw
+  invoeren weer `ENABLED` kunnen worden.
+- Elke andere `state`-waarde (buiten 0/1/2) → `INVALID_DRIVE_STATE`.
 
 Response: alleen `status` (`GEMDRVEMUL_SIDETNFS_DRIVE_STATUS`).
 
@@ -262,24 +320,28 @@ Response: alleen `status` (`GEMDRVEMUL_SIDETNFS_DRIVE_STATUS`).
 
 Request: `uint32_t index`. Wist het record volledig in RAM en herberekent
 `drive_count`. `INVALID_INDEX` als index buiten bereik, `EMPTY_SLOT` als de
-slot al niet `used` was. Kan de configdrive nooit raken — die heeft geen
-index in deze array. Response: alleen `status`.
+slot al `state == EMPTY` was. Kan de configdrive nooit raken — die heeft
+geen index in deze array. Response: alleen `status`.
 
 ## `SET_CONFIG_DRIVE` (`0x0411`)
 
 Request: `uint32_t new_config_drive_letter` (ASCII-code). Wijzigt
 uitsluitend `config_drive_letter` in RAM. Weigert A/B
-(`INVALID_DRIVE_LETTER`) en elke letter die al aan een `used` gewone drive
-toegewezen is (`DUPLICATE_DRIVE_LETTER`). Response: alleen `status`.
+(`INVALID_DRIVE_LETTER`) en elke letter die al aan een geconfigureerde
+(DISABLED of ENABLED) gewone drive toegewezen is
+(`DUPLICATE_DRIVE_LETTER`) — een DISABLED-drive reserveert zijn letter dus
+net zo goed als een ENABLED-drive. Response: alleen `status`.
 
 ## `SAVE_CONFIG` (`0x0412`)
 
 Request: geen. Het enige commando dat ooit flash aanraakt:
 
-1. herberekent `drive_count` uit de `used`-bitmap van de RAM-config;
+1. herberekent `drive_count` uit de geconfigureerde (DISABLED+ENABLED)
+   records van de RAM-config;
 2. valideert de volledige RAM-config (configdriveletter, ieder
-   `used`-record, volledige letter-uniciteit) — bij een fout wordt er
-   niets gewist of geschreven, en de validatiefoutcode wordt teruggegeven;
+   geconfigureerd record, volledige letter-uniciteit) — bij een fout
+   wordt er niets gewist of geschreven, en de validatiefoutcode wordt
+   teruggegeven;
 3. bouwt een schone kopie: `reserved`-bytes op nul, ongebruikte records
    volledig op nul, niet-relevante velden per type op nul, strings
    NUL-getermineerd;
@@ -305,10 +367,10 @@ alleen `status`.
 ## Validatie (details)
 
 - `config_drive_letter`/elke `drive_letter`: hoofdletter A–Z, nooit `A`/`B`.
-- Elke `used` gewone drive heeft een unieke letter, en gebruikt nooit de
-  configdriveletter.
+- Elke geconfigureerde (DISABLED of ENABLED) gewone drive heeft een unieke
+  letter, en gebruikt nooit de configdriveletter.
 - `drive_count` moet (na herberekening bij `SAVE_CONFIG`) gelijk zijn aan
-  het werkelijke aantal `used`-records.
+  het werkelijke aantal geconfigureerde (DISABLED+ENABLED) records.
 - Onbekend `type` (niet SD, niet TNFS) → `INVALID_TYPE`.
 - TNFS: `transport` moet UDP of TCP zijn (`INVALID_TRANSPORT`), `port != 0`
   (`INVALID_PORT`), `host` niet leeg (`INVALID_HOST`), `mount_path` niet
@@ -337,7 +399,8 @@ alleen `status`.
 | 11 | `SIDETNFS_CONFIG_STATUS_TOO_MANY_DRIVES` (via `SET_DRIVE` structureel onbereikbaar — index is altijd 0–7 in de vaste 8-slot array; gedefinieerd voor volledigheid en een eventueel toekomstig bulk-commando) |
 | 12 | `SIDETNFS_CONFIG_STATUS_FLASH_WRITE_FAILED` |
 | 13 | `SIDETNFS_CONFIG_STATUS_CRC_MISMATCH` |
-| 14 | `SIDETNFS_CONFIG_STATUS_UNSUPPORTED_VERSION` (gereserveerd; deze fase heeft nog geen los pad dat dit teruggeeft — `GET_CONFIG_INFO` meldt altijd versie 2) |
+| 14 | `SIDETNFS_CONFIG_STATUS_UNSUPPORTED_VERSION` (intern gebruikt als terugvalreden in `sidetnfs_config_init()` voor een flashversie die noch de huidige (`3`) noch de ene oudere migreerbare versie (`2`) is; wordt niet teruggegeven als `status`-veld door een van de vijf commando's hierboven, dus niet zichtbaar op de wire) |
+| 15 | `SIDETNFS_CONFIG_STATUS_INVALID_DRIVE_STATE` (toegevoegd bij protocolversie 3: `SET_DRIVE`'s `state`-veld buiten het geldige 0/1/2-bereik) |
 
 ## Random-token-handshake
 
@@ -354,12 +417,18 @@ De daadwerkelijke TNFS-client (`sidetnfs_probe.c`) gebruikt niet langer
 hardcoded compile-time constanten. Bij boot roept `main.c` (na
 `sidetnfs_config_init()`, vóór `init_gemdrvemul()`) éénmalig
 `sidetnfs_probe_load_active_server()` aan: deze doorloopt de RAM-drivelijst
-(index 0..`SIDETNFS_MAX_DRIVES-1`) en neemt de **eerste** `used`-record met
-`type == SIDETNFS_DRIVE_TNFS` én `transport == SIDETNFS_TRANSPORT_UDP` over
-als actieve server (`host`, `port`, `mount_path`, `drive_letter`). TCP-drives
-worden overgeslagen (TCP blijft expliciet niet-ondersteund) — het scannen
-gaat door naar de volgende gebruikte drive. Bij lege/ongeldige config of
-alleen SD/TCP-drives blijft de actieve server "niet geconfigureerd": elke
+(index 0..`SIDETNFS_MAX_DRIVES-1`) en neemt de **eerste** record met
+`state == ENABLED`, `type == SIDETNFS_DRIVE_TNFS` én
+`transport == SIDETNFS_TRANSPORT_UDP` over als actieve server (`host`,
+`port`, `mount_path`, `drive_letter`). Een `DISABLED`-drive wordt hier
+expliciet overgeslagen, ook al bevat hij een volledig geldig TNFS-record —
+alleen `ENABLED` telt mee (elke bestaande, gemigreerde configuratie van
+vóór protocolversie 3 kende alleen EMPTY/ENABLED-records, dus dit is een
+no-op voor iedere config die al bestond). TCP-drives worden ook
+overgeslagen (TCP blijft expliciet niet-ondersteund) — het scannen gaat
+door naar de volgende geconfigureerde drive. Bij lege/ongeldige config of
+alleen SD/TCP/DISABLED-drives blijft de actieve server "niet
+geconfigureerd": elke
 netwerkaanroep in `sidetnfs_probe.c` heeft al een bestaande
 `if (!ipaddr_aton(...))`-controle die dan gewoon zijn bestaande, veilige
 faalpad neemt (`ipaddr_aton("")` faalt altijd) — geen extra guards nodig,
@@ -466,7 +535,7 @@ stringvelden gebruiken byte-kopie + `CHANGE_ENDIANESS_BLOCK16` in-place
 stringvelden gebruiken `COPY_AND_CHANGE_ENDIANESS_BLOCK16` (zelfde patroon
 als `SET_DRIVE`/`GEMDRVEMUL_FOPEN_CALL`/`DSETPATH_CALL`). `auth_mode`/
 `use_dhcp` zijn gewone 16-bit woorden (`WRITE_WORD`/`GET_PAYLOAD_PARAM16`,
-geen swap) — zelfde conventie als de drive-record-velden `used`/
+geen swap) — zelfde conventie als de drive-record-velden `state`/
 `drive_letter`/`type`/`transport`/`port`.
 
 ## `GET_NETWORK_CONFIG` (`0x0413`)
@@ -634,5 +703,17 @@ kleine-letters/ongeldige landcodes, DHCP aan met lege statische adressen,
 DHCP uit met geldige en ongeldige IPv4-velden, string-endianness met
 oneven tekstlengtes (rechtstreeks tegen `CHANGE_ENDIANESS_BLOCK16`), een
 mislukte `SET` die de staging-copy intact laat, de 256-byte-uitlijning van
-de programmalengte, en een negen-velden-readbackvergelijking. 51/51
-checks slagen.
+de programmalengte, en een negen-velden-readbackvergelijking. Stond op
+51/51 slagend toen dit geschreven werd.
+
+**Status (2026-08-20): compileert momenteel niet.** Sinds
+`sidetnfs_netconfig.c` is gaan doorverwijzen naar de losstaande
+`sidetnfs_system_config`-module (`sidetnfs_system_config_get/set/save()`,
+zie boven) moet de échte `sidetnfs_system_config.c` mee gelinkt worden;
+die vereist zelf `hardware/flash.h`/`hardware/sync.h`-hoststubs die een
+fake-flashbuffer simuleren op offset `SIDETNFS_SYSTEM_CONFIG_FLASH_OFFSET`
+(`0x101000`), terwijl deze sandbox een eigen, kleinere 8KB fake-flash op
+offset 0 gebruikt (`sandbox/include/config.h`). Bewust nog niet opgelost —
+vereist nieuwe stub-infrastructuur en zorgvuldig kloppende buffergroottes/
+offsets, niet zomaar een ontbrekende symlink zoals bij
+`tests/host_configdrive/` (dat wél weer draait, 67/67).
