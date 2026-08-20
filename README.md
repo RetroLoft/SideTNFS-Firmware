@@ -56,6 +56,18 @@ Out of the box, drive **N:** is pre-configured to connect to a public **RetroLof
 - The server is **read-only**: you can browse, open, and download files, but you cannot modify, upload, rename, or delete anything on it.
 - This default drive is just a starting point. From **SIDETNFS.PRG** you can change its server settings, disable it, or remove it entirely, and configure your own TNFS server(s) instead.
 
+### Running Your Own TNFS Server
+
+**TNFS** (Trivial Network File System) is a lightweight network filesystem protocol built for retro computers — simple enough to run comfortably over a modest network link, and easy to implement on both server and client. It's what lets SideTNFS treat a folder on a machine elsewhere on your network as if it were a local Atari drive.
+
+Running your own TNFS server on your LAN is the recommended way to use SideTNFS day-to-day: unlike the read-only public demo server, your own server gives you full **read and write** access, so you can save files, copy programs over, and work with your Atari the same way you would with any other network drive.
+
+A popular, actively maintained TNFS server implementation is **tnfsd**, part of the [FujiNet](https://github.com/FujiNetWIFI) project:
+
+https://github.com/FujiNetWIFI/tnfsd
+
+It runs on Linux, macOS, and Windows, and only needs a folder on your computer to share — point it at that folder, start it, and then add it as a drive from **SIDETNFS.PRG** using your computer's IP address on your LAN. See that project's own documentation for installation and configuration details.
+
 ### Factory Reset
 
 If your configuration ever becomes unreachable or you just want to start over, you can reset it back to the factory default at any time — no computer or SIDETNFS.PRG needed:
