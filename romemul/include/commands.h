@@ -5,15 +5,11 @@
 // - The most significant byte is the application code. All the commands of an app should have the same code
 // - The least significant byte is the command code. Each command of an app should have a different code
 #define APP_CONFIGURATOR 0x00 // The configurator app
-#define APP_ROMEMUL 0x01      // The ROM emulator app. Should not have any command
 #define APP_FLOPPYEMUL 0x02   // The floppy emulator app
 #define APP_RTCEMUL 0x03      // The RTC emulator app
 #define APP_GEMDRVEMUL 0x04   // The GEMDRIVE app.
 
 // APP_CONFIGURATOR commands
-#define DOWNLOAD_ROM 0          // Download a ROM from the URL
-#define LOAD_ROM 1              // Load a ROM from the SD card
-#define LIST_ROMS 2             // List the ROMs in the SD card
 #define GET_CONFIG 3            // Get the configuration of the device
 #define PUT_CONFIG_STRING 4     // Put a configuration string parameter in the device
 #define PUT_CONFIG_INTEGER 5    // Put a configuration integer parameter in the device
@@ -25,7 +21,6 @@
 #define CONNECT_NETWORK 11      // Connect to a network. Needs the SSID, password and auth method
 #define GET_IP_DATA 12          // Get the IP, mask and gateway of the device
 #define DISCONNECT_NETWORK 13   // Disconnect from the network
-#define GET_ROMS_JSON_FILE 14   // Download the JSON file of ROMs from the URL
 #define LOAD_FLOPPY_RO 15       // Load a floppy image from the SD card in read-only mode
 #define LIST_FLOPPIES 16        // List the floppy images in the SD card
 #define LOAD_FLOPPY_RW 17       // Load a floppy image from the SD card in read-write mode
@@ -38,9 +33,6 @@
 #define CLEAN_START 24          // Start the configurator when the app starts
 #define BOOT_GEMDRIVE 25        // Boot the GEMDRIVE emulator
 #define REBOOT 26               // Reboot the device
-
-// APP_ROMEMUL commands
-// No commands
 
 // APP_FLOPPYEMUL commands
 #define FLOPPYEMUL_SAVE_VECTORS (APP_FLOPPYEMUL << 8 | 0)      // Save the vectors of the floppy emulator

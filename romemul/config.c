@@ -2,6 +2,17 @@
 
 // We should define ALWAYS the default entries with valid values.
 // DONT FORGET TO CHANGE MAX_ENTRIES if the number of value changes!
+//
+// PARAM_DELAY_ROM_EMULATION and PARAM_ROMS_CSV_URL/PARAM_ROMS_FOLDER/
+// PARAM_ROMS_YAML_URL below are inert leftovers from the removed
+// ROM-cartridge-catalog feature (never read by anything). They're kept
+// as placeholders rather than deleted for the same reason as
+// PARAM_LASTEST_RELEASE_URL: load_all_entries()'s flash-read loop is
+// bounded by MAX_ENTRIES, so shrinking this array would stop that loop
+// short of entries that come after these in the list on a device's
+// already-flashed (longer) config -- e.g. every PARAM_WIFI_* entry,
+// which sits at the end of this array -- silently resetting them to
+// defaults on the next firmware update.
 static ConfigEntry defaultEntries[MAX_ENTRIES] = {
     {PARAM_BOOT_FEATURE, TYPE_STRING, "CONFIGURATOR"},
     {PARAM_CONFIGURATOR_DARK, TYPE_BOOL, "false"},

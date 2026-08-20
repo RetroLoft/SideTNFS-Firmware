@@ -36,6 +36,11 @@
 
 #define PARAM_BOOT_FEATURE "BOOT_FEATURE"
 #define PARAM_CONFIGURATOR_DARK "CONFIGURATOR_DARK"
+// Inert leftover from the removed ROM-cartridge-catalog feature. Never
+// read. Kept only as a placeholder -- removing it would change MAX_ENTRIES
+// and the legacy ConfigEntry flash layout, which risks existing devices
+// losing entries stored past the new, shorter array bound on their next
+// firmware update (see the matching comment on defaultEntries[] in config.c).
 #define PARAM_DELAY_ROM_EMULATION "DELAY_ROM_EMULATION"
 #define PARAM_DOWNLOAD_TIMEOUT_SEC "DOWNLOAD_TIMEOUT_SEC"
 #define PARAM_FILE_COUNT_ENABLED "FILE_COUNT_ENABLED"
@@ -58,6 +63,9 @@
 #define PARAM_LASTEST_RELEASE_URL "LASTEST_RELEASE_URL"
 #define PARAM_MENU_REFRESH_SEC "MENU_REFRESH_SEC"
 #define PARAM_NETWORK_STATUS_SEC "NETWORK_STATUS_SEC"
+// Inert leftovers from the removed ROM-cartridge-catalog feature (the old
+// roms.sidecartridge.com service). Never read. See PARAM_DELAY_ROM_EMULATION's
+// comment above for why these placeholders are kept rather than deleted.
 #define PARAM_ROMS_CSV_URL "ROMS_CSV_URL"
 #define PARAM_ROMS_FOLDER "ROMS_FOLDER"
 #define PARAM_ROMS_YAML_URL "ROMS_YAML_URL"

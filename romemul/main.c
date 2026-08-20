@@ -271,7 +271,7 @@ int main()
     setvbuf(stdout, NULL, _IONBF, 1); // specify that the stream should be unbuffered
 #endif
     // Only startup information to display
-    DPRINTF("\n\nSidecart ROM emulator. %s (%s). %s mode.\n\n", RELEASE_VERSION, RELEASE_DATE, _DEBUG ? "DEBUG" : "RELEASE");
+    DPRINTF("\n\nSideTNFS GEMDRIVE emulator. %s (%s). %s mode.\n\n", RELEASE_VERSION, RELEASE_DATE, _DEBUG ? "DEBUG" : "RELEASE");
 
 #if _DEBUG
     // Show information about the frequency and voltage

@@ -77,7 +77,6 @@ TNFS is a lightweight protocol and does not offer encryption. Don't use it to st
 
 - Floppy drive emulation
 - Advanced real-time clock (RTC) with automatic network time synchronization and time zone support
-- Optional ROM support if there is sufficient community interest
 - Falcon support where technically possible
 
 ---
