@@ -1,5 +1,7 @@
 # SideTNFS
 
+<img src="https://retroloft.net/images/sidetnfs/hero-sidetnfs.jpg" alt="SideTNFS" width="600">
+
 Modern network storage for the Atari ST.
 
 SideTNFS transforms the Raspberry Pi Pico W Sidecartridge into a network-enabled hard disk for the Atari ST family. Instead of relying on SD cards, your Atari can access files directly from a TNFS server over your local network.
