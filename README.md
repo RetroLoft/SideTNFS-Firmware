@@ -103,7 +103,7 @@ https://github.com/RetroLoft
 
 Discord
 
-https://discord.gg/yuuE9wbt6E
+https://discord.gg/SaSaAdxfKe
 
 Bug reports, ideas and feature requests are always welcome.
 
