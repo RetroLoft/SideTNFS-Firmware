@@ -1724,6 +1724,21 @@ typedef struct
 
 static SidetnfsFsListingResponse s_fslisting_resp = {0};
 
+// Expected source of the currently-outstanding fs-listing request's
+// response -- set by fslisting_wait_for() (from the same ctx its caller
+// just used to send the request) immediately before it starts polling.
+// tnfs_fslisting_recv_callback() rejects any packet that doesn't match
+// all three before ever treating it as a candidate response, closing off
+// stray packets from an unrelated source or a since-replaced session
+// (e.g. after an Atari reset re-mounts this slot with a new session id).
+// This alone does NOT close the 8-bit seq wraparound gap within one
+// still-active session, since address/port/session id all stay constant
+// for the whole session -- see fslisting_wait_for()'s own comment for
+// the mechanism that closes that specific gap.
+static ip_addr_t s_fslisting_expected_addr;
+static u16_t s_fslisting_expected_port;
+static uint16_t s_fslisting_expected_sid;
+
 // True for exactly the duration of an active
 // fslisting_wait_for() call -- see that function and
 // tnfs_fslisting_recv_callback() below. Root cause: every
@@ -3355,8 +3370,6 @@ static void tnfs_fslisting_recv_callback(void *arg, struct udp_pcb *pcb, struct 
 {
     (void)arg;
     (void)pcb;
-    (void)addr;
-    (void)port;
     if (!p)
     {
         return;
@@ -3369,6 +3382,28 @@ static void tnfs_fslisting_recv_callback(void *arg, struct udp_pcb *pcb, struct 
     // a future, unrelated request that happens to reuse the same 8-bit
     // seq value (see s_fslisting_waiting's own comment above).
     if (!s_fslisting_waiting)
+    {
+        pbuf_free(p);
+        return;
+    }
+
+    // Reject anything not from the exact server/session the currently
+    // outstanding request was sent to before it's ever stored as a
+    // candidate match -- see s_fslisting_expected_addr's own comment.
+    if (addr == NULL || addr->addr != s_fslisting_expected_addr.addr || port != s_fslisting_expected_port)
+    {
+        pbuf_free(p);
+        return;
+    }
+    if (p->tot_len < 2)
+    {
+        pbuf_free(p);
+        return;
+    }
+    uint8_t sid_bytes[2];
+    pbuf_copy_partial(p, sid_bytes, 2, 0);
+    uint16_t resp_sid = (uint16_t)sid_bytes[0] | ((uint16_t)sid_bytes[1] << 8);
+    if (resp_sid != s_fslisting_expected_sid)
     {
         pbuf_free(p);
         return;
@@ -4246,8 +4281,20 @@ bool sidetnfs_tnfs_dta_search_snapshot(int index, uint32_t *out_ndta, int *out_r
 // callback instead of lingering to be misattributed to a future,
 // unrelated request with a reused seq value. Set back to false on every
 // return path.
-static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
+static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t expect_cmd, uint8_t expect_seq)
 {
+    // Record who this specific response must come from before the
+    // first poll -- tnfs_fslisting_recv_callback() rejects anything else
+    // outright. If we can't even resolve the expected address, we can't
+    // safely validate a response either, so fail closed immediately
+    // rather than polling with a stale/empty expectation.
+    if (!ctx_server_ip(ctx, &s_fslisting_expected_addr))
+    {
+        return false;
+    }
+    s_fslisting_expected_port = ctx->port;
+    s_fslisting_expected_sid = ctx->session_id;
+
     s_fslisting_waiting = true;
     for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
     {
@@ -4263,8 +4310,43 @@ static bool fslisting_wait_for(uint8_t expect_cmd, uint8_t expect_seq)
         }
         sleep_us(SIDETNFS_FS_WAIT_STEP_US);
     }
+
+    // TIMEOUT for (expect_cmd, expect_seq). Its response may still be
+    // genuinely in flight, just later than this bounded wait allows --
+    // and s_readdirx_seq will eventually wrap back around to expect_seq
+    // again (every SIDETNFS_TNFS_READ_CHUNK_MAX-sized-round-trip's worth
+    // of requests later, e.g. ~256 rounds into a large file read). cmd+seq
+    // alone can't tell that later, unrelated request's response apart
+    // from this one's straggler if it arrives during that later request's
+    // own wait_for() call -- silently splicing stale bytes into whatever
+    // is being read then (SideTNFS v1.0.3's silent-corruption bug: a
+    // large .PRG loaded over TNFS occasionally executing garbage and
+    // hitting an illegal instruction, traced to exactly this gap). The
+    // addr/port/session-id check above doesn't close this either, since
+    // all three stay constant for the life of one session.
+    //
+    // Closing it deterministically, without any TNFS wire/protocol
+    // change: keep "waiting" for one more full window, unconditionally
+    // discarding anything that arrives (never matching, since this
+    // request has already been given up on). This drains a genuine
+    // straggler for THIS (expect_cmd, expect_seq) pair here, under its
+    // own identity, before returning control to the caller -- so by the
+    // time s_readdirx_seq wraps back around to expect_seq, this pair's
+    // previous use is guaranteed fully resolved (matched or drained) and
+    // can never again produce a stray match. Same bounded-margin
+    // reasoning as TCP's own TIME_WAIT before a 4-tuple/sequence range is
+    // reused -- not a proof against unbounded network delay, but the
+    // standard, deterministic way to bound reuse safety for a fixed-width
+    // wire sequence field. Costs latency only on this already-failing
+    // path; every successful read is completely unaffected.
+    for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
+    {
+        cyw43_arch_poll();
+        s_fslisting_resp.response_ready = false; // drain: never a match, always discard
+        sleep_us(SIDETNFS_FS_WAIT_STEP_US);
+    }
     s_fslisting_waiting = false;
-    return false; // bounded-wait timeout
+    return false; // bounded-wait timeout, straggler-drain complete
 }
 
 // /6D: send CLOSEDIR for dir_handle and wait (bounded -- same
@@ -4298,7 +4380,7 @@ static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle, int runtime_slo
         return;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_CLOSEDIR, ndta, NULL, NULL, NULL, 0, dir_handle, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_CLOSEDIR, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_CLOSEDIR, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_CLOSEDIR_TIMEOUT, ndta, NULL, NULL, NULL, 0, dir_handle, 0, 0);
         return;
@@ -4351,7 +4433,7 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_READDIRX_ONE, search->ndta, search->path, NULL, NULL, (uint16_t)round, 0,
                            0, 0);
 #endif
-        if (!fslisting_wait_for(TNFS_CMD_READDIRX, seq))
+        if (!fslisting_wait_for(&ctx, TNFS_CMD_READDIRX, seq))
         {
             return SIDETNFS_DIR_SEARCH_ERROR;
         }
@@ -4448,7 +4530,7 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const c
 #if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
     sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_OPENDIRX, ndta, path, pattern, NULL, 0, 0, 0, attribs);
 #endif
-    if (!fslisting_wait_for(TNFS_CMD_OPENDIRX, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_OPENDIRX, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_OPENDIRX_ERROR, ndta, path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_DIR_SEARCH_ERROR;
@@ -4620,7 +4702,7 @@ bool sidetnfs_tnfs_dta_close_by_path(int runtime_slot, const char *tnfs_path, ui
             }
             sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_CLOSE, slot->ndta, tnfs_path, NULL, NULL, 0,
                                slot->dir_handle, 0, 0);
-            if (!fslisting_wait_for(TNFS_CMD_CLOSEDIR, seq))
+            if (!fslisting_wait_for(&ddelete_close_ctx, TNFS_CMD_CLOSEDIR, seq))
             {
                 sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_DTA_CLOSE_RC, slot->ndta, tnfs_path, NULL, NULL, 0,
                                    slot->dir_handle, 0xFFu, 0);
@@ -4728,7 +4810,7 @@ static SidetnfsFileOpenResult tnfs_open_with_flags(int runtime_slot, const char 
         return SIDETNFS_FILE_OPEN_ERROR;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_OPEN, 0, tnfs_path, NULL, NULL, 0, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_OPEN, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_OPEN, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
@@ -4850,7 +4932,7 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
         sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_READ, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0,
                            (uint8_t)round);
 #endif
-        if (!fslisting_wait_for(TNFS_CMD_READ, seq))
+        if (!fslisting_wait_for(&ctx, TNFS_CMD_READ, seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk, 0xFFu, 0);
             return false;
@@ -4974,7 +5056,7 @@ bool sidetnfs_tnfs_file_write(uint32_t guest_fd, uint8_t tnfs_handle, int runtim
             }
             return false;
         }
-        if (!fslisting_wait_for(TNFS_CMD_WRITE, seq))
+        if (!fslisting_wait_for(&ctx, TNFS_CMD_WRITE, seq))
         {
             sidetnfs_diag_log(SIDETNFS_DIAG_FWRITE_TRANSPORT_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, chunk,
                                0xFFu, 0);
@@ -5064,7 +5146,7 @@ void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle, int runtim
         return;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_CLOSE, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_CLOSE, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_CLOSE, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FCLOSE_TNFS_ERROR, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0xFFu, 0);
         return;
@@ -5141,7 +5223,7 @@ bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uin
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     diag->dsetpath_exists_opendirx_seq = seq;
 #endif
-    if (!fslisting_wait_for(TNFS_CMD_OPENDIRX, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_OPENDIRX, seq))
     {
         *out_rc = 0xFFu;
         return false;
@@ -5171,7 +5253,7 @@ bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uin
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
         diag->dsetpath_exists_closedir_sent = true;
 #endif
-        bool closedir_responded = fslisting_wait_for(TNFS_CMD_CLOSEDIR, close_seq);
+        bool closedir_responded = fslisting_wait_for(&ctx, TNFS_CMD_CLOSEDIR, close_seq);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
         diag->dsetpath_exists_closedir_response_received = closedir_responded;
         if (closedir_responded)
@@ -5212,7 +5294,7 @@ bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
         return false;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_TNFS_SEEK, guest_fd, NULL, NULL, NULL, tnfs_handle, whence, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_SEEK, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_SEEK, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FSEEK_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, whence, 0xFFu, 0);
         return false;
@@ -5278,7 +5360,7 @@ SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char 
         return SIDETNFS_FILE_DELETE_ERROR;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_TNFS_UNLINK, 0, tnfs_path, NULL, NULL, 0, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_UNLINK, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_UNLINK, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FDELETE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_FILE_DELETE_ERROR;
@@ -5334,7 +5416,7 @@ SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char 
         return SIDETNFS_FILE_RENAME_ERROR;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_TNFS_RENAME, 0, old_path, NULL, new_path, 0, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_RENAME, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_RENAME, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FRENAME_TNFS_RC, 0, old_path, NULL, new_path, 0, 0, 0xFFu, 0);
         return SIDETNFS_FILE_RENAME_ERROR;
@@ -5385,7 +5467,7 @@ SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const c
         return SIDETNFS_DIR_CREATE_ERROR;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_TNFS_MKDIR, 0, tnfs_path, NULL, NULL, 0, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_MKDIR, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_MKDIR, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DCREATE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_DIR_CREATE_ERROR;
@@ -5439,7 +5521,7 @@ SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(int runtime_slot, const c
         return SIDETNFS_DIR_DELETE_ERROR;
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_TNFS_RMDIR, 0, tnfs_path, NULL, NULL, 0, 0, 0, 0);
-    if (!fslisting_wait_for(TNFS_CMD_RMDIR, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_RMDIR, seq))
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DDELETE_TNFS_RC, 0, tnfs_path, NULL, NULL, 0, 0, 0xFFu, 0);
         return SIDETNFS_DIR_DELETE_ERROR;
@@ -5531,7 +5613,7 @@ static SidetnfsTnfsStatResult tnfs_stat_raw(int runtime_slot, const char *tnfs_p
     {
         return SIDETNFS_TNFS_STAT_ERROR;
     }
-    if (!fslisting_wait_for(TNFS_CMD_STAT, seq))
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_STAT, seq))
     {
         return SIDETNFS_TNFS_STAT_ERROR;
     }
