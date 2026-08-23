@@ -502,6 +502,21 @@ void reboot()
     DPRINTF("Requesting AIRCR_Register reset...\n");
     AIRCR_Register = 0x5FA0004;
     DPRINTF("Now ASM code to reset...\n");
+    // VTOR (Vector Table Offset Register) lives at the same fixed PPB/SCB
+    // offset (0xed08) on both cores' standard Arm SCB -- RP2040's Cortex-M0+
+    // and RP2350's Cortex-M33 just ship it under differently-named register
+    // headers/macros (m0plus.h's M0PLUS_VTOR_OFFSET vs m33.h's
+    // M33_VTOR_OFFSET; both expand to the identical 0x0000ed08). This is a
+    // pure rename, not a behavior change. NOTE: this hand-written ARM
+    // assembly (msr/bx) assumes an Arm core -- it does not apply to a
+    // pico2_w built for the RISC-V (Hazard3) platform variant
+    // (PICO_PLATFORM=rp2350-riscv), which this project does not target
+    // (default/only-tested RP2350 platform here is rp2350-arm-s).
+#if PICO_RP2040
+#define SIDETNFS_VTOR_OFFSET M0PLUS_VTOR_OFFSET
+#else
+#define SIDETNFS_VTOR_OFFSET M33_VTOR_OFFSET
+#endif
     asm volatile(
         "mov r0, %[start]\n"
         "ldr r1, =%[vtable]\n"
@@ -510,8 +525,9 @@ void reboot()
         "msr msp, r0\n"
         "bx r1\n"
         :
-        : [start] "r"(XIP_BASE + 0x100), [vtable] "X"(PPB_BASE + M0PLUS_VTOR_OFFSET)
+        : [start] "r"(XIP_BASE + 0x100), [vtable] "X"(PPB_BASE + SIDETNFS_VTOR_OFFSET)
         :);
+#undef SIDETNFS_VTOR_OFFSET
     while (1)
     {
         DPRINTF("Reboot failed.\n");
