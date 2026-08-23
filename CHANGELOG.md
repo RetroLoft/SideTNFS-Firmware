@@ -4,6 +4,17 @@ All notable changes to SideTNFS are documented here. Older entries here describe
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-08-24
+
+### Added
+- README sections on running your own TNFS server and on adding a microSD card drive, plus a link to the community Discord server.
+
+### Fixed
+- "Illegal Instruction" crashes (four bombs) that could occur while loading a large .PRG file from a TNFS drive. The cause: TNFS file-listing responses (open/read/write/seek/close and directory operations) were correlated to their request using only the command byte and an 8-bit sequence counter shared across the whole channel, ignoring the source address, port and TNFS session id. A response could arrive late enough to be misattributed to a later, unrelated request once the 8-bit sequence space wrapped around -- something a large program's 600-800+ read round trips did repeatedly, silently splicing stale bytes into the file being loaded. Responses are now also validated against the exact server address, port and session id they're expected to come from.
+
+### Removed
+- The ROM-cartridge-emulation feature and the online ROM catalog it depended on (the `roms.sidecartridge.com` service is no longer online). SideTNFS only ever uses GEMDRIVE with a TNFS or SD card backend.
+
 ## [1.0.3] - 2026-08-20
 
 ### Added
