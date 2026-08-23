@@ -397,6 +397,15 @@ int main()
     // only SAVE_CONFIG (via SIDETNFS.PRG) ever writes to flash.
     sidetnfs_config_init();
 
+    // Load/validate the persistent FLOPPY.PRG server-profile flash
+    // config exactly once, before GEMDRIVE can process any of the
+    // GEMDRVEMUL_FLOPPY_* commands. Entirely independent of
+    // sidetnfs_config_init() above (separate flash sector, separate
+    // struct) -- order relative to it does not matter, placed right after
+    // it only to keep every "config store init" call together. Read-only
+    // here -- only SAVE_PROFILES (via FLOPPY.PRG) ever writes to flash.
+    sidetnfs_floppy_config_init();
+
     // Sidetnfs_system_config_init moved to run early, before the
     // single CYW43 init call near the top of main() -- no longer called a
     // second time here (an _init() function should only ever run once per

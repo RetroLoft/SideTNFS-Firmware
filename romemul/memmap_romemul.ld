@@ -37,6 +37,19 @@ MEMORY
        exist here so the address is visible and reserved against accidental
        reuse. See romemul/include/sidetnfs_config.h. */
     SIDETNFS_CONFIG_FLASH(rwx) : ORIGIN = 0x10100000, LENGTH = 4k
+
+    /* SideTNFS-Floppy-emulation project, Step 1: FLOPPY.PRG server-profile
+       config sector. sidetnfs_system_config.h's own SIDETNFS_SYSTEM_CONFIG_FLASH
+       sector (0x10101000, 4k) is NOT reserved here as a MEMORY region --
+       only documented in that header's own comment -- which the Step 0
+       research report flagged as a real (if narrow) risk: nothing but a
+       hand-written comment proves its offset doesn't collide with a future
+       sector. This sector follows the stronger SIDETNFS_CONFIG_FLASH
+       precedent instead: an actual MEMORY region, so a future flash-layout
+       change gets a linker-enforced collision check. Immediately follows
+       SIDETNFS_SYSTEM_CONFIG_FLASH (0x10101000 + 4k = 0x10102000). See
+       romemul/include/sidetnfs_floppy_config.h. */
+    SIDETNFS_FLOPPY_CONFIG_FLASH(rwx) : ORIGIN = 0x10102000, LENGTH = 4k
 }
 
 ENTRY(_entry_point)
