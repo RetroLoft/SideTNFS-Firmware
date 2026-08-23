@@ -16,6 +16,8 @@
 #include "sidetnfs_netconfig.h"
 #include "sidetnfs_rtcconfig.h"
 #include "sidetnfs_update_check.h" // SIDETNFS_UPDATE_VERSION_LEN -- see GEMDRVEMUL_SIDETNFS_UPDATE below
+#include "sidetnfs_floppy_config.h" // SIDETNFS_FLOPPY_* lengths -- see GEMDRVEMUL_FLOPPY_PROFILE below
+#include "tprotocol.h" // MAX_PROTOCOL_PAYLOAD_SIZE -- see SET_FLOPPY_PROFILE_PAYLOAD_BYTES below
 #include "sidetnfs_probe.h" // SIDETNFS_NET_ERR_TEXT_MAX -- see FileDescriptors.net_err_text below
 #include "sidetnfs_sd_service.h" // SIDETNFS_SD_ERROR_TEXT_MAX -- see FileDescriptors.sd_error_text below
 
@@ -330,6 +332,55 @@ _Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_LATEST_VERSION % 2 == 0, "GEMDRVEMUL_S
 _Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION % 2 == 0, "GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(SIDETNFS_UPDATE_VERSION_LEN % 2 == 0, "SIDETNFS_UPDATE_VERSION_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_UPDATE block must fit within the 64KB ROM3 window");
+
+// FLOPPY.PRG server-profile config blocks (SideTNFS-Floppy-emulation
+// project, Step 1). Immediately follow the CHECK_UPDATE block above, same
+// ALIGN4(previous block's own end) placement every prior block in this
+// chain uses -- see romemul/include/sidetnfs_floppy_config.h for the
+// record/flash layout this response block mirrors field-for-field (same
+// convention GEMDRVEMUL_SIDETNFS_DRIVE mirrors sidetnfs_drive_config_t).
+// Entirely independent of every GEMDRVEMUL_SIDETNFS_* block above -- no
+// shared offsets, no shared fields.
+#define GEMDRVEMUL_FLOPPY_CONFIG SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN)
+#define GEMDRVEMUL_FLOPPY_CONFIG_VERSION (GEMDRVEMUL_FLOPPY_CONFIG + 0)                          // uint32_t, protocol version (1)
+#define GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES (GEMDRVEMUL_FLOPPY_CONFIG_VERSION + 4)             // uint32_t, SIDETNFS_FLOPPY_MAX_PROFILES
+#define GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT (GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES + 4)       // uint32_t, configured (DISABLED+ENABLED) profile count
+#define GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX (GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT + 4)       // uint32_t, active_profile_index
+#define GEMDRVEMUL_FLOPPY_CONFIG_STATUS (GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX + 4)               // uint32_t, status code (0 = OK)
+// Block ends at GEMDRVEMUL_FLOPPY_CONFIG_STATUS + 4 (20 bytes total).
+
+// Shared by GET_PROFILE (full) and by SET/DELETE/SET_ACTIVE_PROFILE/
+// SAVE_PROFILES (STATUS field only -- none of those four need the rest at
+// the same time, same reasoning GEMDRVEMUL_SIDETNFS_DRIVE's own comment
+// gives).
+#define GEMDRVEMUL_FLOPPY_PROFILE (GEMDRVEMUL_FLOPPY_CONFIG_STATUS + 4)
+#define GEMDRVEMUL_FLOPPY_PROFILE_STATUS (GEMDRVEMUL_FLOPPY_PROFILE + 0)                          // uint32_t, swapped long
+#define GEMDRVEMUL_FLOPPY_PROFILE_STATE (GEMDRVEMUL_FLOPPY_PROFILE_STATUS + 4)                    // uint16_t, plain word
+#define GEMDRVEMUL_FLOPPY_PROFILE_PORT (GEMDRVEMUL_FLOPPY_PROFILE_STATE + 2)                      // uint16_t, plain word
+#define GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME (GEMDRVEMUL_FLOPPY_PROFILE_PORT + 2)                   // char[SIDETNFS_FLOPPY_NICKNAME_LEN]
+#define GEMDRVEMUL_FLOPPY_PROFILE_HOST (GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME + SIDETNFS_FLOPPY_NICKNAME_LEN)       // char[SIDETNFS_FLOPPY_HOST_LEN]
+#define GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH (GEMDRVEMUL_FLOPPY_PROFILE_HOST + SIDETNFS_FLOPPY_HOST_LEN)         // char[SIDETNFS_FLOPPY_MOUNTPATH_LEN]
+#define GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY (GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH + SIDETNFS_FLOPPY_MOUNTPATH_LEN) // char[SIDETNFS_FLOPPY_LASTDIR_LEN]
+// Block ends at GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN (384 bytes total: 4 status + 380 profile fields).
+
+_Static_assert(GEMDRVEMUL_FLOPPY_CONFIG_VERSION % 4 == 0, "GEMDRVEMUL_FLOPPY_CONFIG_VERSION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATE % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATE must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_PORT % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_PORT must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_FLOPPY_NICKNAME_LEN % 2 == 0, "SIDETNFS_FLOPPY_NICKNAME_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_FLOPPY_HOST_LEN % 2 == 0, "SIDETNFS_FLOPPY_HOST_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_FLOPPY_MOUNTPATH_LEN % 2 == 0, "SIDETNFS_FLOPPY_MOUNTPATH_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(SIDETNFS_FLOPPY_LASTDIR_LEN % 2 == 0, "SIDETNFS_FLOPPY_LASTDIR_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PROFILE block must fit within the 64KB ROM3 window");
+
+// SET_PROFILE request payload size, excluding the 4-byte token: index(4) +
+// state+port(2 each=4) + strings (24+64+32+256=376) = 384 bytes.
+#define SET_FLOPPY_PROFILE_PAYLOAD_BYTES \
+    (4UL + 2UL * 2UL + (unsigned long)SIDETNFS_FLOPPY_NICKNAME_LEN + (unsigned long)SIDETNFS_FLOPPY_HOST_LEN + \
+     (unsigned long)SIDETNFS_FLOPPY_MOUNTPATH_LEN + (unsigned long)SIDETNFS_FLOPPY_LASTDIR_LEN)
+_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES == 384UL, "SET_FLOPPY_PROFILE_PAYLOAD_BYTES drifted from the documented request payload size");
+_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_SIZE - 64UL), "SET_PROFILE request payload must fit within the protocol's payload channel");
 
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00

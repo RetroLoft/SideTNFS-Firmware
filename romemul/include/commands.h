@@ -202,6 +202,28 @@
 // in gemdrvemul.h.
 #define GEMDRVEMUL_SIDETNFS_CHECK_UPDATE (APP_GEMDRVEMUL << 8 | 0x1C) // Check github for a newer firmware version
 
+// FLOPPY.PRG server-profile config (SideTNFS-Floppy-emulation project,
+// Step 1). Subcommands 0x1D-0x22, re-verified free (highest used low code
+// before this addition was 0x1C/CHECK_UPDATE, next used is 0x36/
+// GEMDRVEMUL_DFREE_CALL -- 0x1D-0x35 free, see GEMDRVEMUL_REBOOT_PICO's own
+// comment above). Entirely independent from the SIDETNFS drive-list
+// commands above (0x0D-0x12): these describe up to
+// SIDETNFS_FLOPPY_MAX_PROFILES TNFS *sources* FLOPPY.PRG browses for
+// floppy images, never a GEMDOS drive -- no drive letter, no interaction
+// with the GEMDOS drive list or the active TNFS session. See
+// romemul/include/sidetnfs_floppy_config.h for the wire/flash format and
+// the SideTNFS-Floppy-emulation project's RESEARCH-STEP0.md for the design
+// rationale. Reserved for a later phase, NOT added here yet: the LFN
+// directory-browser commands (open directory / get page / select entry) --
+// those will claim their own subcommands from the remaining 0x23-0x35
+// range when that phase is implemented.
+#define GEMDRVEMUL_FLOPPY_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x1D)   // Get FLOPPY.PRG profile-store info (max/count/active index)
+#define GEMDRVEMUL_FLOPPY_GET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1E)      // Get one floppy server-profile record
+#define GEMDRVEMUL_FLOPPY_SET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1F)      // Set one floppy server-profile record (RAM only)
+#define GEMDRVEMUL_FLOPPY_DELETE_PROFILE (APP_GEMDRVEMUL << 8 | 0x20)   // Delete one floppy server-profile record (RAM only)
+#define GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE (APP_GEMDRVEMUL << 8 | 0x21) // Set the active profile index (RAM only)
+#define GEMDRVEMUL_FLOPPY_SAVE_PROFILES (APP_GEMDRVEMUL << 8 | 0x22)    // Persist the RAM profile list to flash
+
 typedef struct
 {
     unsigned int value;

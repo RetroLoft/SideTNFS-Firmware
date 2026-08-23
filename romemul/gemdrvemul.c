@@ -4958,6 +4958,124 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
+        case GEMDRVEMUL_FLOPPY_GET_CONFIG_INFO:
+        {
+            // Minimal, read-only probe. No request payload, no
+            // SD/WiFi/TNFS/flash access. Mirrors GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO's
+            // shape exactly, for the entirely independent FLOPPY.PRG
+            // profile store -- see romemul/include/sidetnfs_floppy_config.h.
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_VERSION, SIDETNFS_FLOPPY_CONFIG_FLASH_VERSION);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES, sidetnfs_floppy_config_get_max_profiles());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT, sidetnfs_floppy_config_get_profile_count());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX, sidetnfs_floppy_config_get_active_profile_index());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_STATUS, SIDETNFS_FLOPPY_STATUS_OK);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_GET_PROFILE:
+        {
+            // Read-only lookup of one profile record from the RAM
+            // profile list. Request: one uint32_t index. status is OK for
+            // EMPTY as much as for DISABLED/ENABLED -- only an
+            // out-of-range index is ever non-OK; the caller reads
+            // PROFILE_STATE to tell the three apart (same convention
+            // GEMDRVEMUL_SIDETNFS_GET_DRIVE uses).
+            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            sidetnfs_floppy_profile_config_t profile;
+            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_get_profile((uint8_t)profile_index, &profile);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATE, (uint16_t)profile.state);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_PORT, profile.port);
+
+            // Pico->Atari string transfer: byte-copy + CHANGE_ENDIANESS_BLOCK16
+            // in place -- same hardware-proven pattern GET_DRIVE/populate_dta
+            // already use (see that case's own comment for the full
+            // hardware-test rationale; not repeated here).
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME), profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME, SIDETNFS_FLOPPY_NICKNAME_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST), profile.host, SIDETNFS_FLOPPY_HOST_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST, SIDETNFS_FLOPPY_HOST_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH), profile.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY), profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY, SIDETNFS_FLOPPY_LASTDIR_LEN);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SET_PROFILE:
+        {
+            // RAM-only write of one profile record. No flash access.
+            // Request payload mirrors GET_PROFILE's response field order
+            // (minus status): index, state, port, then
+            // nickname/host/mount_path/last_directory, read sequentially
+            // from payloadPtr -- same COPY_AND_CHANGE_ENDIANESS_BLOCK16
+            // convention GEMDRVEMUL_SIDETNFS_SET_DRIVE already uses.
+            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+
+            sidetnfs_floppy_profile_config_t profile;
+            memset(&profile, 0, sizeof(profile));
+
+            profile.state = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            profile.port = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_NICKNAME_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.host, SIDETNFS_FLOPPY_HOST_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_HOST_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_MOUNTPATH_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_LASTDIR_LEN / 2;
+
+            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_set_profile((uint8_t)profile_index, &profile);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_DELETE_PROFILE:
+        {
+            // RAM-only clear of one profile record. Request: one
+            // uint32_t index. Response: status only.
+            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_delete_profile((uint8_t)profile_index);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE:
+        {
+            // RAM-only change of the active profile index. No flash
+            // access. Request: one uint32_t index. Response: status only.
+            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_set_active_profile((uint8_t)profile_index);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SAVE_PROFILES:
+        {
+            // The only command in this protocol that ever touches
+            // flash. Validates the full RAM profile list, then
+            // erases+programs exactly one 4KB flash sector, reads it back
+            // via XIP, and verifies magic/version/CRC before reporting
+            // success. Request: none. Response: status only.
+            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_save();
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
         case GEMDRVEMUL_DFREE_CALL:
         {
             // CMD_DFREE_CALL is a `send_sync ..., 2` call: the 68k side
