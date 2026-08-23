@@ -1471,7 +1471,16 @@ void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void)
 // memory; the caller does that (generic).
 static bool gemdrive_backend_dta_exists(uint32_t ndta)
 {
+    // v1.0.3 reliability-fix diagnostics: DTA_EXIST fires repeatedly
+    // during ordinary desktop icon refresh (unrelated to the TNFS
+    // read-corruption/envelope-fix investigation) and was eating a
+    // disproportionate share of the fixed 256-event budget before the
+    // actually-interesting Fopen/Fread sequence even started -- gated
+    // behind the same "directory detail" suppression as
+    // READDIRX_ONE/etc. below, on the same terms.
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
     sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
     bool ndta_exists;
 #if SIDETNFS_USE_TNFS_LISTING
     // DTA_EXIST must recognize TNFS, fake no-network, AND the
@@ -1495,6 +1504,7 @@ static bool gemdrive_backend_dta_exists(uint32_t ndta)
     // own Fsfirst (see gemdrive_backend_fsfirst()'s SD branch).
     bool sd_fatfs_active = lookupDTA(ndta) ? true : false;
     ndta_exists = tnfs_active || fake_active || settings_active || sd_error_active || sd_fatfs_active;
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
     if (sd_fatfs_active)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FATFS_OK, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
@@ -1515,10 +1525,13 @@ static bool gemdrive_backend_dta_exists(uint32_t ndta)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
     }
+#endif
 #else
     ndta_exists = lookupDTA(ndta) ? true : false;
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
     sidetnfs_diag_log(ndta_exists ? SIDETNFS_DIAG_DTA_EXIST_FATFS_OK : SIDETNFS_DIAG_DTA_EXIST_FAIL, ndta,
                        NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
 #endif
     DPRINTF("DTA %x exists: %s\n", ndta, (ndta_exists) ? "TRUE" : "FALSE");
     return ndta_exists;
@@ -2841,8 +2854,10 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
         return;
     }
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_HANDLE, readbuff_fd, NULL, NULL, NULL, file->tnfs_handle, 0, 0, 0);
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_BACKEND, readbuff_fd, NULL, NULL, NULL, 0, 0, (uint8_t)file->backend, 0);
+#endif
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     SidetnfsDiagSnapshot *fread_diag = sidetnfs_diag_snapshot();
     fread_diag->fread_calls++;
@@ -2873,15 +2888,17 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
     uint16_t buff_size = readbuff_pending_bytes_to_read > DEFAULT_FOPEN_READ_BUFFER_SIZE
                               ? DEFAULT_FOPEN_READ_BUFFER_SIZE
                               : (uint16_t)readbuff_pending_bytes_to_read;
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_REQUESTED, readbuff_fd, NULL, NULL, NULL, 0, buff_size, 0, 0);
-#if SIDETNFS_DIAG_DUMP_ON_SELECT
-    fread_diag->fread_last_requested = buff_size;
-#endif
     {
         char offset_str[24];
         snprintf(offset_str, sizeof(offset_str), "off=%lu", (unsigned long)file->offset);
         sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_OFFSET_BEFORE, readbuff_fd, offset_str, NULL, NULL, 0, 0, 0, 0);
     }
+#endif
+#if SIDETNFS_DIAG_DUMP_ON_SELECT
+    fread_diag->fread_last_requested = buff_size;
+#endif
     if (buff_size < DEFAULT_FOPEN_READ_BUFFER_SIZE)
     {
         memset((void *)(memory_shared_address + GEMDRVEMUL_READ_BUFF), 0, DEFAULT_FOPEN_READ_BUFFER_SIZE);
@@ -2904,12 +2921,17 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
     // TNFS-side file position (which 's Fseek also updates via its
     // own successful seek's returned position, keeping the two in sync).
     file->offset += actual;
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_ACTUAL, readbuff_fd, NULL, NULL, NULL, 0, actual, 0, 0);
     {
         char offset_str[24];
         snprintf(offset_str, sizeof(offset_str), "off=%lu", (unsigned long)file->offset);
         sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_OFFSET_AFTER, readbuff_fd, offset_str, NULL, NULL, 0, 0, 0, 0);
     }
+#endif
+    // Single unconditional summary of the success path -- everything
+    // FILE_IO's per-round/per-field detail above would otherwise add is
+    // reconstructible from this plus the ENTER event's requested size.
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_RETURN, readbuff_fd, NULL, NULL, NULL, 0, actual, 0, 0);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     fread_diag->fread_last_actual = actual;
@@ -5921,7 +5943,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             bool ndta_exists = gemdrive_backend_dta_exists(ndta);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DTA_EXIST, (ndta_exists ? ndta : 0));
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
             sidetnfs_diag_log(SIDETNFS_DIAG_DTA_EXIST_RETURN, ndta, NULL, NULL, NULL, 0, 0, (uint8_t)ndta_exists, 0);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;

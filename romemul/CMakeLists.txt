@@ -195,16 +195,17 @@ endif()
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
-# Workaround to disable USB output in release builds. SIDETNFS_ENABLE_DIAG
-# additionally forces the physical UART on even at _DEBUG=0 (reachable only
-# via the independent-override form above), so the SELECT-triggered
-# snapshot dump's own instrumentation has a live stdio backend to sit
-# behind -- DPRINTF itself stays gated on _DEBUG alone (unchanged).
-if(${_DEBUG} STREQUAL "0" AND ${_SIDETNFS_ENABLE_DIAG} STREQUAL "0")
-    pico_enable_stdio_uart(${PROJECT_NAME} 0)
-else()
-    pico_enable_stdio_uart(${PROJECT_NAME} 1)
-endif()
+# UART is deliberately OFF unconditionally, in every build variant --
+# not just a debug/production distinction. gemdrvemul.c alone has 349
+# DPRINTF() call sites throughout the TNFS-read/Pexec/bus-IRQ-adjacent
+# code paths, each a blocking UART character-by-character transmission
+# (no receiver needed for the driver to still block shifting bytes out at
+# the configured baud rate) -- a potential multi-millisecond stall in code
+# with sub-microsecond timing budgets, discovered while chasing the
+# v1.0.3 TNFS-reliability-fix regression. The eventlog/SELECT-dump ring
+# buffer (see sidetnfs_diag_log() in sidetnfs_probe.c) never calls
+# DPRINTF, so debug builds stay fully diagnosable with UART off.
+pico_enable_stdio_uart(${PROJECT_NAME} 0)
 
 # Print the variables on screen
 message("Build variant: " ${_SIDETNFS_BUILD_VARIANT})
