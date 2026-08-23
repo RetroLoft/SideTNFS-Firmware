@@ -265,7 +265,21 @@ SECTIONS
         PROVIDE(__flash_binary_end = .);
     } > FLASH
 
-    /* stack limit is poorly named, but historically is maximum heap ptr */
+    /* stack limit is poorly named, but historically is maximum heap ptr.
+       v1.0.3 TNFS-reliability-fix regression chase: briefly tried removing
+       "+ LENGTH(ROM_IN_RAM)" here (capping heap growth at the true end of
+       RAM, matching pico-sdk's own memmap_default.ld) on the theory that
+       _sbrk() spilling into the live ROM_IN_RAM window was corrupting the
+       GEMDRIVE.BIN image the Atari executes. Real-hardware test falsified
+       that: with the cap in place, BOTH the debug and the production
+       build bombed even earlier (before reaching the desktop at all,
+       reproducibly) -- meaning normal boot-time heap usage routinely
+       needs part of this "extra" space, not just some rare large-file
+       edge case. Reverted to the original formula. If this is revisited,
+       the real fix is almost certainly to reduce actual heap usage (or
+       give it more static headroom some other way), not to move
+       __StackLimit again without first knowing how many bytes boot alone
+       requires. */
     __StackLimit = ORIGIN(RAM) + LENGTH(RAM) + LENGTH(ROM_IN_RAM);
     __StackOneTop = ORIGIN(SCRATCH_X) + LENGTH(SCRATCH_X);
     __StackTop = ORIGIN(SCRATCH_Y) + LENGTH(SCRATCH_Y);
