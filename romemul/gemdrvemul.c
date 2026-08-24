@@ -4980,7 +4980,12 @@ void init_gemdrvemul(bool safe_config_reboot)
             // EMPTY as much as for DISABLED/ENABLED -- only an
             // out-of-range index is ever non-OK; the caller reads
             // PROFILE_STATE to tell the three apart (same convention
-            // GEMDRVEMUL_SIDETNFS_GET_DRIVE uses).
+            // GEMDRVEMUL_SIDETNFS_GET_DRIVE uses). host/mount_path are
+            // only meaningful when PROFILE_BACKEND == TNFS, sd_path only
+            // when == SD -- both are always sent regardless (the ROM3
+            // window has ample headroom, see GEMDRVEMUL_FLOPPY_PROFILE's
+            // own comment in gemdrvemul.h), the caller is expected to
+            // ignore whichever doesn't apply.
             uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
 
             sidetnfs_floppy_profile_config_t profile;
@@ -4988,6 +4993,7 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATE, (uint16_t)profile.state);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_BACKEND, (uint16_t)profile.backend);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_PORT, profile.port);
 
             // Pico->Atari string transfer: byte-copy + CHANGE_ENDIANESS_BLOCK16
@@ -4996,12 +5002,14 @@ void init_gemdrvemul(bool safe_config_reboot)
             // hardware-test rationale; not repeated here).
             memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME), profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
             CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME, SIDETNFS_FLOPPY_NICKNAME_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST), profile.host, SIDETNFS_FLOPPY_HOST_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST, SIDETNFS_FLOPPY_HOST_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH), profile.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
             memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY), profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
             CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY, SIDETNFS_FLOPPY_LASTDIR_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST), profile.fields.tnfs.host, SIDETNFS_FLOPPY_HOST_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST, SIDETNFS_FLOPPY_HOST_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH), profile.fields.tnfs.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH), profile.fields.sd.sd_path, SIDETNFS_FLOPPY_SDPATH_LEN);
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH, SIDETNFS_FLOPPY_SDPATH_LEN);
 
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -5011,10 +5019,24 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             // RAM-only write of one profile record. No flash access.
             // Request payload mirrors GET_PROFILE's response field order
-            // (minus status): index, state, port, then
-            // nickname/host/mount_path/last_directory, read sequentially
-            // from payloadPtr -- same COPY_AND_CHANGE_ENDIANESS_BLOCK16
-            // convention GEMDRVEMUL_SIDETNFS_SET_DRIVE already uses.
+            // (minus status): index, state, backend, port, then
+            // nickname/last_directory/host/mount_path/sd_path, read
+            // sequentially from payloadPtr -- same
+            // COPY_AND_CHANGE_ENDIANESS_BLOCK16 convention
+            // GEMDRVEMUL_SIDETNFS_SET_DRIVE already uses.
+            //
+            // host/mount_path/sd_path are decoded into separate PLAIN
+            // (non-union) local buffers first, then only the relevant
+            // one(s) for the record's own `backend` are copied into
+            // profile.fields (a union). Decoding straight into
+            // profile.fields.tnfs.* and profile.fields.sd.sd_path in wire
+            // order would silently corrupt whichever member is copied
+            // first: sd_path (256 bytes) fully overlaps and is a strict
+            // superset of host+mount_path's own 96 bytes at the same
+            // union offset, so writing it after host/mount_path -- or
+            // reading host/mount_path after sd_path -- always clobbers
+            // one with the other. Keeping the wire-decode step entirely
+            // union-free avoids that class of bug outright.
             uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
             payloadPtr += 2;
 
@@ -5023,17 +5045,42 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             profile.state = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
             payloadPtr += 1;
+            profile.backend = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
             profile.port = GET_PAYLOAD_PARAM16(payloadPtr);
             payloadPtr += 1;
 
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
             payloadPtr += SIDETNFS_FLOPPY_NICKNAME_LEN / 2;
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.host, SIDETNFS_FLOPPY_HOST_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_HOST_LEN / 2;
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_MOUNTPATH_LEN / 2;
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
             payloadPtr += SIDETNFS_FLOPPY_LASTDIR_LEN / 2;
+
+            char host_buf[SIDETNFS_FLOPPY_HOST_LEN];
+            char mount_path_buf[SIDETNFS_FLOPPY_MOUNTPATH_LEN];
+            char sd_path_buf[SIDETNFS_FLOPPY_SDPATH_LEN];
+
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, host_buf, SIDETNFS_FLOPPY_HOST_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_HOST_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, mount_path_buf, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_MOUNTPATH_LEN / 2;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, sd_path_buf, SIDETNFS_FLOPPY_SDPATH_LEN);
+            payloadPtr += SIDETNFS_FLOPPY_SDPATH_LEN / 2;
+
+            if (profile.backend == SIDETNFS_FLOPPY_BACKEND_SD)
+            {
+                memcpy(profile.fields.sd.sd_path, sd_path_buf, SIDETNFS_FLOPPY_SDPATH_LEN);
+            }
+            else
+            {
+                // Default to the TNFS interpretation for backend==TNFS
+                // AND for any invalid backend value -- an invalid backend
+                // is rejected by sidetnfs_floppy_config_set_profile()'s
+                // own validation regardless of which union member ends up
+                // populated here, so this default is only ever
+                // load-bearing for the genuine TNFS case.
+                memcpy(profile.fields.tnfs.host, host_buf, SIDETNFS_FLOPPY_HOST_LEN);
+                memcpy(profile.fields.tnfs.mount_path, mount_path_buf, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
+            }
 
             sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_set_profile((uint8_t)profile_index, &profile);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);

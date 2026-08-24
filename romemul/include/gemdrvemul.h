@@ -353,33 +353,44 @@ _Static_assert((GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_V
 // SAVE_PROFILES (STATUS field only -- none of those four need the rest at
 // the same time, same reasoning GEMDRVEMUL_SIDETNFS_DRIVE's own comment
 // gives).
+// Fields sent as three independent, always-present strings (host,
+// mount_path, sd_path) rather than mirroring the firmware's own
+// space-saving TNFS/SD union (sidetnfs_floppy_backend_fields_t) -- the
+// ROM3 window has ~46KB of free headroom (see RESEARCH-STEP0.md section
+// 4.4) and this is not a static-RAM allocation on either side, so the
+// union's complexity buys nothing here and a union-free wire layout is
+// less error-prone to pack/unpack correctly on the Atari side.
 #define GEMDRVEMUL_FLOPPY_PROFILE (GEMDRVEMUL_FLOPPY_CONFIG_STATUS + 4)
 #define GEMDRVEMUL_FLOPPY_PROFILE_STATUS (GEMDRVEMUL_FLOPPY_PROFILE + 0)                          // uint32_t, swapped long
 #define GEMDRVEMUL_FLOPPY_PROFILE_STATE (GEMDRVEMUL_FLOPPY_PROFILE_STATUS + 4)                    // uint16_t, plain word
-#define GEMDRVEMUL_FLOPPY_PROFILE_PORT (GEMDRVEMUL_FLOPPY_PROFILE_STATE + 2)                      // uint16_t, plain word
+#define GEMDRVEMUL_FLOPPY_PROFILE_BACKEND (GEMDRVEMUL_FLOPPY_PROFILE_STATE + 2)                   // uint16_t, plain word -- sidetnfs_floppy_backend_t
+#define GEMDRVEMUL_FLOPPY_PROFILE_PORT (GEMDRVEMUL_FLOPPY_PROFILE_BACKEND + 2)                    // uint16_t, plain word -- TNFS only
 #define GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME (GEMDRVEMUL_FLOPPY_PROFILE_PORT + 2)                   // char[SIDETNFS_FLOPPY_NICKNAME_LEN]
-#define GEMDRVEMUL_FLOPPY_PROFILE_HOST (GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME + SIDETNFS_FLOPPY_NICKNAME_LEN)       // char[SIDETNFS_FLOPPY_HOST_LEN]
-#define GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH (GEMDRVEMUL_FLOPPY_PROFILE_HOST + SIDETNFS_FLOPPY_HOST_LEN)         // char[SIDETNFS_FLOPPY_MOUNTPATH_LEN]
-#define GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY (GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH + SIDETNFS_FLOPPY_MOUNTPATH_LEN) // char[SIDETNFS_FLOPPY_LASTDIR_LEN]
-// Block ends at GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN (384 bytes total: 4 status + 380 profile fields).
+#define GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY (GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME + SIDETNFS_FLOPPY_NICKNAME_LEN) // char[SIDETNFS_FLOPPY_LASTDIR_LEN]
+#define GEMDRVEMUL_FLOPPY_PROFILE_HOST (GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN)      // char[SIDETNFS_FLOPPY_HOST_LEN] -- TNFS only
+#define GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH (GEMDRVEMUL_FLOPPY_PROFILE_HOST + SIDETNFS_FLOPPY_HOST_LEN)             // char[SIDETNFS_FLOPPY_MOUNTPATH_LEN] -- TNFS only
+#define GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH (GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH + SIDETNFS_FLOPPY_MOUNTPATH_LEN)     // char[SIDETNFS_FLOPPY_SDPATH_LEN] -- SD only
+// Block ends at GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH + SIDETNFS_FLOPPY_SDPATH_LEN (642 bytes total: 4 status + 2 state + 2 backend + 2 port + 24 nickname + 256 last_directory + 64 host + 32 mount_path + 256 sd_path).
 
 _Static_assert(GEMDRVEMUL_FLOPPY_CONFIG_VERSION % 4 == 0, "GEMDRVEMUL_FLOPPY_CONFIG_VERSION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATE % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATE must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_BACKEND % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_BACKEND must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_PORT % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_PORT must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(SIDETNFS_FLOPPY_NICKNAME_LEN % 2 == 0, "SIDETNFS_FLOPPY_NICKNAME_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(SIDETNFS_FLOPPY_HOST_LEN % 2 == 0, "SIDETNFS_FLOPPY_HOST_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(SIDETNFS_FLOPPY_MOUNTPATH_LEN % 2 == 0, "SIDETNFS_FLOPPY_MOUNTPATH_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert(SIDETNFS_FLOPPY_LASTDIR_LEN % 2 == 0, "SIDETNFS_FLOPPY_LASTDIR_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert((GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PROFILE block must fit within the 64KB ROM3 window");
+_Static_assert(SIDETNFS_FLOPPY_SDPATH_LEN % 2 == 0, "SIDETNFS_FLOPPY_SDPATH_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH + SIDETNFS_FLOPPY_SDPATH_LEN) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PROFILE block must fit within the 64KB ROM3 window");
 
 // SET_PROFILE request payload size, excluding the 4-byte token: index(4) +
-// state+port(2 each=4) + strings (24+64+32+256=376) = 384 bytes.
+// state+backend+port(2 each=6) + strings (24+256+64+32+256=632) = 642 bytes.
 #define SET_FLOPPY_PROFILE_PAYLOAD_BYTES \
-    (4UL + 2UL * 2UL + (unsigned long)SIDETNFS_FLOPPY_NICKNAME_LEN + (unsigned long)SIDETNFS_FLOPPY_HOST_LEN + \
-     (unsigned long)SIDETNFS_FLOPPY_MOUNTPATH_LEN + (unsigned long)SIDETNFS_FLOPPY_LASTDIR_LEN)
-_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES == 384UL, "SET_FLOPPY_PROFILE_PAYLOAD_BYTES drifted from the documented request payload size");
+    (4UL + 2UL * 3UL + (unsigned long)SIDETNFS_FLOPPY_NICKNAME_LEN + (unsigned long)SIDETNFS_FLOPPY_LASTDIR_LEN + \
+     (unsigned long)SIDETNFS_FLOPPY_HOST_LEN + (unsigned long)SIDETNFS_FLOPPY_MOUNTPATH_LEN + (unsigned long)SIDETNFS_FLOPPY_SDPATH_LEN)
+_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES == 642UL, "SET_FLOPPY_PROFILE_PAYLOAD_BYTES drifted from the documented request payload size");
 _Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_SIZE - 64UL), "SET_PROFILE request payload must fit within the protocol's payload channel");
 
 // Atari ST FATTRIB flag
