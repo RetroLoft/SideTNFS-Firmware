@@ -47,9 +47,14 @@ MEMORY
        sector. This sector follows the stronger SIDETNFS_CONFIG_FLASH
        precedent instead: an actual MEMORY region, so a future flash-layout
        change gets a linker-enforced collision check. Immediately follows
-       SIDETNFS_SYSTEM_CONFIG_FLASH (0x10101000 + 4k = 0x10102000). See
+       SIDETNFS_SYSTEM_CONFIG_FLASH (0x10101000 + 4k = 0x10102000).
+       LENGTH grew from 4k to 8k when the SD-backend feature was added (a
+       v2 record with its 256-byte sd_path no longer fits 8 records in
+       4KB) -- the extra 4KB (0x103000-0x104000) is, like the original
+       reservation, confirmed free flash (see RESEARCH-STEP0.md section 8;
+       ~880KB free from this point to the end of the FLASH region). See
        romemul/include/sidetnfs_floppy_config.h. */
-    SIDETNFS_FLOPPY_CONFIG_FLASH(rwx) : ORIGIN = 0x10102000, LENGTH = 4k
+    SIDETNFS_FLOPPY_CONFIG_FLASH(rwx) : ORIGIN = 0x10102000, LENGTH = 8k
 }
 
 ENTRY(_entry_point)
