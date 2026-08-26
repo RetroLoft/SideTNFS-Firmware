@@ -11,6 +11,7 @@
 #include "include/sidetnfs_sd_service.h"
 #include "include/memfunc.h"
 #include "f_util.h" // ff.h (FRESULT/FATFS/FILINFO/DIR/AM_DIR), same include this codebase's own SD code uses
+#include "pico/time.h" // absolute_time_t/get_absolute_time()/absolute_time_diff_us() -- see FLOPPY_BROWSE_TNFS_CALL_TIME_BUDGET_US
 
 #include <string.h>
 #include <stdio.h>
@@ -522,30 +523,48 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
 // collection is never expected to come close), guarding only against a
 // pathological server that never reaches TNFS_EOF.
 //
-// This counts REAL DIRECTORY ENTRIES examined (one sidetnfs_tnfs_raw_readdir()
-// call each -- dirs and files both, whichever phase is active), NOT
-// network round trips -- those are two different things now that
-// sidetnfs_tnfs_raw_readdir() batches SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH
-// (15) entries per real READDIRX round trip and caches the rest. Real-
-// hardware testing after enabling that batching showed page-fetch time
-// barely changed: this round count was still the actual bottleneck,
-// unchanged by batching, since it bounds how many entries one dispatch
-// call examines before returning FLOPPY_BROWSE_STATUS_IN_PROGRESS and
-// waiting for the Atari-side client to notice and resume -- and THAT
-// round trip (bus dispatch + Atari-side poll-and-resume) has its own
-// real cost, paid once per resumed call regardless of how cheap the
-// entries examined during it were. Raised from 8 to 32 now that most of
-// those entries are served from sidetnfs_tnfs_raw_readdir()'s cache
-// (worst case ceil(32/15)=3 real network rounds per dispatch call,
-// ~600ms typical rather than 8 separate up-to-200ms rounds strung across
-// 8 different resumed Atari-side polls) -- fewer resumed calls needed
-// per page, at a modest, bounded increase to any single call's own
-// worst-case duration.
+// A fixed entry-count budget here (tried at 8, then 32) turned out to be
+// the wrong knob entirely: it bounds how many REAL DIRECTORY ENTRIES one
+// dispatch call examines (one sidetnfs_tnfs_raw_readdir() call each --
+// dirs and files both, whichever phase is active), which is NOT the same
+// as network round trips now that sidetnfs_tnfs_raw_readdir() batches
+// SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH (15) entries per real READDIRX
+// round trip and caches the rest. A real packet capture on the actual
+// (LAN-local) TNFS server showed individual round trips completing in
+// ~1-3ms -- the network was never the bottleneck -- while resumed
+// dispatch calls (Atari notices FLOPPY_BROWSE_STATUS_IN_PROGRESS, resends
+// the identical request) showed up as ~100ms gaps between request
+// bursts. A fixed entry count can't adapt to that: too low leaves an
+// unnecessary ~100ms resume-round-trip on the table every time it's
+// hit on a fast network; too high risks a multi-hundred-ms real stall on
+// a slow/lossy one (WAIT_MAX_ITER's own 200ms-per-round budget, times
+// however many real rounds that entry count needs).
+//
+// So the budget is WALL-CLOCK time instead: keep examining entries
+// until FLOPPY_BROWSE_TNFS_CALL_TIME_BUDGET_US (80ms) of real elapsed
+// time has passed, or FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL entries have
+// been examined regardless (a generous outer safety cap only, never
+// meant to be the thing that actually triggers -- guards a pathological
+// case where every single round is a fast cache hit forever, which
+// should not be possible but costs nothing to also bound). This lets a
+// fast LAN server walk far more of a directory per dispatch call
+// (more real network rounds fit in 80ms when each one only costs a
+// couple of ms), while a slow/lossy connection naturally examines fewer
+// entries per call and returns IN_PROGRESS sooner -- both cases stay
+// within a bounded, predictable real-time budget for how long the Atari
+// bus goes unserviced, which is what actually matters, rather than an
+// indirect proxy like "how many entries."
+//
+// FLOPPY_BROWSE_TNFS_MAX_TOTAL_ROUNDS is the overall safety bound across
+// every resumed call for ONE page fetch (generous -- a floppy-image
+// collection is never expected to come close), guarding only against a
+// pathological server that never reaches TNFS_EOF.
 //
 // SD: local FatFS reads have no unbounded network wait, so a page always
 // finishes within a single call -- FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS is
 // cheap headroom against a runaway loop, not a deliberately-reached limit.
-#define FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL 32
+#define FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL 2000
+#define FLOPPY_BROWSE_TNFS_CALL_TIME_BUDGET_US 80000
 #define FLOPPY_BROWSE_TNFS_MAX_TOTAL_ROUNDS 100000
 #define FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS 20000
 
@@ -668,8 +687,21 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
         // dirs reaches real EOF partway through the budget, phase files
         // starts immediately and consumes whatever budget remains, rather
         // than waiting for a whole extra resumed call just to begin.
+        //
+        // Wall-clock budget, not just a round count -- see
+        // FLOPPY_BROWSE_TNFS_CALL_TIME_BUDGET_US's own comment. Checked
+        // once per round (not per network round trip inside
+        // sidetnfs_tnfs_raw_readdir(), which stays fast/cache-served most
+        // of the time) so a fast server naturally gets many more entries
+        // examined per dispatch call than a slow one, without needing to
+        // guess a single "safe" entry count for both.
+        absolute_time_t call_start = get_absolute_time();
         for (uint32_t round = 0; round < FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL; round++)
         {
+            if (absolute_time_diff_us(call_start, get_absolute_time()) >= FLOPPY_BROWSE_TNFS_CALL_TIME_BUDGET_US)
+            {
+                break; // time budget exhausted -- falls through to the IN_PROGRESS return below (finished stays false)
+            }
             if (!s_browse.walk_tnfs_handle_open)
             {
                 // s_browse.cwd alone, never mount_path+cwd -- see
