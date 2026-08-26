@@ -4350,7 +4350,21 @@ static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t 
 // than asked for," not corruption -- it only becomes a real problem if
 // that keeps happening across an entire directory of long names, which a
 // typical floppy-image filename collection is not expected to be.
-#define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 8
+// TEMPORARILY reverted to 1 (real-hardware behavior identical to the
+// pre-batching code): real-device testing showed errors appearing EARLIER
+// and MORE OFTEN as this was raised, including on page 1 -- the opposite
+// of what a pure network-latency theory would predict, and inconsistent
+// with a working multi-entry response. Root cause: this codebase's
+// existing multi-entry parser (fslisting_parse_batch(), used by
+// Fsfirst/Fsnext) has NEVER actually been exercised with batch>1 in
+// practice either -- its only caller always requests
+// SIDETNFS_READDIRX_MAX_ENTRIES=1 -- so the "entries repeat back-to-back
+// in the exact same 13-byte-header+name+NUL shape" assumption both
+// parsers share was never validated against a real server's actual
+// multi-entry response. Do not raise this again without independently
+// confirming that assumption against the real server (same caution this
+// project already applies to unverified opcodes like SEEKDIR/TELLDIR).
+#define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 1
 
 // Small cache of raw (already filtered: no "."/".."/SPECIAL/too-long)
 // entries from the most recent READDIRX round, so sidetnfs_tnfs_raw_readdir()
@@ -4477,6 +4491,22 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         return -1;
     }
 
+    // Separate, SMALL retry budget just for a timed-out READDIRX round --
+    // deliberately not folded into SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS
+    // (8), which exists for cheap, no-network-wait retries (a batch that
+    // parsed fine but filtered down to zero real entries). Each network
+    // retry here can cost up to SIDETNFS_FS_WAIT_MAX_ITER*
+    // SIDETNFS_FS_WAIT_STEP_US (200ms) of real waiting, and this function
+    // runs synchronously inside the main GEMDRIVE dispatch call that must
+    // keep servicing the time-critical Atari bus -- see the v1.0.4
+    // TNFS-reliability-fix regression this project already shipped once
+    // (git history) for exactly how expensive an unbounded retry-on-
+    // timeout habit can get. 2 retries (3 attempts, worst case ~600ms) is
+    // enough to ride out an occasional slow tick without risking anywhere
+    // near that regression's territory.
+#define SIDETNFS_FLOPPY_BROWSE_READDIRX_NETWORK_RETRIES 2
+    int network_retries_left = SIDETNFS_FLOPPY_BROWSE_READDIRX_NETWORK_RETRIES;
+
     for (int round = 0; round < SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS; round++)
     {
         if (s_raw_readdir_cache.next_index < s_raw_readdir_cache.count)
@@ -4499,7 +4529,24 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         }
         if (!fslisting_wait_for(&ctx, TNFS_CMD_READDIRX, seq))
         {
-            return -1;
+            // A single bounded (200ms) wait timing out is not necessarily
+            // a real failure -- a SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH-
+            // sized request legitimately takes the server measurably
+            // longer to prepare than the old one-entry-at-a-time request
+            // did, and deeper pages fire proportionally more of these
+            // rounds (each page re-walks from the start), so the
+            // cumulative chance of any single round landing right on a
+            // slow tick grows with page depth -- exactly the "error 13
+            // only from page 3 onward" symptom a real capture showed.
+            // Retry a small, bounded number of times instead of giving up
+            // on the very first timeout (see network_retries_left's own
+            // comment for why this is capped separately and tightly).
+            if (network_retries_left <= 0)
+            {
+                return -1;
+            }
+            network_retries_left--;
+            continue;
         }
         uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
         uint8_t batch = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
