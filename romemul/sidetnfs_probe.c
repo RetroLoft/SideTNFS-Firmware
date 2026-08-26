@@ -4328,6 +4328,56 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
 
 static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t expect_cmd, uint8_t expect_seq);
 
+// How many entries one READDIRX round requests for sidetnfs_tnfs_raw_readdir()
+// (FLOPPY.PRG's browser only -- entirely separate from
+// SIDETNFS_READDIRX_MAX_ENTRIES, which is the Fsfirst/Fsnext DTA-registry's
+// own knob and is left untouched here). Deliberately NOT the 16-32 range
+// floated when this was first proposed: the real ceiling is
+// s_fslisting_resp.buf's fixed SIDETNFS_RX_BUF_SIZE (256 bytes), which the
+// receive callback silently truncates a longer UDP datagram down to (see
+// tnfs_fslisting_recv_callback()) -- and the SERVER's own directory
+// position still advances past every entry it packed into that datagram,
+// whether or not our copy of it got truncated before we could parse that
+// far. Requesting too many entries for the actual name lengths present
+// therefore doesn't just risk a slow round; it risks silently skipping
+// entries forever (the truncated tail is never seen, and the next round
+// starts past it). 8 is a conservative bound: even at a generous ~24-byte
+// average name (13-byte fixed header + name + NUL each), 8 entries is
+// ~296 bytes -- already past 256 in the worst case, but the parser below
+// stops cleanly at whatever fits and simply serves fewer than requested
+// out of that round's cache rather than reading past the buffer, so a
+// single oversized batch degrades to "this round yielded fewer entries
+// than asked for," not corruption -- it only becomes a real problem if
+// that keeps happening across an entire directory of long names, which a
+// typical floppy-image filename collection is not expected to be.
+#define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 8
+
+// Small cache of raw (already filtered: no "."/".."/SPECIAL/too-long)
+// entries from the most recent READDIRX round, so sidetnfs_tnfs_raw_readdir()
+// can serve its documented "one entry per call" contract to
+// sidetnfs_floppy_browse.c without wasting the rest of a
+// SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH-sized response every single call.
+// Explicitly invalidated by sidetnfs_tnfs_raw_opendir() on every successful
+// open (below) -- NOT just left to the (slot, dir_handle) mismatch check in
+// sidetnfs_tnfs_raw_readdir() itself, since TNFS dir handles are small
+// server-assigned integers that get reused after a close: a fresh opendir
+// landing on the SAME handle number a previous, now-stale cache entry was
+// keyed on would otherwise look "still valid" and serve entries from the
+// WRONG directory. The mismatch check stays as a second layer (a genuinely
+// different handle number also invalidates), but opendir's explicit
+// invalidation is what actually closes the reuse gap.
+typedef struct
+{
+    bool valid;
+    int slot;
+    uint8_t dir_handle;
+    uint8_t count;      // valid (already-filtered) entries currently cached
+    uint8_t next_index; // index of the next not-yet-served entry
+    bool hit_eof;       // the round that filled this cache saw TNFS_EOF -- once drained, end of directory, no further round needed
+    SidetnfsTnfsRawEntry entries[SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH];
+} sidetnfs_tnfs_raw_readdir_cache_t;
+static sidetnfs_tnfs_raw_readdir_cache_t s_raw_readdir_cache = {0};
+
 // Opens `tnfs_path` (already normalized and rooted under the profile's own
 // mount_path by the caller -- this function does no path manipulation of
 // its own) for raw listing on runtime slot `slot`'s existing TNFS session.
@@ -4366,6 +4416,10 @@ SidetnfsTnfsDirOpenResult sidetnfs_tnfs_raw_opendir(int slot, const char *tnfs_p
     s_fslisting_resp.response_ready = false;
     if (rc == TNFS_OK)
     {
+        // See s_raw_readdir_cache's own comment: a fresh handle must never
+        // be served stale cached entries from a previous directory that
+        // happened to reuse the same handle number.
+        s_raw_readdir_cache.valid = false;
         *out_handle = handle;
         return SIDETNFS_TNFS_DIR_OK;
     }
@@ -4403,15 +4457,43 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
     {
         return -1;
     }
+
+    if (!s_raw_readdir_cache.valid || s_raw_readdir_cache.slot != slot || s_raw_readdir_cache.dir_handle != dir_handle)
+    {
+        // A different handle than whatever this cache last held -- always
+        // true on a fresh opendir (Step 2/3 never has two browse handles
+        // open at once), so this is really "first call on this handle."
+        s_raw_readdir_cache.valid = true;
+        s_raw_readdir_cache.slot = slot;
+        s_raw_readdir_cache.dir_handle = dir_handle;
+        s_raw_readdir_cache.count = 0;
+        s_raw_readdir_cache.next_index = 0;
+        s_raw_readdir_cache.hit_eof = false;
+    }
+
     sidetnfs_slot_tnfs_context_t ctx;
     if (!sidetnfs_probe_get_slot_context(slot, &ctx))
     {
         return -1;
     }
+
     for (int round = 0; round < SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS; round++)
     {
+        if (s_raw_readdir_cache.next_index < s_raw_readdir_cache.count)
+        {
+            *out = s_raw_readdir_cache.entries[s_raw_readdir_cache.next_index];
+            s_raw_readdir_cache.next_index++;
+            return 1;
+        }
+        if (s_raw_readdir_cache.hit_eof)
+        {
+            return 0; // cache fully served and the round that filled it already saw TNFS_EOF -- no more to fetch
+        }
+
+        // Cache empty (first call, or fully served and not yet at EOF) --
+        // fetch and parse a fresh batch.
         uint8_t seq = 0;
-        if (!fslisting_send_readdirx(&ctx, dir_handle, (uint8_t)SIDETNFS_READDIRX_MAX_ENTRIES, &seq))
+        if (!fslisting_send_readdirx(&ctx, dir_handle, (uint8_t)SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH, &seq))
         {
             return -1;
         }
@@ -4428,47 +4510,67 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         {
             return -1;
         }
+
+        s_raw_readdir_cache.count = 0;
+        s_raw_readdir_cache.next_index = 0;
+        s_raw_readdir_cache.hit_eof = (rc == TNFS_EOF);
+
         if (batch == 0 || resp_len <= 9)
         {
-            return 0; // nothing in this response -- end of directory
+            continue; // nothing in this response -- if hit_eof, the next loop iteration returns 0 above
         }
 
         // Same byte layout fslisting_parse_batch() uses (needle=9):
         // flags(1) + size(4 LE, unused here) + mtime(4 LE, unused) +
-        // ctime(4 LE, unused) + NUL-terminated name.
+        // ctime(4 LE, unused) + NUL-terminated name, repeated up to
+        // `batch` times -- stop cleanly (never read past resp_len) the
+        // moment an entry doesn't fully fit, which is exactly what
+        // happens when the server's own batch got truncated by
+        // SIDETNFS_RX_BUF_SIZE on the way in (see
+        // SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH's own comment) --
+        // whatever fit gets served as this round's cache, same as a
+        // smaller real batch would.
         const uint8_t *buf = s_fslisting_resp.buf;
-        const uint16_t needle = 9;
-        if ((uint32_t)needle + 13 >= resp_len)
+        uint16_t needle = 9;
+        for (uint8_t i = 0; i < batch && s_raw_readdir_cache.count < SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH; i++)
         {
-            return 0; // malformed/truncated response -- treat as end of directory, never read past the buffer
-        }
-        uint8_t flags = buf[needle];
-        const char *name = (const char *)&buf[needle + 13];
-        uint16_t avail = (uint16_t)(resp_len - (needle + 13));
-        size_t nlen = strnlen(name, avail);
-        if (nlen >= avail)
-        {
-            return 0; // name ran off the end of the response -- malformed, stop rather than read garbage past it
-        }
-
-        bool is_dot = (nlen == 0) || (name[0] == '.' && (nlen == 1 || (name[1] == '.' && nlen == 2)));
-        bool is_special = (flags & TNFS_DIRENTRY_SPECIAL) != 0;
-        bool name_fits = nlen < sizeof(out->name);
-        if (is_dot || is_special || !name_fits)
-        {
-            // A too-long name is skipped here (never truncated into a
-            // different, shorter name) -- s_fslisting_resp.buf is only 256
-            // bytes so this should not be reachable in practice, but the
-            // contract ("skip, never truncate") is enforced regardless.
-            if (rc == TNFS_EOF)
+            if ((uint32_t)needle + 13 >= resp_len)
             {
-                return 0; // that skipped entry was the last one
+                break; // truncated mid-entry -- stop, never read past the buffer
             }
-            continue;
+            uint8_t flags = buf[needle];
+            const char *name = (const char *)&buf[needle + 13];
+            uint16_t avail = (uint16_t)(resp_len - (needle + 13));
+            size_t nlen = strnlen(name, avail);
+            if (nlen >= avail)
+            {
+                break; // name ran off the end of the response -- same truncation guard
+            }
+            needle = (uint16_t)(needle + 13 + (uint16_t)nlen + 1);
+
+            bool is_dot = (nlen == 0) || (name[0] == '.' && (nlen == 1 || (name[1] == '.' && nlen == 2)));
+            bool is_special = (flags & TNFS_DIRENTRY_SPECIAL) != 0;
+            bool name_fits = nlen < sizeof(out->name);
+            if (is_dot || is_special || !name_fits)
+            {
+                // A too-long name is skipped here (never truncated into a
+                // different, shorter name) -- SidetnfsTnfsRawEntry.name is
+                // SIDETNFS_TNFS_RAW_NAME_MAX (256) bytes, larger than
+                // s_fslisting_resp.buf itself, so this should not be
+                // reachable in practice, but the contract ("skip, never
+                // truncate") is enforced regardless.
+                continue;
+            }
+            SidetnfsTnfsRawEntry *slot_entry = &s_raw_readdir_cache.entries[s_raw_readdir_cache.count];
+            memcpy(slot_entry->name, name, nlen + 1);
+            slot_entry->is_dir = (flags & TNFS_DIRENTRY_DIR) != 0;
+            s_raw_readdir_cache.count++;
         }
-        memcpy(out->name, name, nlen + 1);
-        out->is_dir = (flags & TNFS_DIRENTRY_DIR) != 0;
-        return 1;
+        // Loop back around: serves from the freshly filled cache above if
+        // it got anything, or (if every entry this round was filtered
+        // out, or the round was empty) either fetches another round or
+        // returns 0 via the hit_eof check, bounded by
+        // SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS either way.
     }
     return -1; // gave up after SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS rounds
 }
