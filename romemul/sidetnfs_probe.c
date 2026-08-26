@@ -258,10 +258,31 @@ char sidetnfs_probe_get_active_drive_letter(void)
 #define SIDETNFS_DEBUG_RAW_SIZE 16
 #define SIDETNFS_DEBUG_WRITE_MIN_INTERVAL_MS 250
 
-// Response parse buffer: large enough for a READDIRX batch (a few entries
-// with short 8.3-style Atari names). MOUNT/OPENDIRX responses are much
-// smaller and always fit comfortably too.
+// Response parse buffer for the MOUNT/OPENDIRX/READDIRX probe channel
+// (tnfs_recv_callback()/SidetnfsProbeResponse's own buf below): large
+// enough for a READDIRX batch of a few entries with short 8.3-style Atari
+// names (the only thing that channel ever carries). NOT used by the
+// fs-listing channel below, which needs its own, much larger buffer for
+// FLOPPY.PRG's LFN browse (see SIDETNFS_FSLISTING_RX_BUF_SIZE).
 #define SIDETNFS_RX_BUF_SIZE 256
+
+// Response parse buffer for the fs-listing channel (SidetnfsFsListingResponse.buf
+// below -- Fsfirst/Fsnext's DTA-registry reads AND FLOPPY.PRG's LFN
+// browse both funnel through this one shared buffer). Sized for a
+// SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH-sized (15) batch of REAL LFN
+// names, not the short 8.3-style names SIDETNFS_RX_BUF_SIZE above was
+// sized for -- FLOPPY_BROWSE_NAME_LEN allows up to 255-byte names, so
+// even a handful of realistically long floppy-image filenames could
+// exceed the old 256-byte buffer, silently truncating a batched READDIRX
+// response and desyncing the server's own directory cursor from what got
+// parsed (see SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH's own comment in
+// sidetnfs_probe.c for why that particular failure mode is worse than a
+// merely-short response). 2048 comfortably covers 15 entries at a ~120-byte
+// average name (13-byte fixed header + name + NUL each) with real margin
+// to spare, while staying a small fraction of this project's available
+// static RAM (see the v1.0.4 ROM_IN_RAM/heap investigation in git history
+// for how that budget was established).
+#define SIDETNFS_FSLISTING_RX_BUF_SIZE 2048
 
 // Entries requested per READDIRX round-trip, and a hard cap on the number
 // of round-trips so a pathological/misbehaving server can never turn this
@@ -1868,7 +1889,7 @@ typedef struct
     volatile bool response_ready;
     uint8_t cmd;
     uint8_t seq; // echoed sequence number, for cmd+seq correlation
-    uint8_t buf[SIDETNFS_RX_BUF_SIZE];
+    uint8_t buf[SIDETNFS_FSLISTING_RX_BUF_SIZE];
     uint16_t len;
 } SidetnfsFsListingResponse;
 
@@ -4345,40 +4366,34 @@ static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t 
 // How many entries one READDIRX round requests for sidetnfs_tnfs_raw_readdir()
 // (FLOPPY.PRG's browser only -- entirely separate from
 // SIDETNFS_READDIRX_MAX_ENTRIES, which is the Fsfirst/Fsnext DTA-registry's
-// own knob and is left untouched here). Deliberately NOT the 16-32 range
-// floated when this was first proposed: the real ceiling is
-// s_fslisting_resp.buf's fixed SIDETNFS_RX_BUF_SIZE (256 bytes), which the
-// receive callback silently truncates a longer UDP datagram down to (see
-// tnfs_fslisting_recv_callback()) -- and the SERVER's own directory
-// position still advances past every entry it packed into that datagram,
-// whether or not our copy of it got truncated before we could parse that
-// far. Requesting too many entries for the actual name lengths present
-// therefore doesn't just risk a slow round; it risks silently skipping
-// entries forever (the truncated tail is never seen, and the next round
-// starts past it). 8 is a conservative bound: even at a generous ~24-byte
-// average name (13-byte fixed header + name + NUL each), 8 entries is
-// ~296 bytes -- already past 256 in the worst case, but the parser below
-// stops cleanly at whatever fits and simply serves fewer than requested
-// out of that round's cache rather than reading past the buffer, so a
-// single oversized batch degrades to "this round yielded fewer entries
-// than asked for," not corruption -- it only becomes a real problem if
-// that keeps happening across an entire directory of long names, which a
-// typical floppy-image filename collection is not expected to be.
-// TEMPORARILY reverted to 1 (real-hardware behavior identical to the
-// pre-batching code): real-device testing showed errors appearing EARLIER
-// and MORE OFTEN as this was raised, including on page 1 -- the opposite
-// of what a pure network-latency theory would predict, and inconsistent
-// with a working multi-entry response. Root cause: this codebase's
-// existing multi-entry parser (fslisting_parse_batch(), used by
-// Fsfirst/Fsnext) has NEVER actually been exercised with batch>1 in
-// practice either -- its only caller always requests
-// SIDETNFS_READDIRX_MAX_ENTRIES=1 -- so the "entries repeat back-to-back
-// in the exact same 13-byte-header+name+NUL shape" assumption both
-// parsers share was never validated against a real server's actual
-// multi-entry response. Do not raise this again without independently
-// confirming that assumption against the real server (same caution this
-// project already applies to unverified opcodes like SEEKDIR/TELLDIR).
-#define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 1
+// own knob and is left untouched here).
+//
+// History: first tried at 8, with the receive buffer still at the old
+// SIDETNFS_RX_BUF_SIZE (256 bytes, sized only for Fsfirst/Fsnext's short
+// 8.3-style names). Real-hardware testing showed errors appearing EARLIER
+// and MORE OFTEN as this was raised, including on page 1 -- reverted to 1
+// (pre-batching behavior) as a precaution, on the theory that the
+// multi-entry parser's "entries repeat back-to-back in the exact same
+// 13-byte-header+name+NUL shape" assumption (shared with
+// fslisting_parse_batch(), also never exercised with batch>1 in practice)
+// might not hold against the real server.
+//
+// Real EVENTLOG.TXT captures added since then (SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL/
+// SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR) told a different story: the
+// actual failure was sidetnfs_tnfs_raw_readdir() exhausting
+// SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS with every round getting a clean,
+// non-timeout response that just never signaled TNFS_EOF (now handled
+// gracefully -- see that function's own comment on its final return).
+// That failure mode is independent of batch size and reproduced even at
+// batch=1, so the multi-entry-parser-format worry above was never
+// actually confirmed as a real problem -- it just hadn't been
+// re-attempted with a properly-sized buffer yet. s_fslisting_resp.buf is
+// now SIDETNFS_FSLISTING_RX_BUF_SIZE (2048, see its own comment) instead
+// of the old 256, comfortably fitting a 15-entry batch of real LFN names
+// without the truncation/server-cursor-desync risk that size was never
+// meant to survive. Back to 15 -- one full FLOPPY_BROWSE_PAGE_ENTRIES
+// page's worth of dir-or-file entries in a single network round trip.
+#define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 15
 
 // Small cache of raw (already filtered: no "."/".."/SPECIAL/too-long)
 // entries from the most recent READDIRX round, so sidetnfs_tnfs_raw_readdir()
@@ -4645,12 +4660,22 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         // SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS either way.
     }
     // result=5: exhausted SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS without a
-    // real entry, EOF, or a hard failure above -- every round's batch
-    // parsed fine but filtered down to zero real entries (or genuinely
-    // ran out of both filter- and network-retry budget together).
+    // real entry, a genuine EOF, or a network/protocol failure above --
+    // every one of the SKIP_ROUNDS rounds got a normal (non-timeout,
+    // rc==OK/EOF) response that just parsed down to zero usable entries
+    // (dot/special/too-long). A real capture (network_retries_left still
+    // at its initial value here -- confirmed via this exact event -- so
+    // not a timeout pattern) showed this: 8 straight rounds, no EOF ever
+    // signaled. Rather than fail the whole page over what looks like a
+    // server quirk (some directories apparently don't cleanly flag
+    // TNFS_EOF the way this code expected), treat exhausting this budget
+    // as "nothing more to offer from here" -- same as a real EOF -- and
+    // let the walk finish gracefully instead of erroring the caller out.
+    // Worst case this stops a fraction of one directory's worth of
+    // entries early; that beats leaving FLOPPY.PRG's browser stuck empty.
     sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL,
                        (uint16_t)SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS, (uint16_t)network_retries_left, 5, 0);
-    return -1; // gave up after SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS rounds
+    return 0;
 }
 
 // Best-effort CLOSEDIR -- mirrors tnfs_dta_closedir()'s own contract
