@@ -1344,6 +1344,10 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "FSLISTING_ENVELOPE_EXPECTED";
     case SIDETNFS_DIAG_FSLISTING_ENVELOPE_ACTUAL:
         return "FSLISTING_ENVELOPE_ACTUAL";
+    case SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL:
+        return "FLOPPY_RAW_READDIR_FAIL";
+    case SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR:
+        return "FLOPPY_GET_PAGE_BACKEND_ERROR";
     default:
         return "UNKNOWN";
     }
@@ -1444,7 +1448,17 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
         {
             return;
         }
-        int n = snprintf(path, sizeof(path), "/EVENTLOG.TXT");
+        // Same "/hd" folder PARAM_GEMDRIVE_FOLDERS defaults to (config.c)
+        // and the hd_folder-populated branch above already writes into --
+        // this fallback only exists for the crash-before-hd_folder-ready
+        // window, and should still land in the one place a user actually
+        // looks for it. f_mkdir() is best-effort: FR_EXIST (folder
+        // already there, the overwhelmingly common case) and any other
+        // failure are both ignored here -- f_open() right below is the
+        // real, authoritative check, and its own failure already returns
+        // silently.
+        f_mkdir("/hd");
+        int n = snprintf(path, sizeof(path), "/hd/EVENTLOG.TXT");
         if (n <= 0 || (size_t)n >= sizeof(path))
         {
             return;
@@ -4488,6 +4502,8 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
     sidetnfs_slot_tnfs_context_t ctx;
     if (!sidetnfs_probe_get_slot_context(slot, &ctx))
     {
+        // result=1: slot context unavailable.
+        sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL, 0, 0, 1, 0);
         return -1;
     }
 
@@ -4525,6 +4541,8 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         uint8_t seq = 0;
         if (!fslisting_send_readdirx(&ctx, dir_handle, (uint8_t)SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH, &seq))
         {
+            // result=2: could not even send the READDIRX request this round.
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL, (uint16_t)round, 0, 2, 0);
             return -1;
         }
         if (!fslisting_wait_for(&ctx, TNFS_CMD_READDIRX, seq))
@@ -4543,6 +4561,9 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
             // comment for why this is capped separately and tightly).
             if (network_retries_left <= 0)
             {
+                // result=3: wait_for timed out and the network-retry budget is exhausted.
+                sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL, (uint16_t)round, 0, 3,
+                                   0);
                 return -1;
             }
             network_retries_left--;
@@ -4555,6 +4576,10 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
 
         if (rc != TNFS_OK && rc != TNFS_EOF)
         {
+            // result=4: response arrived but rc is neither OK nor EOF --
+            // attr carries the actual rc byte, count carries resp_len.
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL, (uint16_t)round, resp_len,
+                               4, rc);
             return -1;
         }
 
@@ -4619,6 +4644,12 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
         // returns 0 via the hit_eof check, bounded by
         // SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS either way.
     }
+    // result=5: exhausted SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS without a
+    // real entry, EOF, or a hard failure above -- every round's batch
+    // parsed fine but filtered down to zero real entries (or genuinely
+    // ran out of both filter- and network-retry budget together).
+    sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL, 0, NULL, NULL, NULL,
+                       (uint16_t)SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS, (uint16_t)network_retries_left, 5, 0);
     return -1; // gave up after SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS rounds
 }
 

@@ -687,6 +687,17 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
             int r = sidetnfs_tnfs_raw_readdir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle, &entry);
             if (r < 0)
             {
+                // "error 13" investigation: ndta carries walk_matched
+                // (this phase's own skip/collect progress at the moment
+                // of failure), index=outer round, count=walk_collected
+                // (combined across phases), result=1 dirs phase/2 files
+                // phase, attr=page_index (fits a byte for realistic UIs).
+                // Paired with the SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL
+                // event sidetnfs_tnfs_raw_readdir() itself just logged
+                // (the actual reason this call returned -1).
+                sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR, s_browse.walk_matched, NULL, NULL,
+                                   NULL, (uint16_t)round, s_browse.walk_collected,
+                                   s_browse.walk_files_phase ? 2 : 1, (uint8_t)page_index);
                 backend_error = true;
                 break;
             }

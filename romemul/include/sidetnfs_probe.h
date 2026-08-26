@@ -1518,6 +1518,14 @@ typedef enum
     // addr/port/session id).
     SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED,
     SIDETNFS_DIAG_FSLISTING_ENVELOPE_ACTUAL,
+    // FLOPPY.PRG browse Step 3 deep-page "error 13" investigation.
+    // Logged by sidetnfs_tnfs_raw_readdir() (sidetnfs_probe.c) right
+    // before it returns -1, and by sidetnfs_floppy_browse_get_page()
+    // (sidetnfs_floppy_browse.c) when that -1 turns into backend_error.
+    // index/count/result/attr are repurposed per event -- see each call
+    // site's own comment for what they carry.
+    SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL,
+    SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR,
 } SidetnfsDiagEventType;
 
 // SIDETNFS_DIAG_MAX_EVENTS itself is defined in debug.h.
