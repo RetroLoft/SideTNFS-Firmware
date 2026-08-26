@@ -34,7 +34,15 @@
 #include <hardware/watchdog.h>
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/cyw43_arch.h"
+
+// See romemul/include/rtcemul.h for why this is board-conditional (RP2350
+// has no hardware_rtc peripheral/library) -- gemdrvemul.c calls rtc_init()
+// directly, so it needs the same rtc_compat.h shim on non-RP2040 boards.
+#if PICO_RP2040
 #include "hardware/rtc.h"
+#else
+#include "rtc_compat.h"
+#endif
 
 #include "sd_card.h"
 #include "f_util.h"

@@ -44,7 +44,11 @@ static spi_t spis[] = { // One for each SPI.
         .miso_gpio = 4,  // GPIO number (not pin number)
         .mosi_gpio = 3,
         .sck_gpio = 2,
-        .use_exclusive_DMA_IRQ_handler = true,
+        // fatfs-sdk bump (v1.2.4-era branch -> v3.5.1): `use_exclusive_DMA_IRQ_handler`
+        // moved off spi_t (it's now sd_sdio_if_t-only, for the SDIO path we don't
+        // use); spi_t instead grew use_static_dma_channels/tx_dma/rx_dma, which we
+        // leave at their defaults (auto-claimed DMA channels, same effective
+        // behavior as before).
         //.baud_rate = 1 * 1000 * 1000,
         .baud_rate = 12.5 * 1000 * 1000,
         //.baud_rate = 25 * 1000 * 1000, // Actual frequency: 20833333.
@@ -60,7 +64,13 @@ static sd_spi_if_t spi_ifs[] = {
 // Hardware Configuration of the SD Card "objects"
 static sd_card_t sd_cards[] = { // One for each SD card
     {
-        .pcName = "0:", // Name used to mount device
+        // fatfs-sdk bump (v1.2.4-era branch -> v3.5.1): `pcName` was removed from
+        // sd_card_t -- the mount prefix is now derived dynamically from the card's
+        // index in sd_get_by_num() (sd_set_drive_prefix(), sd_card.c), which still
+        // yields "0:" for this single-card config. Nothing in this project reads
+        // sd_card_t.pcName -- SD mounting elsewhere uses the raw FatFs API with a
+        // literal "0:" (see sidetnfs_sd_service.c, gemdrvemul.c), so behavior is
+        // unchanged.
         .type = SD_IF_SPI,
         .spi_if_p = &spi_ifs[0], // Pointer to the SPI driving this card
         .use_card_detect = false,

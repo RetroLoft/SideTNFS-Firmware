@@ -1,6 +1,25 @@
 # Set minimum required version of CMake
 cmake_minimum_required(VERSION 3.12)
 
+# If not specified, use pico_w as default board type.
+#
+# SDK-2.x note: pico-sdk >= 2.0 resolves PICO_BOARD (and derives
+# PICO_PLATFORM/the toolchain from it) inside pico_pre_load_platform.cmake,
+# which runs as part of `include(pico_sdk_import.cmake)` below -- i.e.
+# strictly BEFORE project(). Under SDK 1.5.1 the equivalent resolution
+# happened later (at pico_sdk_init()/project() time), so setting PICO_BOARD
+# *after* the SDK import (as this file used to, right before
+# pico_sdk_init()) was harmless there. On 2.x it silently locks the board's
+# CMake config (board_config, incl. things like PICO_CYW43_SUPPORTED) to
+# the default "pico" board before our own BOARD_TYPE logic ever runs,
+# which breaks pico_w (missing pico/cyw43_arch.h) and would equally break
+# pico2_w. So this whole block must come before the SDK imports now.
+set(BOARD_TYPE $ENV{BOARD_TYPE})
+if(NOT BOARD_TYPE)
+    set(BOARD_TYPE "pico_w")
+endif()
+set(PICO_BOARD ${BOARD_TYPE})
+
 # Include build functions from Pico SDK
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
@@ -8,13 +27,6 @@ include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 # Set name of project (as PROJECT_NAME) and C/C   standards
 project(romemul C CXX ASM)
 set(CMAKE_C_STANDARD 11)
-
-# If not specified, use pico_w as default board type
-set(BOARD_TYPE $ENV{BOARD_TYPE})
-if(NOT BOARD_TYPE)
-    set(BOARD_TYPE "pico_w")
-endif()
-set(PICO_BOARD ${BOARD_TYPE})
 
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
@@ -71,8 +83,13 @@ target_sources(${PROJECT_NAME} PRIVATE usb_mass.c)
 add_subdirectory($ENV{FATFS_SDK_PATH}/src build)
 
 # Link to pico_stdlib (gpio, time, etc. functions)
+# fatfs-sdk bump (v1.2.4-era branch -> v3.5.1): the library's own CMakeLists.txt
+# renamed its INTERFACE target from `FatFs_SPI` to
+# `no-OS-FatFS-SD-SDIO-SPI-RPi-Pico` (matching the repo's own rename from
+# no-OS-FatFS-SD-SPI-RPi-Pico to no-OS-FatFS-SD-SDIO-SPI-RPi-Pico) -- old name no
+# longer exists, so this had to follow.
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        FatFs_SPI                # for SD card access
+        no-OS-FatFS-SD-SDIO-SPI-RPi-Pico # for SD card access
         pico_stdlib              # for core functionality
         hardware_pio             # for GPIO
         hardware_dma             # for DMA
@@ -80,9 +97,20 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         tinyusb_device           # for USB
         )
 
-# Link custom memmap with reserved memory for ROMs
+# Link custom memmap with reserved memory for ROMs.
+# RP2350 (pico2_w) needs a different linker script: it boots via a picobin
+# IMAGE_DEF metadata block instead of a boot2 entry vector, has a bigger
+# binary_info budget, and its SCRATCH_X/SCRATCH_Y banks sit at different
+# fixed addresses -- see memmap_romemul_rp2350.ld's header comment for the
+# full list of deltas from memmap_romemul.ld (the RP2040/pico_w script,
+# unchanged).
+if (PICO_RP2040)
+        set(SIDETNFS_LINKER_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/memmap_romemul.ld)
+else()
+        set(SIDETNFS_LINKER_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/memmap_romemul_rp2350.ld)
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES
-        PICO_TARGET_LINKER_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/memmap_romemul.ld
+        PICO_TARGET_LINKER_SCRIPT ${SIDETNFS_LINKER_SCRIPT}
 )
 
 # Use reduced space for ROMs
@@ -224,6 +252,14 @@ add_definitions(-DLATEST_RELEASE_URL="${LATEST_RELEASE_URL}")
 
 # Pass the _DEBUG flag to the C compiler
 add_definitions(-D_DEBUG=${_DEBUG})
+
+# RP2350 support: pico-sdk only defaults PICO_INCLUDE_RTC_DATETIME (which
+# gates datetime_t and the datetime_t<->struct tm converters used by
+# romemul/include/rtc_compat.h) to 1 on RP2040 -- force it on unconditionally
+# so pico_w keeps its existing behavior (already 1 there by default; this is
+# a no-op restatement) and pico2_w gets the same datetime_t API surface.
+# See rtc_compat.h / rtcemul.h for why this is needed.
+add_definitions(-DPICO_INCLUDE_RTC_DATETIME=1)
 
 message("SIDETNFS_ENABLE_DEBUG: " ${_SIDETNFS_ENABLE_DEBUG})
 message("SIDETNFS_ENABLE_DIAG: " ${_SIDETNFS_ENABLE_DIAG})

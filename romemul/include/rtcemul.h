@@ -22,7 +22,23 @@
 #include <hardware/watchdog.h>
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/cyw43_arch.h"
+
+// RP2350 note: the RP2040 `hardware_rtc` peripheral/library does not exist
+// on RP2350 (pico-sdk's rp2_common.cmake only adds it `if (PICO_RP2040 OR
+// PICO_COMBINED_DOCS)` -- RP2350 replaced the RTC block with the Power
+// Manager's "Powman" always-on timer). The SDK's own cross-chip
+// abstraction for this is pico_aon_timer (pico/aon_timer.h), which on
+// RP2040 is a thin wrapper around the same hardware_rtc calls used below,
+// and on RP2350 drives hardware_powman instead -- so we route through it
+// only for RP2350 and leave the original RP2040 hardware_rtc calls
+// (rtc_init/rtc_get_datetime/rtc_set_datetime, used as-is by rtcemul.c and
+// gemdrvemul.c) completely untouched there. See rtc_compat.h for the
+// small shim providing the same 3 call signatures on top of pico_aon_timer.
+#if PICO_RP2040
 #include "hardware/rtc.h"
+#else
+#include "rtc_compat.h"
+#endif
 
 #include "time.h"
 

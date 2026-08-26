@@ -11,18 +11,35 @@ cd fatfs-sdk
 #git checkout tags/v1.1.1
 #git checkout v1.2.4
 #git checkout v2.6.0
-git checkout v1.2.4
+# Bumped to v3.5.1 alongside the pico-sdk 2.2.0 upgrade below: the
+# previously-pinned v1.2.4 branch does not build against pico-sdk 2.2.0
+# (uses `enum gpio_function` / `padsbank0_hw`, both removed/renamed in
+# SDK 2.x -- see rp2040_sdio.c / sd_card_sdio.c). v3.5.1 is a tagged
+# release that already contains RP2350 support (carlk3 commits
+# "Make it work on the RP2350" / "Port to RP2350 RISC-V mode" are its
+# ancestors) and sits 8 commits before the exact fatfs-sdk commit pinned
+# by the sibling md-microfirmware-template project.
+git checkout v3.5.1
 
 cd ../pico-sdk
-git checkout tags/1.5.1
+git checkout tags/2.2.0
+git submodule update --init --recursive
 
 cd ../pico-extras
-git checkout tags/sdk-1.5.1
+git checkout tags/sdk-2.2.0
 cd ..
 
 # This is a dirty hack to guarantee that I can use the fatfs-sdk submodule
+# NOTE: as of the fatfs-sdk v3.5.1 bump, romemul/ffconf.h (this project's
+# own copy, already carrying FF_USE_CHMOD=1) is what actually governs the
+# build -- it sits ahead of fatfs-sdk's own ffconf.h on the include path
+# for every fatfs-sdk source file compiled into the romemul target (see
+# `target_include_directories(romemul PRIVATE ...)` in romemul/CMakeLists.txt).
+# This sed against fatfs-sdk's own copy is kept only for belt-and-suspenders
+# safety (and updated to the new path -- v3.5.1 moved ffconf.h from
+# src/ff15/source/ to src/include/).
 echo "Patching the fatfs-sdk... to use chmod"
-sed -i.bak 's/#define FF_USE_CHMOD[[:space:]]*0/#define FF_USE_CHMOD 1/' fatfs-sdk/src/ff15/source/ffconf.h && mv fatfs-sdk/src/ff15/source/ffconf.h.bak .
+sed -i.bak 's/#define FF_USE_CHMOD[[:space:]]*0/#define FF_USE_CHMOD 1/' fatfs-sdk/src/include/ffconf.h && mv fatfs-sdk/src/include/ffconf.h.bak .
 
 # Set the environment variables of the SDKs
 export FATFS_SDK_PATH=$PWD/fatfs-sdk
