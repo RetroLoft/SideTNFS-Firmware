@@ -2965,6 +2965,38 @@ void sidetnfs_probe_mount_runtime_slots(void)
     }
 }
 
+bool sidetnfs_probe_mount_slot(int slot)
+{
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS)
+    {
+        return false;
+    }
+    if (!s_slot_contexts[slot].valid || s_slot_contexts[slot].backend_type != SIDETNFS_DRIVE_TNFS ||
+        s_slot_contexts[slot].transport != SIDETNFS_TRANSPORT_UDP)
+    {
+        return false;
+    }
+    if (s_slot_contexts[slot].session_established)
+    {
+        return true; // already mounted -- no-op, matches this function's own contract
+    }
+    if (!ensure_slot_address(slot))
+    {
+        return false; // unresolvable host -- slot's own host_unresolvable is already set
+    }
+    send_slot_mount_request(slot);
+    bool ok = wait_for_mount_response(&s_slot_contexts[slot].response_received);
+    if (s_mount_pending_slot == slot)
+    {
+        s_mount_pending_slot = -1;
+    }
+    DPRINTF("TNFS mount slot %d (%s) path=%s: %s rc=%u sid=0x%04X\n",
+            slot, s_slot_contexts[slot].host, s_slot_contexts[slot].mount_path,
+            ok ? "responded" : "TIMED OUT",
+            s_slot_contexts[slot].mount_result, s_slot_contexts[slot].session_id);
+    return s_slot_contexts[slot].session_established;
+}
+
 // Send a single OPENDIRX "/" request over the existing MOUNT PCB,
 // using the session id learned from the MOUNT response. Fire-and-forget,
 // same non-blocking guarantees as sidetnfs_send_mount_probe().
@@ -4268,6 +4300,198 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
         }
     }
     return count;
+}
+
+// ------------------------------------------------------------------
+// Raw (un-normalized, no 8.3 filtering/aliasing/case conversion) TNFS
+// directory access for FLOPPY.PRG's own LFN browser
+// (sidetnfs_floppy_browse.c, Step 2). Deliberately separate from the
+// SidetnfsAtariDirEntry/fslisting_parse_batch()/sidetnfs_tnfs_dta_start()
+// family above (which exists to serve GEMDOS Fsfirst/Fsnext and is
+// permanently 8.3-shaped) -- these three functions are the ONLY new TNFS
+// wire code Step 2 adds; everything else (fslisting_send_opendirx/
+// readdirx/closedir, fslisting_wait_for, s_fslisting_resp, the per-slot
+// mount/session machinery) is reused as-is. Names are handed back exactly
+// as TNFS sent them, NUL-terminated, up to SIDETNFS_TNFS_RAW_NAME_MAX-1
+// bytes -- s_fslisting_resp.buf itself is only SIDETNFS_RX_BUF_SIZE (256)
+// bytes, so a real name can never actually reach that bound; the
+// destination-size check in sidetnfs_tnfs_raw_readdir() below exists
+// purely as defense in depth, never as the primary bound.
+//
+// SidetnfsTnfsDirOpenResult/SidetnfsTnfsRawEntry are declared in
+// sidetnfs_probe.h (this file's own header), not here.
+//
+// fslisting_wait_for() is defined further down this file (after the TNFS
+// DTA-registry block) -- forward-declared here, same convention
+// tnfs_dta_closedir() already uses just below for the same reason.
+// ------------------------------------------------------------------
+
+static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t expect_cmd, uint8_t expect_seq);
+
+// Opens `tnfs_path` (already normalized and rooted under the profile's own
+// mount_path by the caller -- this function does no path manipulation of
+// its own) for raw listing on runtime slot `slot`'s existing TNFS session.
+// *out_handle is only meaningful when this returns SIDETNFS_TNFS_DIR_OK.
+SidetnfsTnfsDirOpenResult sidetnfs_tnfs_raw_opendir(int slot, const char *tnfs_path, uint8_t *out_handle)
+{
+    if (tnfs_path == NULL || out_handle == NULL)
+    {
+        return SIDETNFS_TNFS_DIR_ERROR;
+    }
+    if (strlen(tnfs_path) >= MAX_FOLDER_LENGTH)
+    {
+        // fslisting_send_opendirx() copies tnfs_path via
+        // strnlen(tnfs_path, MAX_FOLDER_LENGTH - 1) -- silently capping a
+        // longer path instead of rejecting it. Reject explicitly here so a
+        // too-long CWD+name can never resolve to a different, truncated
+        // directory on the server.
+        return SIDETNFS_TNFS_DIR_PATH_TOO_LONG;
+    }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return SIDETNFS_TNFS_DIR_ERROR;
+    }
+    uint8_t seq = 0;
+    if (!fslisting_send_opendirx(&ctx, tnfs_path, &seq))
+    {
+        return SIDETNFS_TNFS_DIR_ERROR;
+    }
+    if (!fslisting_wait_for(&ctx, TNFS_CMD_OPENDIRX, seq))
+    {
+        return SIDETNFS_TNFS_DIR_ERROR;
+    }
+    uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+    uint8_t handle = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+    s_fslisting_resp.response_ready = false;
+    if (rc == TNFS_OK)
+    {
+        *out_handle = handle;
+        return SIDETNFS_TNFS_DIR_OK;
+    }
+    if (rc == TNFS_ENOENT || rc == TNFS_ENOTDIR)
+    {
+        return SIDETNFS_TNFS_DIR_NOT_FOUND;
+    }
+    if (rc == TNFS_EACCES)
+    {
+        return SIDETNFS_TNFS_DIR_ACCESS_DENIED;
+    }
+    return SIDETNFS_TNFS_DIR_ERROR;
+}
+
+// Small, bounded loop -- only ever needs to skip past "." / ".." (at most
+// two, always first) and TNFS_DIRENTRY_SPECIAL-flagged entries (rare) to
+// reach the next real one. NOT meant to walk deep into a directory --
+// sidetnfs_floppy_browse.c's own paging loop calls this once per real
+// entry it wants to count/collect, and bounds ITS OWN total round count
+// across many calls; a large flat directory is therefore bounded by the
+// caller, not by this constant.
+#define SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS 8
+
+// Reads the next raw directory entry on an already-open handle (one or
+// more READDIRX round trips, bounded by SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS).
+// "."/".." and TNFS_DIRENTRY_SPECIAL-flagged entries are skipped
+// internally and never returned. Returns 1 with *out filled on a real
+// entry, 0 at end of directory (*out untouched), -1 on a network/protocol
+// error (including "gave up after SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS
+// rounds without a real entry or EOF", which should not happen against a
+// well-behaved server but must never spin forever).
+int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry *out)
+{
+    if (out == NULL)
+    {
+        return -1;
+    }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return -1;
+    }
+    for (int round = 0; round < SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS; round++)
+    {
+        uint8_t seq = 0;
+        if (!fslisting_send_readdirx(&ctx, dir_handle, (uint8_t)SIDETNFS_READDIRX_MAX_ENTRIES, &seq))
+        {
+            return -1;
+        }
+        if (!fslisting_wait_for(&ctx, TNFS_CMD_READDIRX, seq))
+        {
+            return -1;
+        }
+        uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+        uint8_t batch = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+        uint16_t resp_len = s_fslisting_resp.len;
+        s_fslisting_resp.response_ready = false;
+
+        if (rc != TNFS_OK && rc != TNFS_EOF)
+        {
+            return -1;
+        }
+        if (batch == 0 || resp_len <= 9)
+        {
+            return 0; // nothing in this response -- end of directory
+        }
+
+        // Same byte layout fslisting_parse_batch() uses (needle=9):
+        // flags(1) + size(4 LE, unused here) + mtime(4 LE, unused) +
+        // ctime(4 LE, unused) + NUL-terminated name.
+        const uint8_t *buf = s_fslisting_resp.buf;
+        const uint16_t needle = 9;
+        if ((uint32_t)needle + 13 >= resp_len)
+        {
+            return 0; // malformed/truncated response -- treat as end of directory, never read past the buffer
+        }
+        uint8_t flags = buf[needle];
+        const char *name = (const char *)&buf[needle + 13];
+        uint16_t avail = (uint16_t)(resp_len - (needle + 13));
+        size_t nlen = strnlen(name, avail);
+        if (nlen >= avail)
+        {
+            return 0; // name ran off the end of the response -- malformed, stop rather than read garbage past it
+        }
+
+        bool is_dot = (nlen == 0) || (name[0] == '.' && (nlen == 1 || (name[1] == '.' && nlen == 2)));
+        bool is_special = (flags & TNFS_DIRENTRY_SPECIAL) != 0;
+        bool name_fits = nlen < sizeof(out->name);
+        if (is_dot || is_special || !name_fits)
+        {
+            // A too-long name is skipped here (never truncated into a
+            // different, shorter name) -- s_fslisting_resp.buf is only 256
+            // bytes so this should not be reachable in practice, but the
+            // contract ("skip, never truncate") is enforced regardless.
+            if (rc == TNFS_EOF)
+            {
+                return 0; // that skipped entry was the last one
+            }
+            continue;
+        }
+        memcpy(out->name, name, nlen + 1);
+        out->is_dir = (flags & TNFS_DIRENTRY_DIR) != 0;
+        return 1;
+    }
+    return -1; // gave up after SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS rounds
+}
+
+// Best-effort CLOSEDIR -- mirrors tnfs_dta_closedir()'s own contract
+// exactly (fire the request, wait once, log/ignore the outcome either
+// way). Never fails outwardly: a lost handle on the server is a leak the
+// server's own eventual session/handle-table cleanup deals with, not
+// something the Atari-side caller can act on differently.
+void sidetnfs_tnfs_raw_closedir(int slot, uint8_t dir_handle)
+{
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return;
+    }
+    uint8_t seq = 0;
+    if (!fslisting_send_closedir(&ctx, dir_handle, &seq))
+    {
+        return;
+    }
+    (void)fslisting_wait_for(&ctx, TNFS_CMD_CLOSEDIR, seq);
+    s_fslisting_resp.response_ready = false;
 }
 
 // TNFS DTA registry -- lookupTnfsDTA/insertTnfsDTA/

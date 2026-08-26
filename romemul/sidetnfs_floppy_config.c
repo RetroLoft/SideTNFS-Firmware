@@ -338,6 +338,22 @@ sidetnfs_floppy_config_status_t sidetnfs_floppy_config_get_profile(uint8_t index
     return SIDETNFS_FLOPPY_STATUS_OK;
 }
 
+// Shared clearing logic for DELETE_PROFILE and SET_PROFILE's own
+// state==EMPTY case -- idempotent, always succeeds regardless of whether
+// the slot was already empty. Callers with a stricter "there must be
+// something here to delete" contract (DELETE_PROFILE) check
+// sidetnfs_floppy_profile_is_empty() themselves BEFORE calling this; this
+// function itself never reports EMPTY_SLOT.
+static void clear_profile_slot(uint8_t index)
+{
+    memset(&g_config.profiles[index], 0, sizeof(g_config.profiles[index]));
+    if (g_config.active_profile_index == index)
+    {
+        g_config.active_profile_index = 0;
+    }
+    sidetnfs_floppy_config_recompute_profile_count();
+}
+
 sidetnfs_floppy_config_status_t sidetnfs_floppy_config_set_profile(uint8_t index, const sidetnfs_floppy_profile_config_t *in)
 {
     if (index >= SIDETNFS_FLOPPY_MAX_PROFILES)
@@ -347,7 +363,19 @@ sidetnfs_floppy_config_status_t sidetnfs_floppy_config_set_profile(uint8_t index
 
     if (in->state == SIDETNFS_FLOPPY_PROFILE_EMPTY)
     {
-        return sidetnfs_floppy_config_delete_profile(index);
+        // Idempotent "ensure this slot is empty" -- NOT the same contract
+        // as DELETE_PROFILE below (which correctly errors on an
+        // already-empty slot, since an explicit user Delete on nothing is
+        // a caller mistake). SET_PROFILE's own contract is "the record
+        // now looks like `in`", so setting an EMPTY record onto an
+        // already-EMPTY slot must succeed trivially. This matters because
+        // FLOPPY.PRG's perform_save() (dialog.c) calls SET_PROFILE once
+        // per slot for the FULL 8-slot array on every save, including
+        // every currently-unconfigured slot -- treating "already empty"
+        // as an error here made every ordinary save (fewer than 8
+        // profiles configured) fail on the first unused slot.
+        clear_profile_slot(index);
+        return SIDETNFS_FLOPPY_STATUS_OK;
     }
     if (in->state != SIDETNFS_FLOPPY_PROFILE_DISABLED && in->state != SIDETNFS_FLOPPY_PROFILE_ENABLED)
     {
@@ -377,12 +405,7 @@ sidetnfs_floppy_config_status_t sidetnfs_floppy_config_delete_profile(uint8_t in
         return SIDETNFS_FLOPPY_STATUS_EMPTY_SLOT;
     }
 
-    memset(&g_config.profiles[index], 0, sizeof(g_config.profiles[index]));
-    if (g_config.active_profile_index == index)
-    {
-        g_config.active_profile_index = 0;
-    }
-    sidetnfs_floppy_config_recompute_profile_count();
+    clear_profile_slot(index);
     return SIDETNFS_FLOPPY_STATUS_OK;
 }
 

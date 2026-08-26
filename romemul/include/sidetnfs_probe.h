@@ -225,12 +225,53 @@ bool sidetnfs_probe_has_active_server(void);
 // sidetnfs_probe_has_active_server() is true; returns '\0' otherwise.
 char sidetnfs_probe_get_active_drive_letter(void);
 
-// Mirrors
-// gemdrvemul.c's GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (9), duplicated
-// as a literal rather than included -- sidetnfs_probe.h must not depend
-// on gemdrvemul.h (the dependency already goes the other way). See
-// report for the cross-check this relies on.
-#define SIDETNFS_PROBE_MAX_RUNTIME_SLOTS 9
+// Slots 0..8 mirror gemdrvemul.c's GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES
+// (9), duplicated as a literal rather than included -- sidetnfs_probe.h
+// must not depend on gemdrvemul.h (the dependency already goes the other
+// way). See report for the cross-check this relies on.
+//
+// Slot 9 (ONE slot, not one per profile) is reserved for FLOPPY.PRG's own
+// directory browser (sidetnfs_floppy_browse.c, Step 2) --
+// SIDETNFS_PROBE_FLOPPY_SLOT_BASE. FLOPPY.PRG only ever has ONE active
+// browse session at a time (see sidetnfs_floppy_browse.h), so a single
+// shared slot is enough -- BROWSE_OPEN re-populates/re-mounts it whenever
+// the requested profile's own host/port/mount_path differs from whatever
+// this slot currently holds (see sidetnfs_floppy_browse_open()'s own
+// comment). An earlier version of this reserved 8 slots (one per profile
+// index) to avoid re-mounting on every OPEN of the same already-open
+// profile -- that traded ~1.4KB of static RAM for a savings this project's
+// own RAM-discipline history (see sidetnfs_floppy_config.h) says isn't
+// worth it; re-mounting on an actual profile switch costs one ~200ms MOUNT
+// round trip, not a correctness problem.
+//
+// This slot is populated by sidetnfs_probe_set_slot_context()/mounted by
+// sidetnfs_probe_mount_slot() exactly like any GEMDOS-drive slot, but is
+// NEVER entered into g_runtime_drives[]/g_drive_number_table -- no drive
+// letter is ever assigned to it, and it is invisible to
+// sidetnfs_probe_mount_runtime_slots()'s own loop (which only mounts
+// *GEMDOS* drive slots at boot; the floppy browser mounts its own slot
+// on demand, from sidetnfs_floppy_browse_open()). Reusing this same
+// per-slot mount/session/reconnect machinery -- instead of a second,
+// parallel TNFS session mechanism -- is the "no duplicated TNFS logic"
+// shared-abstraction requirement from the Step 2 spec.
+#define SIDETNFS_PROBE_MAX_RUNTIME_SLOTS 10
+#define SIDETNFS_PROBE_FLOPPY_SLOT_BASE 9
+
+// Mounts exactly one runtime slot (blocking, bounded wait -- same
+// resolve-then-MOUNT-then-wait sequence sidetnfs_probe_mount_runtime_slots()
+// uses for slots >= 1) and reports whether it ended up with a live
+// session. A no-op success if the slot already has session_established
+// (repeated FLOPPY_BROWSE_OPEN calls on an already-mounted profile don't
+// re-mount). Returns false immediately if the slot was never populated via
+// sidetnfs_probe_set_slot_context(), if its host is unresolvable, or if
+// the bounded wait times out -- the caller (sidetnfs_floppy_browse.c)
+// turns that into the appropriate FLOPPY_BROWSE_ERR_TNFS_* status; this
+// function itself never blocks longer than one MOUNT round trip's bound.
+// Only ever intended for slot >= SIDETNFS_PROBE_FLOPPY_SLOT_BASE -- GEMDOS
+// drive slots 0..8 are mounted exclusively via
+// sidetnfs_probe_mount_runtime_slots() at boot/reinit, never through this
+// function, so the two mounting paths can never race over the same slot.
+bool sidetnfs_probe_mount_slot(int slot);
 
 // (generic multi-slot runtime publication/mount, per the runtime-
 // drive-publication audit): per-slot TNFS/backend identity --
@@ -333,6 +374,33 @@ void sidetnfs_tnfs_dta_release_all(void);
 // slot isn't currently active. Never mutates anything.
 bool sidetnfs_tnfs_dta_search_snapshot(int index, uint32_t *out_ndta, int *out_runtime_slot);
 #endif
+
+// Raw (un-normalized, no 8.3 filtering/aliasing/case conversion) TNFS
+// directory access for FLOPPY.PRG's own LFN browser
+// (sidetnfs_floppy_browse.c, Step 2) -- see the three functions' own
+// comments in sidetnfs_probe.c for the full contract. Entirely separate
+// from SidetnfsAtariDirEntry/sidetnfs_tnfs_dta_start() above, which stay
+// permanently 8.3-shaped for GEMDOS Fsfirst/Fsnext.
+#define SIDETNFS_TNFS_RAW_NAME_MAX 256
+
+typedef struct
+{
+    char name[SIDETNFS_TNFS_RAW_NAME_MAX];
+    bool is_dir;
+} SidetnfsTnfsRawEntry;
+
+typedef enum
+{
+    SIDETNFS_TNFS_DIR_OK = 0,
+    SIDETNFS_TNFS_DIR_NOT_FOUND,
+    SIDETNFS_TNFS_DIR_ACCESS_DENIED,
+    SIDETNFS_TNFS_DIR_PATH_TOO_LONG,
+    SIDETNFS_TNFS_DIR_ERROR
+} SidetnfsTnfsDirOpenResult;
+
+SidetnfsTnfsDirOpenResult sidetnfs_tnfs_raw_opendir(int slot, const char *tnfs_path, uint8_t *out_handle);
+int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry *out);
+void sidetnfs_tnfs_raw_closedir(int slot, uint8_t dir_handle);
 
 // Create a UDP PCB and udp_connect it to the TNFS server, then
 // immediately remove it again. Sends no payload at all -- udp_connect() is a

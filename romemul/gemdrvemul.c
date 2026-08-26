@@ -129,8 +129,21 @@ static bool sidetnfs_runtime_slot_is_settings(int slot)
 // so SIDETNFS_PROBE_MAX_RUNTIME_SLOTS is a separately maintained literal --
 // this is the one place both constants are visible together to catch any
 // future drift at compile time.
-_Static_assert(GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES == SIDETNFS_PROBE_MAX_RUNTIME_SLOTS,
-               "GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES and SIDETNFS_PROBE_MAX_RUNTIME_SLOTS must match");
+//
+// The two no longer need to be EQUAL (they did before SideTNFS-Floppy-
+// emulation's Step 2 browser): SIDETNFS_PROBE_MAX_RUNTIME_SLOTS now also
+// reserves ONE slot (index SIDETNFS_PROBE_FLOPPY_SLOT_BASE) for FLOPPY.PRG's
+// own directory browser (sidetnfs_floppy_browse.c) -- deliberately outside
+// g_runtime_drives[]/g_drive_number_table above and never a GEMDOS drive.
+// What must still hold is that every GEMDOS drive slot index
+// (0..GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-1) fits inside the
+// s_slot_contexts[] table AND never collides with the floppy browser's own
+// reserved slot.
+_Static_assert(GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES <= SIDETNFS_PROBE_FLOPPY_SLOT_BASE,
+               "GEMDOS drive slots (0..GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES-1) must fit strictly below "
+               "SIDETNFS_PROBE_FLOPPY_SLOT_BASE, or they would collide with FLOPPY.PRG's own reserved slot");
+_Static_assert(SIDETNFS_PROBE_FLOPPY_SLOT_BASE + 1 <= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS,
+               "FLOPPY.PRG's reserved slot must fit inside s_slot_contexts[]");
 
 // Derived from g_runtime_drives --
 // never set independently anywhere else. g_drive_number_table[slot] is
@@ -5119,6 +5132,110 @@ void init_gemdrvemul(bool safe_config_reboot)
             // success. Request: none. Response: status only.
             sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_save();
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_BROWSE_OPEN:
+        {
+            // Opens one profile for real LFN directory browsing (Step 2,
+            // see sidetnfs_floppy_browse.h) -- resolves the backend
+            // (TNFS session or SD path), sets the CWD to the profile's
+            // own stored last_directory (or root), starts a new browse
+            // generation. Request: one uint32_t profile index. Response:
+            // status + generation + CWD (GEMDRVEMUL_FLOPPY_BROWSE_*).
+            // sidetnfs_network_ok is this function's own boot-time-latched
+            // WiFi flag, same value sidetnfs_probe_classify_slot_error()
+            // is already fed elsewhere in this switch.
+            uint32_t browse_open_profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            uint32_t browse_open_generation = 0;
+            char browse_open_cwd[FLOPPY_BROWSE_CWD_LEN];
+            sidetnfs_floppy_browse_status_t browse_open_result = sidetnfs_floppy_browse_open(
+                (uint8_t)browse_open_profile_index, sidetnfs_network_ok, &browse_open_generation, browse_open_cwd,
+                sizeof(browse_open_cwd));
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_STATUS, (uint32_t)browse_open_result);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_GENERATION, browse_open_generation);
+            memset((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD), 0, FLOPPY_BROWSE_CWD_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD), browse_open_cwd,
+                   strnlen(browse_open_cwd, FLOPPY_BROWSE_CWD_LEN - 1));
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD, FLOPPY_BROWSE_CWD_LEN);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_BROWSE_CHANGE_DIR:
+        {
+            // Changes the active browse CWD -- go_up moves to the parent
+            // (a no-op at the profile's own root), otherwise descends
+            // into `name` (one of the CURRENT CWD's own subdirectory
+            // names, as most recently returned by a dir-kind GET_*_PAGE).
+            // Request: generation(4) + go_up(2, nonzero=up) +
+            // name(FLOPPY_BROWSE_NAME_LEN, ignored when go_up). Response:
+            // same shape as BROWSE_OPEN's.
+            uint32_t change_dir_req_generation = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            bool change_dir_go_up = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
+            payloadPtr += 1;
+            char change_dir_name[FLOPPY_BROWSE_NAME_LEN];
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, change_dir_name, FLOPPY_BROWSE_NAME_LEN);
+            payloadPtr += FLOPPY_BROWSE_NAME_LEN / 2;
+            change_dir_name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
+
+            uint32_t change_dir_generation = 0;
+            char change_dir_cwd[FLOPPY_BROWSE_CWD_LEN];
+            sidetnfs_floppy_browse_status_t change_dir_result = sidetnfs_floppy_browse_change_dir(
+                change_dir_req_generation, change_dir_go_up, change_dir_name, &change_dir_generation,
+                change_dir_cwd, sizeof(change_dir_cwd));
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_STATUS, (uint32_t)change_dir_result);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_GENERATION, change_dir_generation);
+            memset((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD), 0, FLOPPY_BROWSE_CWD_LEN);
+            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD), change_dir_cwd,
+                   strnlen(change_dir_cwd, FLOPPY_BROWSE_CWD_LEN - 1));
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_BROWSE_CWD, FLOPPY_BROWSE_CWD_LEN);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE:
+        case GEMDRVEMUL_FLOPPY_BROWSE_GET_FILE_PAGE:
+        {
+            // Fetches one page (25 names max) of the active CWD's
+            // subdirectories (GET_DIR_PAGE) or files (GET_FILE_PAGE) --
+            // always two independent result sets, never mixed in one
+            // page. Request: generation(4) + page_index(4, 0-based).
+            // Response: status/generation/page_index/count/has_prev/
+            // has_next (GEMDRVEMUL_FLOPPY_PAGE_*) plus up to 25 entry
+            // names written directly by sidetnfs_floppy_browse_get_page()
+            // itself -- no RAM page buffer, see that function's own
+            // comment. That function -- NOT this dispatch handler -- owns
+            // clearing the entries region: it does so exactly once, when
+            // a genuinely NEW page request starts, never on a resumed
+            // call for a walk already in progress (see its own comment on
+            // FLOPPY_BROWSE_STATUS_IN_PROGRESS) -- clearing it here on
+            // every call would wipe out entries a previous resumed call
+            // already collected.
+            bool get_page_want_dirs = (active_command_id == GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE);
+            uint32_t get_page_req_generation = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint32_t get_page_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+
+            floppy_browse_page_result_t get_page_result = sidetnfs_floppy_browse_get_page(
+                get_page_req_generation, get_page_want_dirs, get_page_index, memory_shared_address,
+                GEMDRVEMUL_FLOPPY_PAGE_ENTRIES);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_STATUS, (uint32_t)get_page_result.status);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_GENERATION, get_page_result.generation);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_INDEX, get_page_result.page_index);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_COUNT, get_page_result.count);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_HAS_PREV, get_page_result.has_prev ? 1 : 0);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_HAS_NEXT, get_page_result.has_next ? 1 : 0);
+
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;

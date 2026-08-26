@@ -213,16 +213,28 @@
 // with the GEMDOS drive list or the active TNFS session. See
 // romemul/include/sidetnfs_floppy_config.h for the wire/flash format and
 // the SideTNFS-Floppy-emulation project's RESEARCH-STEP0.md for the design
-// rationale. Reserved for a later phase, NOT added here yet: the LFN
-// directory-browser commands (open directory / get page / select entry) --
-// those will claim their own subcommands from the remaining 0x23-0x35
-// range when that phase is implemented.
+// rationale.
 #define GEMDRVEMUL_FLOPPY_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x1D)   // Get FLOPPY.PRG profile-store info (max/count/active index)
 #define GEMDRVEMUL_FLOPPY_GET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1E)      // Get one floppy server-profile record
 #define GEMDRVEMUL_FLOPPY_SET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1F)      // Set one floppy server-profile record (RAM only)
 #define GEMDRVEMUL_FLOPPY_DELETE_PROFILE (APP_GEMDRVEMUL << 8 | 0x20)   // Delete one floppy server-profile record (RAM only)
 #define GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE (APP_GEMDRVEMUL << 8 | 0x21) // Set the active profile index (RAM only)
 #define GEMDRVEMUL_FLOPPY_SAVE_PROFILES (APP_GEMDRVEMUL << 8 | 0x22)    // Persist the RAM profile list to flash
+
+// FLOPPY.PRG LFN directory browser (Step 2). Subcommands 0x23-0x26, from
+// the range the block above already reserved for this. Browses ONE active
+// profile's real TNFS/SD source directly -- no GEMDOS drive/letter, no
+// Fsfirst/Fsnext, no 8.3 conversion, no name aliasing. Exactly one CWD is
+// active at a time (see sidetnfs_floppy_browse.h); a generation counter
+// bumped by OPEN/CHANGE_DIR lets GET_*_PAGE detect a stale request (e.g.
+// the Atari asking for a page from a directory it has since left). See
+// romemul/include/sidetnfs_floppy_browse.h for status codes and
+// romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_BROWSE/_PAGE) for the
+// wire layout.
+#define GEMDRVEMUL_FLOPPY_BROWSE_OPEN (APP_GEMDRVEMUL << 8 | 0x23)          // Open a profile for browsing (resolves backend/session, CWD = last_directory or root)
+#define GEMDRVEMUL_FLOPPY_BROWSE_CHANGE_DIR (APP_GEMDRVEMUL << 8 | 0x24)    // Change the active CWD (subdir name, or go-up)
+#define GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE (APP_GEMDRVEMUL << 8 | 0x25)  // Fetch one page of subdirectory names for the active CWD
+#define GEMDRVEMUL_FLOPPY_BROWSE_GET_FILE_PAGE (APP_GEMDRVEMUL << 8 | 0x26) // Fetch one page of file names for the active CWD
 
 typedef struct
 {
