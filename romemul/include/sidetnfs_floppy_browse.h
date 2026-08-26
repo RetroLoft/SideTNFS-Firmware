@@ -39,10 +39,16 @@
  * reads have no unbounded network wait to chunk around and always finish
  * within one call.
  *
- * Directories and files are always listed as two independent result sets
- * (see sidetnfs_floppy_browse_get_page's `want_dirs`) -- a page never
- * mixes the two, so no per-entry type field is needed on the wire (see
- * GEMDRVEMUL_FLOPPY_PAGE in gemdrvemul.h).
+ * Step 3: directories and files share ONE combined page -- dirs are always
+ * listed before files, in pages of FLOPPY_BROWSE_PAGE_ENTRIES entries
+ * (matches the Atari-side file manager's visible row count), with a
+ * parallel is_dir[] word array on the wire (GEMDRVEMUL_FLOPPY_PAGE_IS_DIR
+ * in gemdrvemul.h) telling the caller which slot is which. This keeps the
+ * Atari-side client from ever having to fetch two separate page streams
+ * and stitch them together itself. sidetnfs_floppy_browse_get_page()
+ * walks the backend directory in two internal phases (dirs, then files)
+ * against ONE shared combined page_index -- see that function's own
+ * comment for the skip/collect math across the phase boundary.
  *
  * Backend abstraction: TNFS reuses sidetnfs_probe.c's existing per-slot
  * MOUNT/session machinery (slots SIDETNFS_PROBE_FLOPPY_SLOT_BASE.. --
@@ -67,7 +73,7 @@
 
 #define FLOPPY_BROWSE_CWD_LEN 256   // matches SIDETNFS_FLOPPY_LASTDIR_LEN / the Step 2 spec's "CWD max 256 bytes incl. terminator"
 #define FLOPPY_BROWSE_NAME_LEN 256  // matches the Step 2 spec's "each name max 256 bytes incl. terminator"
-#define FLOPPY_BROWSE_PAGE_ENTRIES 25 // matches RESEARCH-STEP0.md's page size and the Step 2 spec
+#define FLOPPY_BROWSE_PAGE_ENTRIES 15 // Step 3: matches FM_MAX_VISIBLE_FILES (the Atari-side file manager's visible row count) -- was 25 (separate dirs/files pages) in Step 2
 
 typedef enum
 {
@@ -85,8 +91,8 @@ typedef enum
     FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY = 11,      // page_index is past the last real page -- NOT a hard error, response is still well-formed (count=0)
     FLOPPY_BROWSE_ERR_STALE_GENERATION = 12,         // caller's generation no longer matches the active browse session
     FLOPPY_BROWSE_ERR_BACKEND_ERROR = 13,            // generic TNFS/SD I/O error mid-listing (timeout after the session was already established, unexpected FRESULT, malformed response, ...)
-    FLOPPY_BROWSE_ERR_NOT_OPEN = 14,                 // CHANGE_DIR/GET_*_PAGE called before a successful BROWSE_OPEN
-    FLOPPY_BROWSE_STATUS_IN_PROGRESS = 15             // NOT an error: GET_*_PAGE's walk isn't finished yet -- caller must re-issue the IDENTICAL request (same generation/want_dirs/page_index) to resume it. See sidetnfs_floppy_browse_get_page()'s own comment.
+    FLOPPY_BROWSE_ERR_NOT_OPEN = 14,                 // CHANGE_DIR/GET_PAGE called before a successful BROWSE_OPEN
+    FLOPPY_BROWSE_STATUS_IN_PROGRESS = 15             // NOT an error: GET_PAGE's walk isn't finished yet -- caller must re-issue the IDENTICAL request (same generation/page_index) to resume it. See sidetnfs_floppy_browse_get_page()'s own comment.
 } sidetnfs_floppy_browse_status_t;
 
 // Opens `profile_index` for browsing: resolves the backend, establishes
@@ -134,21 +140,30 @@ typedef struct
     bool has_next;
 } floppy_browse_page_result_t;
 
-// Fetches page `page_index` (0-based) of the active CWD's subdirectory
-// names (want_dirs=true) or file names (want_dirs=false). Each matched
-// entry name is written directly into the ROM3 shared-memory window at
-// memory_shared_address+entries_offset+ (slot * FLOPPY_BROWSE_NAME_LEN),
-// up to FLOPPY_BROWSE_PAGE_ENTRIES slots, using the same byte-copy +
-// CHANGE_ENDIANESS_BLOCK16 convention every other Pico->Atari string field
-// in this protocol already uses -- no separate RAM page buffer is ever
-// allocated (see this project's own RAM-discipline history).
+// Fetches combined page `page_index` (0-based) of the active CWD:
+// subdirectory names first, then file names, up to FLOPPY_BROWSE_PAGE_ENTRIES
+// slots total. Each matched entry name is written directly into the ROM3
+// shared-memory window at memory_shared_address+entries_offset+
+// (slot * FLOPPY_BROWSE_NAME_LEN), and its kind into
+// memory_shared_address+is_dir_offset+(slot*2) (1=dir/0=file, WRITE_WORD),
+// using the same byte-copy + CHANGE_ENDIANESS_BLOCK16 / WRITE_WORD
+// conventions every other Pico->Atari field in this protocol already uses
+// -- no separate RAM page buffer is ever allocated (see this project's own
+// RAM-discipline history).
 //
-// Re-walks the backend directory from the start every time a NEW request
-// arrives (different generation/want_dirs/page_index than whatever was
-// last in progress), counting matching (dir-or-file, per want_dirs)
-// entries, skipping page_index*FLOPPY_BROWSE_PAGE_ENTRIES of them, then
-// collecting up to FLOPPY_BROWSE_PAGE_ENTRIES more -- so
-// FIRST/NEXT/PREVIOUS/arbitrary-page and a TNFS timeout+reconnect
+// Internally walks the backend CWD in two phases against ONE combined
+// skip = page_index*FLOPPY_BROWSE_PAGE_ENTRIES: phase DIRS first (matches
+// what a want_dirs=true walk did in Step 2 -- skip/collect/has_next over
+// directory entries only). If phase DIRS fills all
+// FLOPPY_BROWSE_PAGE_ENTRIES slots (has_next), the page is done and phase
+// FILES never runs. Otherwise, once phase DIRS reaches the backend's REAL
+// end-of-directory (not just "ran out of slots"), the number of matching
+// dirs seen becomes `dirs_total`, and phase FILES starts a FRESH
+// enumeration of the SAME CWD filtered to files only, with its own skip =
+// max(0, combined_skip - dirs_total), continuing to fill the SAME
+// (shared, never reset) collected-slot counter up to
+// FLOPPY_BROWSE_PAGE_ENTRIES or its own end-of-directory/has_next. This
+// means FIRST/NEXT/PREVIOUS/arbitrary-page and a TNFS timeout+reconnect
 // mid-browse are all simply "the caller asked for a different
 // page_index"; there is no server-side per-direction cursor to invalidate
 // or get out of sync. A page_index past the last real page returns
@@ -157,18 +172,19 @@ typedef struct
 // error.
 //
 // IMPORTANT -- this call can return FLOPPY_BROWSE_STATUS_IN_PROGRESS: a
-// TNFS walk is never carried to completion inside one call if that would
-// take more than a handful of real network round trips (each dispatch
-// call runs on the same core that must keep answering the time-critical
-// Atari bus, so it must always return quickly). When this happens, no
-// entries have been published for the caller to see yet -- the caller
-// (the Atari-side client) must re-issue the IDENTICAL request (same
-// generation/want_dirs/page_index) to resume exactly where this call left
-// off, repeating until a terminal status (OK/END_OF_DIRECTORY/an error)
-// comes back. SD walks have no unbounded network wait to chunk around, so
-// they always finish within one call in practice.
-floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation, bool want_dirs, uint32_t page_index,
+// TNFS walk (either phase) is never carried to completion inside one call
+// if that would take more than a handful of real network round trips
+// (each dispatch call runs on the same core that must keep answering the
+// time-critical Atari bus, so it must always return quickly). When this
+// happens, no entries have been published for the caller to see yet --
+// the caller (the Atari-side client) must re-issue the IDENTICAL request
+// (same generation/page_index) to resume exactly where this call left
+// off (including which phase it was in), repeating until a terminal
+// status (OK/END_OF_DIRECTORY/an error) comes back. SD walks have no
+// unbounded network wait to chunk around, so both phases always finish
+// within one call in practice.
+floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation, uint32_t page_index,
                                                               uint32_t memory_shared_address,
-                                                              uint32_t entries_offset);
+                                                              uint32_t entries_offset, uint32_t is_dir_offset);
 
 #endif // SIDETNFS_FLOPPY_BROWSE_H

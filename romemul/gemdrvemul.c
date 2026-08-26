@@ -5201,33 +5201,33 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
-        case GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE:
-        case GEMDRVEMUL_FLOPPY_BROWSE_GET_FILE_PAGE:
+        case GEMDRVEMUL_FLOPPY_BROWSE_GET_PAGE:
         {
-            // Fetches one page (25 names max) of the active CWD's
-            // subdirectories (GET_DIR_PAGE) or files (GET_FILE_PAGE) --
-            // always two independent result sets, never mixed in one
-            // page. Request: generation(4) + page_index(4, 0-based).
-            // Response: status/generation/page_index/count/has_prev/
-            // has_next (GEMDRVEMUL_FLOPPY_PAGE_*) plus up to 25 entry
-            // names written directly by sidetnfs_floppy_browse_get_page()
-            // itself -- no RAM page buffer, see that function's own
-            // comment. That function -- NOT this dispatch handler -- owns
-            // clearing the entries region: it does so exactly once, when
-            // a genuinely NEW page request starts, never on a resumed
-            // call for a walk already in progress (see its own comment on
+            // Fetches one COMBINED page (15 names max, Step 3) of the
+            // active CWD: subdirectories first, then files, with a
+            // parallel is_dir[] word array (GEMDRVEMUL_FLOPPY_PAGE_IS_DIR)
+            // saying which is which per slot -- no more separate dir/file
+            // pages for the Atari-side client to stitch together itself.
+            // Request: generation(4) + page_index(4, 0-based). Response:
+            // status/generation/page_index/count/has_prev/has_next
+            // (GEMDRVEMUL_FLOPPY_PAGE_*) plus up to 15 entry names + kinds
+            // written directly by sidetnfs_floppy_browse_get_page() itself
+            // -- no RAM page buffer, see that function's own comment. That
+            // function -- NOT this dispatch handler -- owns clearing the
+            // entries/is_dir regions: it does so exactly once, when a
+            // genuinely NEW page request starts, never on a resumed call
+            // for a walk already in progress (see its own comment on
             // FLOPPY_BROWSE_STATUS_IN_PROGRESS) -- clearing it here on
             // every call would wipe out entries a previous resumed call
             // already collected.
-            bool get_page_want_dirs = (active_command_id == GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE);
             uint32_t get_page_req_generation = GET_PAYLOAD_PARAM32(payloadPtr);
             payloadPtr += 2;
             uint32_t get_page_index = GET_PAYLOAD_PARAM32(payloadPtr);
             payloadPtr += 2;
 
-            floppy_browse_page_result_t get_page_result = sidetnfs_floppy_browse_get_page(
-                get_page_req_generation, get_page_want_dirs, get_page_index, memory_shared_address,
-                GEMDRVEMUL_FLOPPY_PAGE_ENTRIES);
+            floppy_browse_page_result_t get_page_result =
+                sidetnfs_floppy_browse_get_page(get_page_req_generation, get_page_index, memory_shared_address,
+                                                 GEMDRVEMUL_FLOPPY_PAGE_ENTRIES, GEMDRVEMUL_FLOPPY_PAGE_IS_DIR);
 
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_STATUS, (uint32_t)get_page_result.status);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_GENERATION, get_page_result.generation);

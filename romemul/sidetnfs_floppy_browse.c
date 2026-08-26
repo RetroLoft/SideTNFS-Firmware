@@ -28,19 +28,31 @@ typedef struct
     char cwd[FLOPPY_BROWSE_CWD_LEN];
     uint32_t generation;
 
-    // In-progress GET_DIR_PAGE/GET_FILE_PAGE walk (TNFS only -- see
+    // In-progress GET_PAGE walk (TNFS only -- see
     // sidetnfs_floppy_browse_get_page()'s own top-of-function comment for
     // why this exists: a deep page must never be walked to completion
     // inside one blocking dispatch call, since that call runs on the same
     // core that must keep servicing the time-critical Atari bus. SD reads
     // are fast enough to always finish within a single call and never use
     // this).
+    //
+    // Step 3: one combined page walk has two internal phases (dirs, then
+    // files) -- walk_files_phase says which is currently active.
+    // walk_matched is PHASE-LOCAL (reset to 0 both when a fresh walk
+    // starts and again at the dirs->files phase transition);
+    // walk_collected is the ONE combined slot counter shared across both
+    // phases (never reset at the transition). walk_dirs_total is set
+    // exactly once, at the moment phase dirs reaches the backend's real
+    // end-of-directory, and is what phase files' own skip count is
+    // computed from (see sidetnfs_floppy_browse_get_page()'s own
+    // comment).
     bool walk_active;
-    bool walk_want_dirs;
+    bool walk_files_phase;
+    uint32_t walk_dirs_total;
     uint32_t walk_page_index;
     uint32_t walk_generation;
-    uint32_t walk_matched;      // matching (dir-or-file) entries seen so far, this walk
-    uint16_t walk_collected;    // entries already written into the ROM3 page region, this walk
+    uint32_t walk_matched;      // matching entries seen so far THIS PHASE
+    uint16_t walk_collected;    // entries already written into the ROM3 page region, both phases combined
     uint8_t walk_tnfs_handle;   // open TNFS dir handle, only meaningful while walk_tnfs_handle_open
     bool walk_tnfs_handle_open;
 } floppy_browse_state_t;
@@ -497,7 +509,7 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
 }
 
 // ------------------------------------------------------------------
-// GET_DIR_PAGE / GET_FILE_PAGE
+// GET_PAGE (Step 3: one combined dirs-then-files page)
 // ------------------------------------------------------------------
 
 // TNFS: small per-CALL round budget, NOT a total-walk budget -- see this
@@ -533,7 +545,23 @@ static void write_page_entry(uint32_t memory_shared_address, uint32_t entries_of
     CHANGE_ENDIANESS_BLOCK16(memory_shared_address + addr, FLOPPY_BROWSE_NAME_LEN);
 }
 
-// Fetches page `page_index` of the active CWD's subdirectories/files.
+// Writes one entry's dir/file flag into the parallel is_dir[] word array --
+// same WRITE_WORD convention every other plain-word field in this protocol
+// already uses. Index-matched with write_page_entry()'s own slot_index.
+static void write_is_dir_entry(uint32_t memory_shared_address, uint32_t is_dir_offset, uint16_t slot_index,
+                                bool is_dir)
+{
+    uint32_t addr = is_dir_offset + (uint32_t)slot_index * 2;
+    WRITE_WORD(memory_shared_address, addr, is_dir ? 1 : 0);
+}
+
+// Fetches ONE combined page of the active CWD's subdirectories followed
+// by its files (Step 3 -- see this file's own header comment). Walked in
+// two internal phases against a single combined page_index; see the
+// walk_files_phase/walk_dirs_total fields' own comment on
+// floppy_browse_state_t for the skip/collect math across the phase
+// boundary.
+//
 // TNFS walks are INCREMENTAL and RESUMABLE: this function never performs
 // more than FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL real TNFS round trips
 // before returning, however deep the page or however large the directory
@@ -545,14 +573,14 @@ static void write_page_entry(uint32_t memory_shared_address, uint32_t entries_of
 // time-critical Atari bus for however long that took.
 //
 // When more work remains, this returns FLOPPY_BROWSE_STATUS_IN_PROGRESS
-// (not an error) and parks its progress in s_browse.walk_* (including the
-// still-open TNFS dir handle) -- the caller (the Atari-side client, see
-// floppy_probe.c's polling wrapper) re-issues the IDENTICAL request
-// (same generation/want_dirs/page_index) to resume exactly where this
-// call left off, until a terminal status (OK/END_OF_DIRECTORY/an error)
-// comes back. Matched/collected entries accumulate in s_browse across
-// calls; entries already written into the ROM3 page region are never
-// re-cleared on a resume (only on a genuinely NEW request -- see
+// (not an error) and parks its progress in s_browse.walk_* (including
+// which phase it's in and the still-open TNFS dir handle) -- the caller
+// (the Atari-side client, see floppy_probe.c's polling wrapper) re-issues
+// the IDENTICAL request (same generation/page_index) to resume exactly
+// where this call left off, until a terminal status (OK/END_OF_DIRECTORY/
+// an error) comes back. Matched/collected entries accumulate in s_browse
+// across calls; entries already written into the ROM3 page region are
+// never re-cleared on a resume (only on a genuinely NEW request -- see
 // `resuming` below), so a partially-built page is never visible to the
 // Atari as such: nothing publishes it (writes the response header +
 // random token) until this function returns a terminal status.
@@ -560,8 +588,9 @@ static void write_page_entry(uint32_t memory_shared_address, uint32_t entries_of
 // SD walks always finish within this one call (no unbounded network wait
 // to chunk around), so `resuming` is always false for the SD backend in
 // practice.
-floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation, bool want_dirs, uint32_t page_index,
-                                                              uint32_t memory_shared_address, uint32_t entries_offset)
+floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation, uint32_t page_index,
+                                                              uint32_t memory_shared_address, uint32_t entries_offset,
+                                                              uint32_t is_dir_offset)
 {
     floppy_browse_page_result_t result;
     memset(&result, 0, sizeof(result));
@@ -580,8 +609,8 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     }
     result.generation = s_browse.generation;
 
-    bool resuming = s_browse.walk_active && s_browse.walk_generation == generation &&
-                     s_browse.walk_want_dirs == want_dirs && s_browse.walk_page_index == page_index;
+    bool resuming =
+        s_browse.walk_active && s_browse.walk_generation == generation && s_browse.walk_page_index == page_index;
     if (s_browse.walk_active && !resuming)
     {
         // A different request arrived while a walk was still parked
@@ -594,91 +623,122 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     {
         // Fresh walk: clear the ROM3 page region exactly once, up front
         // -- every subsequent resumed call for THIS walk only ever adds
-        // to it, never re-clears it.
+        // to it, never re-clears it. Starts in phase dirs.
         memset((void *)(memory_shared_address + entries_offset), 0,
                (size_t)FLOPPY_BROWSE_PAGE_ENTRIES * FLOPPY_BROWSE_NAME_LEN);
+        memset((void *)(memory_shared_address + is_dir_offset), 0, (size_t)FLOPPY_BROWSE_PAGE_ENTRIES * 2);
         s_browse.walk_active = true;
-        s_browse.walk_want_dirs = want_dirs;
         s_browse.walk_page_index = page_index;
         s_browse.walk_generation = generation;
+        s_browse.walk_files_phase = false;
+        s_browse.walk_dirs_total = 0;
         s_browse.walk_matched = 0;
         s_browse.walk_collected = 0;
         s_browse.walk_tnfs_handle_open = false;
     }
 
-    uint32_t skip = page_index * (uint32_t)FLOPPY_BROWSE_PAGE_ENTRIES;
+    uint32_t combined_skip = page_index * (uint32_t)FLOPPY_BROWSE_PAGE_ENTRIES;
     bool has_next = false;
     bool backend_error = false;
     bool finished = false;
 
     if (s_browse.backend == SIDETNFS_FLOPPY_BACKEND_TNFS)
     {
-        if (!s_browse.walk_tnfs_handle_open)
+        // One round budget spans BOTH phases within this call -- if phase
+        // dirs reaches real EOF partway through the budget, phase files
+        // starts immediately and consumes whatever budget remains, rather
+        // than waiting for a whole extra resumed call just to begin.
+        for (uint32_t round = 0; round < FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL; round++)
         {
-            // s_browse.cwd alone, never mount_path+cwd -- see
-            // sidetnfs_floppy_browse_open()'s own comment on why.
-            uint8_t handle;
-            SidetnfsTnfsDirOpenResult open_result = sidetnfs_tnfs_raw_opendir(s_browse.tnfs_slot, s_browse.cwd, &handle);
-            if (open_result != SIDETNFS_TNFS_DIR_OK)
+            if (!s_browse.walk_tnfs_handle_open)
             {
-                s_browse.walk_active = false;
-                result.status = (open_result == SIDETNFS_TNFS_DIR_NOT_FOUND)     ? FLOPPY_BROWSE_ERR_DIR_NOT_FOUND
-                                 : (open_result == SIDETNFS_TNFS_DIR_ACCESS_DENIED) ? FLOPPY_BROWSE_ERR_ACCESS_DENIED
-                                 : (open_result == SIDETNFS_TNFS_DIR_PATH_TOO_LONG) ? FLOPPY_BROWSE_ERR_PATH_TOO_LONG
-                                                                                    : FLOPPY_BROWSE_ERR_BACKEND_ERROR;
-                return result;
+                // s_browse.cwd alone, never mount_path+cwd -- see
+                // sidetnfs_floppy_browse_open()'s own comment on why. Same
+                // CWD for both phases -- phase files always starts a
+                // FRESH enumeration from the top, filtered differently.
+                uint8_t handle;
+                SidetnfsTnfsDirOpenResult open_result =
+                    sidetnfs_tnfs_raw_opendir(s_browse.tnfs_slot, s_browse.cwd, &handle);
+                if (open_result != SIDETNFS_TNFS_DIR_OK)
+                {
+                    s_browse.walk_active = false;
+                    result.status = (open_result == SIDETNFS_TNFS_DIR_NOT_FOUND) ? FLOPPY_BROWSE_ERR_DIR_NOT_FOUND
+                                     : (open_result == SIDETNFS_TNFS_DIR_ACCESS_DENIED)
+                                         ? FLOPPY_BROWSE_ERR_ACCESS_DENIED
+                                     : (open_result == SIDETNFS_TNFS_DIR_PATH_TOO_LONG)
+                                         ? FLOPPY_BROWSE_ERR_PATH_TOO_LONG
+                                         : FLOPPY_BROWSE_ERR_BACKEND_ERROR;
+                    return result;
+                }
+                s_browse.walk_tnfs_handle = handle;
+                s_browse.walk_tnfs_handle_open = true;
             }
-            s_browse.walk_tnfs_handle = handle;
-            s_browse.walk_tnfs_handle_open = true;
+
+            if (s_browse.walk_matched > FLOPPY_BROWSE_TNFS_MAX_TOTAL_ROUNDS)
+            {
+                // Pathological case only (server never reaches TNFS_EOF)
+                // -- give up rather than resume forever. Re-armed per
+                // phase since walk_matched resets at the transition.
+                backend_error = true;
+                break;
+            }
+
+            SidetnfsTnfsRawEntry entry;
+            int r = sidetnfs_tnfs_raw_readdir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle, &entry);
+            if (r < 0)
+            {
+                backend_error = true;
+                break;
+            }
+            if (r == 0)
+            {
+                // Real end of directory for the CURRENT phase.
+                sidetnfs_tnfs_raw_closedir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle);
+                s_browse.walk_tnfs_handle_open = false;
+                if (s_browse.walk_files_phase)
+                {
+                    finished = true; // both phases done -- whole page complete
+                    break;
+                }
+                // Phase dirs -> phase files: dirs_total is exactly how
+                // many dir entries this phase ever counted (skipped or
+                // collected), since it walked the CWD to its real end.
+                s_browse.walk_dirs_total = s_browse.walk_matched;
+                s_browse.walk_files_phase = true;
+                s_browse.walk_matched = 0; // phase-local counter resets
+                continue; // next round opens the fresh files-phase handle
+            }
+            bool want_dirs_now = !s_browse.walk_files_phase;
+            if (entry.is_dir != want_dirs_now)
+            {
+                continue; // wrong kind for the current phase
+            }
+            uint32_t phase_skip = s_browse.walk_files_phase
+                                       ? (combined_skip > s_browse.walk_dirs_total
+                                              ? combined_skip - s_browse.walk_dirs_total
+                                              : 0)
+                                       : combined_skip;
+            if (s_browse.walk_matched < phase_skip)
+            {
+                s_browse.walk_matched++;
+                continue;
+            }
+            if (s_browse.walk_collected < FLOPPY_BROWSE_PAGE_ENTRIES)
+            {
+                write_page_entry(memory_shared_address, entries_offset, s_browse.walk_collected, entry.name);
+                write_is_dir_entry(memory_shared_address, is_dir_offset, s_browse.walk_collected, want_dirs_now);
+                s_browse.walk_collected++;
+                s_browse.walk_matched++;
+            }
+            else
+            {
+                has_next = true;
+                finished = true;
+                break;
+            }
         }
 
-        if (s_browse.walk_matched > FLOPPY_BROWSE_TNFS_MAX_TOTAL_ROUNDS)
-        {
-            // Pathological case only (server never reaches TNFS_EOF) --
-            // give up rather than resume forever.
-            backend_error = true;
-        }
-        else
-        {
-            for (uint32_t round = 0; round < FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL; round++)
-            {
-                SidetnfsTnfsRawEntry entry;
-                int r = sidetnfs_tnfs_raw_readdir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle, &entry);
-                if (r < 0)
-                {
-                    backend_error = true;
-                    break;
-                }
-                if (r == 0)
-                {
-                    finished = true; // real end of directory
-                    break;
-                }
-                if (entry.is_dir != want_dirs)
-                {
-                    continue;
-                }
-                if (s_browse.walk_matched < skip)
-                {
-                    s_browse.walk_matched++;
-                    continue;
-                }
-                if (s_browse.walk_collected < FLOPPY_BROWSE_PAGE_ENTRIES)
-                {
-                    write_page_entry(memory_shared_address, entries_offset, s_browse.walk_collected, entry.name);
-                    s_browse.walk_collected++;
-                    s_browse.walk_matched++;
-                }
-                else
-                {
-                    has_next = true;
-                    finished = true;
-                    break;
-                }
-            }
-        }
-
-        if (finished || backend_error)
+        if ((finished || backend_error) && s_browse.walk_tnfs_handle_open)
         {
             sidetnfs_tnfs_raw_closedir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle);
             s_browse.walk_tnfs_handle_open = false;
@@ -686,6 +746,8 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     }
     else
     {
+        // SD: both phases always finish within this one call (no
+        // unbounded network wait to chunk around).
         char sd_root[SIDETNFS_FLOPPY_SDPATH_LEN + 4];
         snprintf(sd_root, sizeof(sd_root), "0:%s", s_browse.sd_root);
         char fatfs_path[FLOPPY_BROWSE_CWD_LEN + SIDETNFS_FLOPPY_SDPATH_LEN + 4];
@@ -708,13 +770,14 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
             return result;
         }
 
+        // Phase dirs.
         uint32_t round;
         for (round = 0; round < FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS && fr == FR_OK && fno.fname[0] != '\0'; round++)
         {
             bool is_dir = (fno.fattrib & AM_DIR) != 0;
-            if (is_dir == want_dirs)
+            if (is_dir)
             {
-                if (s_browse.walk_matched < skip)
+                if (s_browse.walk_matched < combined_skip)
                 {
                     s_browse.walk_matched++;
                 }
@@ -723,11 +786,9 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
                     if (strlen(fno.fname) < FLOPPY_BROWSE_NAME_LEN)
                     {
                         write_page_entry(memory_shared_address, entries_offset, s_browse.walk_collected, fno.fname);
+                        write_is_dir_entry(memory_shared_address, is_dir_offset, s_browse.walk_collected, true);
                         s_browse.walk_collected++;
                     }
-                    // else: skip rather than truncate into a different
-                    // name -- FF_MAX_LFN already keeps fname well under
-                    // 256 bytes in practice, this is defense in depth only.
                     s_browse.walk_matched++;
                 }
                 else
@@ -739,11 +800,63 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
             fr = f_findnext(&dj, &fno);
         }
         f_closedir(&dj);
-        finished = true; // SD always completes within one call
         if (round >= FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS)
         {
             backend_error = true;
         }
+        s_browse.walk_dirs_total = s_browse.walk_matched;
+
+        // Phase files -- fresh enumeration of the same CWD, only if phase
+        // dirs didn't already fill every slot.
+        if (!backend_error && !has_next)
+        {
+            fr = f_findfirst(&dj, &fno, fatfs_path, "*");
+            if (fr != FR_OK)
+            {
+                backend_error = true;
+            }
+            else
+            {
+                uint32_t file_skip =
+                    combined_skip > s_browse.walk_dirs_total ? combined_skip - s_browse.walk_dirs_total : 0;
+                uint32_t file_matched = 0;
+                for (; round < FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS && fr == FR_OK && fno.fname[0] != '\0'; round++)
+                {
+                    bool is_dir = (fno.fattrib & AM_DIR) != 0;
+                    if (!is_dir)
+                    {
+                        if (file_matched < file_skip)
+                        {
+                            file_matched++;
+                        }
+                        else if (s_browse.walk_collected < FLOPPY_BROWSE_PAGE_ENTRIES)
+                        {
+                            if (strlen(fno.fname) < FLOPPY_BROWSE_NAME_LEN)
+                            {
+                                write_page_entry(memory_shared_address, entries_offset, s_browse.walk_collected,
+                                                  fno.fname);
+                                write_is_dir_entry(memory_shared_address, is_dir_offset, s_browse.walk_collected,
+                                                    false);
+                                s_browse.walk_collected++;
+                            }
+                            file_matched++;
+                        }
+                        else
+                        {
+                            has_next = true;
+                            break;
+                        }
+                    }
+                    fr = f_findnext(&dj, &fno);
+                }
+                f_closedir(&dj);
+                if (round >= FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS)
+                {
+                    backend_error = true;
+                }
+            }
+        }
+        finished = true; // SD always completes within one call
     }
 
     if (backend_error)
@@ -756,7 +869,8 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     if (!finished)
     {
         // Budget for this call is exhausted but the walk isn't done --
-        // state stays parked in s_browse for the next resumed call.
+        // state stays parked in s_browse (including which phase) for the
+        // next resumed call.
         result.status = FLOPPY_BROWSE_STATUS_IN_PROGRESS;
         return result;
     }

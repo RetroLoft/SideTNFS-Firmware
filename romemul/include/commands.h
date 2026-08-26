@@ -221,20 +221,25 @@
 #define GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE (APP_GEMDRVEMUL << 8 | 0x21) // Set the active profile index (RAM only)
 #define GEMDRVEMUL_FLOPPY_SAVE_PROFILES (APP_GEMDRVEMUL << 8 | 0x22)    // Persist the RAM profile list to flash
 
-// FLOPPY.PRG LFN directory browser (Step 2). Subcommands 0x23-0x26, from
-// the range the block above already reserved for this. Browses ONE active
-// profile's real TNFS/SD source directly -- no GEMDOS drive/letter, no
-// Fsfirst/Fsnext, no 8.3 conversion, no name aliasing. Exactly one CWD is
-// active at a time (see sidetnfs_floppy_browse.h); a generation counter
-// bumped by OPEN/CHANGE_DIR lets GET_*_PAGE detect a stale request (e.g.
-// the Atari asking for a page from a directory it has since left). See
+// FLOPPY.PRG LFN directory browser (Step 2/3). Subcommands 0x23-0x25, from
+// the range the block above already reserved for this (0x26 free again as
+// of Step 3 -- GET_DIR_PAGE/GET_FILE_PAGE merged into one GET_PAGE, see
+// below). Browses ONE active profile's real TNFS/SD source directly -- no
+// GEMDOS drive/letter, no Fsfirst/Fsnext, no 8.3 conversion, no name
+// aliasing. Exactly one CWD is active at a time (see
+// sidetnfs_floppy_browse.h); a generation counter bumped by
+// OPEN/CHANGE_DIR lets GET_PAGE detect a stale request (e.g. the Atari
+// asking for a page from a directory it has since left). See
 // romemul/include/sidetnfs_floppy_browse.h for status codes and
 // romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_BROWSE/_PAGE) for the
 // wire layout.
-#define GEMDRVEMUL_FLOPPY_BROWSE_OPEN (APP_GEMDRVEMUL << 8 | 0x23)          // Open a profile for browsing (resolves backend/session, CWD = last_directory or root)
-#define GEMDRVEMUL_FLOPPY_BROWSE_CHANGE_DIR (APP_GEMDRVEMUL << 8 | 0x24)    // Change the active CWD (subdir name, or go-up)
-#define GEMDRVEMUL_FLOPPY_BROWSE_GET_DIR_PAGE (APP_GEMDRVEMUL << 8 | 0x25)  // Fetch one page of subdirectory names for the active CWD
-#define GEMDRVEMUL_FLOPPY_BROWSE_GET_FILE_PAGE (APP_GEMDRVEMUL << 8 | 0x26) // Fetch one page of file names for the active CWD
+#define GEMDRVEMUL_FLOPPY_BROWSE_OPEN (APP_GEMDRVEMUL << 8 | 0x23)       // Open a profile for browsing (resolves backend/session, CWD = last_directory or root)
+#define GEMDRVEMUL_FLOPPY_BROWSE_CHANGE_DIR (APP_GEMDRVEMUL << 8 | 0x24) // Change the active CWD (subdir name, or go-up)
+// Step 3: ONE combined page (dirs listed before files, GEMDRVEMUL_FLOPPY_PAGE_IS_DIR
+// says which is which per slot) instead of separate dir/file pages -- was
+// 0x25=GET_DIR_PAGE/0x26=GET_FILE_PAGE, now just this. Request payload
+// unchanged (generation(4) + page_index(4)) -- no want_dirs parameter.
+#define GEMDRVEMUL_FLOPPY_BROWSE_GET_PAGE (APP_GEMDRVEMUL << 8 | 0x25)   // Fetch one combined page (dirs then files) of the active CWD
 
 typedef struct
 {

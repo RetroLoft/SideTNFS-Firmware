@@ -418,28 +418,32 @@ _Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_SIZE - 
 #define GEMDRVEMUL_FLOPPY_BROWSE_CWD (GEMDRVEMUL_FLOPPY_BROWSE_GENERATION + 4)            // char[FLOPPY_BROWSE_CWD_LEN] (256)
 // Block ends at GEMDRVEMUL_FLOPPY_BROWSE_CWD + FLOPPY_BROWSE_CWD_LEN (264 bytes total).
 
-// GEMDRVEMUL_FLOPPY_PAGE: response to GET_DIR_PAGE/GET_FILE_PAGE -- small
-// status/metadata header, followed by up to FLOPPY_BROWSE_PAGE_ENTRIES (25)
-// fixed-size name slots. Dirs and files always land in this SAME region --
-// only one page (the most recently requested one, whichever kind) is ever
-// "current" at a time, since the Atari always fully consumes a page
-// synchronously before requesting the next, so there is no concurrent-
-// access hazard from sharing it. Publication is atomic from the Atari's
-// point of view: the whole block is only ever read AFTER the firmware's
-// write_random_token() at the end of the command handler, the same
-// producer/consumer handshake every other command in this protocol
-// already relies on -- there is no separate "half-written page" state the
-// Atari could ever observe.
+// GEMDRVEMUL_FLOPPY_PAGE: response to GET_PAGE -- small status/metadata
+// header, followed by up to FLOPPY_BROWSE_PAGE_ENTRIES (15) fixed-size
+// name slots, then a parallel is_dir[] word array (Step 3: one combined
+// page, dirs listed before files, GEMDRVEMUL_FLOPPY_PAGE_IS_DIR[slot]
+// tells the Atari which is which -- a page can now hold both kinds at
+// once, see sidetnfs_floppy_browse_get_page()'s own comment for the
+// dirs-then-files walk that fills it). Only one page (the most recently
+// requested one) is ever "current" at a time, since the Atari always
+// fully consumes a page synchronously before requesting the next, so
+// there is no concurrent-access hazard from sharing it. Publication is
+// atomic from the Atari's point of view: the whole block is only ever
+// read AFTER the firmware's write_random_token() at the end of the
+// command handler, the same producer/consumer handshake every other
+// command in this protocol already relies on -- there is no separate
+// "half-written page" state the Atari could ever observe.
 #define GEMDRVEMUL_FLOPPY_PAGE SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_BROWSE_CWD + FLOPPY_BROWSE_CWD_LEN)
 #define GEMDRVEMUL_FLOPPY_PAGE_STATUS (GEMDRVEMUL_FLOPPY_PAGE + 0)                        // uint32_t, swapped long
 #define GEMDRVEMUL_FLOPPY_PAGE_GENERATION (GEMDRVEMUL_FLOPPY_PAGE_STATUS + 4)             // uint32_t, swapped long
 #define GEMDRVEMUL_FLOPPY_PAGE_INDEX (GEMDRVEMUL_FLOPPY_PAGE_GENERATION + 4)              // uint32_t, swapped long -- echoes the request's page_index
-#define GEMDRVEMUL_FLOPPY_PAGE_COUNT (GEMDRVEMUL_FLOPPY_PAGE_INDEX + 4)                   // uint16_t, plain word -- entries actually filled, 0..25
+#define GEMDRVEMUL_FLOPPY_PAGE_COUNT (GEMDRVEMUL_FLOPPY_PAGE_INDEX + 4)                   // uint16_t, plain word -- entries actually filled, 0..15
 #define GEMDRVEMUL_FLOPPY_PAGE_HAS_PREV (GEMDRVEMUL_FLOPPY_PAGE_COUNT + 2)                // uint16_t, plain word -- 0/1
 #define GEMDRVEMUL_FLOPPY_PAGE_HAS_NEXT (GEMDRVEMUL_FLOPPY_PAGE_HAS_PREV + 2)              // uint16_t, plain word -- 0/1
 #define GEMDRVEMUL_FLOPPY_PAGE_RESERVED (GEMDRVEMUL_FLOPPY_PAGE_HAS_NEXT + 2)              // uint16_t, unused -- keeps ENTRIES 4-byte aligned
-#define GEMDRVEMUL_FLOPPY_PAGE_ENTRIES (GEMDRVEMUL_FLOPPY_PAGE_RESERVED + 2)               // char[25][256] -- 16-byte header above, entries start 4-aligned
-// Block ends at GEMDRVEMUL_FLOPPY_PAGE_ENTRIES + 25*256 (6400 bytes) -- 6416 bytes total.
+#define GEMDRVEMUL_FLOPPY_PAGE_ENTRIES (GEMDRVEMUL_FLOPPY_PAGE_RESERVED + 2)               // char[15][256] -- 16-byte header above, entries start 4-aligned
+#define GEMDRVEMUL_FLOPPY_PAGE_IS_DIR (GEMDRVEMUL_FLOPPY_PAGE_ENTRIES + (unsigned long)FLOPPY_BROWSE_PAGE_ENTRIES * (unsigned long)FLOPPY_BROWSE_NAME_LEN) // uint16_t[15], plain word each -- 1=dir/0=file, index-matched with ENTRIES
+// Block ends at GEMDRVEMUL_FLOPPY_PAGE_IS_DIR + 15*2 (30 bytes) -- header(16) + entries(15*256=3840) + is_dir(30) = 3886 bytes total.
 
 _Static_assert(GEMDRVEMUL_FLOPPY_BROWSE_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_BROWSE_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_BROWSE_GENERATION % 4 == 0, "GEMDRVEMUL_FLOPPY_BROWSE_GENERATION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
@@ -450,7 +454,8 @@ _Static_assert(GEMDRVEMUL_FLOPPY_PAGE_GENERATION % 4 == 0, "GEMDRVEMUL_FLOPPY_PA
 _Static_assert(GEMDRVEMUL_FLOPPY_PAGE_INDEX % 4 == 0, "GEMDRVEMUL_FLOPPY_PAGE_INDEX must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PAGE_COUNT % 2 == 0, "GEMDRVEMUL_FLOPPY_PAGE_COUNT must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_PAGE_ENTRIES % 4 == 0, "GEMDRVEMUL_FLOPPY_PAGE_ENTRIES must be 4-byte aligned (16-byte header above it)");
-_Static_assert((GEMDRVEMUL_FLOPPY_PAGE_ENTRIES + (unsigned long)FLOPPY_BROWSE_PAGE_ENTRIES * (unsigned long)FLOPPY_BROWSE_NAME_LEN) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PAGE block must fit within the 64KB ROM3 window");
+_Static_assert(GEMDRVEMUL_FLOPPY_PAGE_IS_DIR % 2 == 0, "GEMDRVEMUL_FLOPPY_PAGE_IS_DIR must be 2-byte aligned for WRITE_WORD");
+_Static_assert((GEMDRVEMUL_FLOPPY_PAGE_IS_DIR + (unsigned long)FLOPPY_BROWSE_PAGE_ENTRIES * 2UL) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PAGE block must fit within the 64KB ROM3 window");
 
 // BROWSE_CHANGE_DIR request payload size, excluding the 4-byte token:
 // generation(4) + go_up(2) + name(FLOPPY_BROWSE_NAME_LEN) = 262 bytes.
