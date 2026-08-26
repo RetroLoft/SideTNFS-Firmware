@@ -522,10 +522,30 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
 // collection is never expected to come close), guarding only against a
 // pathological server that never reaches TNFS_EOF.
 //
+// This counts REAL DIRECTORY ENTRIES examined (one sidetnfs_tnfs_raw_readdir()
+// call each -- dirs and files both, whichever phase is active), NOT
+// network round trips -- those are two different things now that
+// sidetnfs_tnfs_raw_readdir() batches SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH
+// (15) entries per real READDIRX round trip and caches the rest. Real-
+// hardware testing after enabling that batching showed page-fetch time
+// barely changed: this round count was still the actual bottleneck,
+// unchanged by batching, since it bounds how many entries one dispatch
+// call examines before returning FLOPPY_BROWSE_STATUS_IN_PROGRESS and
+// waiting for the Atari-side client to notice and resume -- and THAT
+// round trip (bus dispatch + Atari-side poll-and-resume) has its own
+// real cost, paid once per resumed call regardless of how cheap the
+// entries examined during it were. Raised from 8 to 32 now that most of
+// those entries are served from sidetnfs_tnfs_raw_readdir()'s cache
+// (worst case ceil(32/15)=3 real network rounds per dispatch call,
+// ~600ms typical rather than 8 separate up-to-200ms rounds strung across
+// 8 different resumed Atari-side polls) -- fewer resumed calls needed
+// per page, at a modest, bounded increase to any single call's own
+// worst-case duration.
+//
 // SD: local FatFS reads have no unbounded network wait, so a page always
 // finishes within a single call -- FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS is
 // cheap headroom against a runaway loop, not a deliberately-reached limit.
-#define FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL 8
+#define FLOPPY_BROWSE_TNFS_ROUNDS_PER_CALL 32
 #define FLOPPY_BROWSE_TNFS_MAX_TOTAL_ROUNDS 100000
 #define FLOPPY_BROWSE_SD_MAX_WALK_ROUNDS 20000
 
