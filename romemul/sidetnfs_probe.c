@@ -17,6 +17,8 @@
 #include "lwip/pbuf.h"
 #include "lwip/ip_addr.h"
 #include "f_util.h"
+#include "sd_card.h"                     // sd_init_driver() -- v1.0.3 diag fallback mount only
+#include "include/sidetnfs_sd_service.h" // sidetnfs_sd_service_has_run()/sidetnfs_sd_global_status()
 #include "include/filesys.h"  // FS_ST_* Atari attribute bits
 #include "include/commands.h" // GEMDRVEMUL_*_CALL ids -- for COMMAND_ENTER name decode only
 #include "include/rtcemul.h"  // get_utc_offset_seconds() -- same local-time policy as NTP->RTC
@@ -853,6 +855,37 @@ typedef struct
 
 static SidetnfsTnfsDtaSearch s_tnfs_dta_searches[SIDETNFS_TNFS_DTA_SLOTS] = {0};
 
+// TNFS reliability diagnostics: cheap, always-on
+// bookkeeping for fs-listing envelope rejections (see
+// tnfs_fslisting_recv_callback()) -- a plain counter (no per-event cost
+// at all) plus a one-shot latch so the actual expected-vs-actual values
+// are captured to the eventlog exactly once, ever. Declared here,
+// unconditionally (not gated by SIDETNFS_ENABLE_DIAG/_DEBUG below),
+// because the increment itself always compiles regardless of build
+// variant -- only the one-time sidetnfs_diag_log() calls it gates are a
+// no-op in Production. See sidetnfs_eventlog_dump_to_file()'s own
+// summary line for where the count is read back out.
+static uint32_t s_fslisting_envelope_reject_count = 0;
+static bool s_fslisting_envelope_reject_logged = false;
+
+// First-occurrence expected-vs-actual envelope values, captured OUTSIDE
+// the fixed-size s_diag_events[] array (see tnfs_fslisting_recv_callback()'s
+// own comment) -- a real capture showed the reject counter above at 2
+// while the corresponding SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED/_ACTUAL
+// entries never made it into EVENTLOG.TXT at all: s_diag_events[] had
+// already hit SIDETNFS_DIAG_MAX_EVENTS by the time the reject fired (it
+// stops recording once full, see sidetnfs_diag_log()), silently dropping
+// the one-shot sidetnfs_diag_log() calls along with everything else. These
+// six fields cost a few words of static RAM and are always printed by
+// sidetnfs_eventlog_dump_to_file() regardless of how full the main log is.
+static uint32_t s_fslisting_envelope_reject_expected_addr = 0;
+static uint16_t s_fslisting_envelope_reject_expected_port = 0;
+static uint16_t s_fslisting_envelope_reject_expected_sid = 0;
+static uint32_t s_fslisting_envelope_reject_actual_addr = 0;
+static uint16_t s_fslisting_envelope_reject_actual_port = 0;
+static uint16_t s_fslisting_envelope_reject_actual_sid = 0;
+static uint8_t s_fslisting_envelope_reject_reason = 0;
+
 // RAM-only diagnostic eventlog. Stops recording once full (see
 // sidetnfs_diag_log() doc comment) -- never a ring buffer, so the earliest
 // events (boot/cold-start/first Fsfirst) are never overwritten by later
@@ -870,10 +903,45 @@ static SidetnfsTnfsDtaSearch s_tnfs_dta_searches[SIDETNFS_TNFS_DTA_SLOTS] = {0};
 static SidetnfsDiagEvent s_diag_events[SIDETNFS_DIAG_MAX_EVENTS];
 static uint16_t s_diag_event_count = 0;
 
+// TNFS reliability diagnostics: directory browsing
+// itself (Fsfirst/Fsnext for desktop icon refresh) is already confirmed
+// working from an earlier eventlog capture -- these events are pure
+// repetitive noise that ate most of the fixed 256-event budget before
+// the actually-interesting Fopen/Fread/Fclose sequence for a specific
+// file even started. Filtered centrally here rather than at each of
+// their many call sites (DTA_EXIST_* siblings are filtered at their own,
+// far fewer call sites in gemdrvemul.c via the existing
+// SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL idiom instead).
+static bool sidetnfs_diag_is_browse_noise(SidetnfsDiagEventType event)
+{
+    switch (event)
+    {
+    case SIDETNFS_DIAG_FSFIRST_ENTER:
+    case SIDETNFS_DIAG_FSFIRST_ATTR_PREP:
+    case SIDETNFS_DIAG_FSFIRST_FOUND:
+    case SIDETNFS_DIAG_FSFIRST_NOT_FOUND:
+    case SIDETNFS_DIAG_FSFIRST_RETURN:
+    case SIDETNFS_DIAG_FSNEXT_ENTER:
+    case SIDETNFS_DIAG_FSNEXT_CASE_REACHED:
+    case SIDETNFS_DIAG_FSNEXT_SEARCH_ACTIVE:
+    case SIDETNFS_DIAG_FSNEXT_SEARCH_MISSING:
+    case SIDETNFS_DIAG_FSNEXT_FOUND:
+    case SIDETNFS_DIAG_FSNEXT_END:
+    case SIDETNFS_DIAG_FSNEXT_RETURN:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *path,
                         const char *pattern, const char *name, uint16_t index,
                         uint16_t count, uint8_t result, uint8_t attr)
 {
+    if (sidetnfs_diag_is_browse_noise(event))
+    {
+        return;
+    }
     if (s_diag_event_count >= SIDETNFS_DIAG_MAX_EVENTS)
     {
         return; // full -- stop recording, keep the earliest events
@@ -1272,6 +1340,10 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "UPDATE_EMPTY_VERSION";
     case SIDETNFS_DIAG_UPDATE_RESULT:
         return "UPDATE_RESULT";
+    case SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED:
+        return "FSLISTING_ENVELOPE_EXPECTED";
+    case SIDETNFS_DIAG_FSLISTING_ENVELOPE_ACTUAL:
+        return "FSLISTING_ENVELOPE_ACTUAL";
     default:
         return "UNKNOWN";
     }
@@ -1337,15 +1409,46 @@ static const char *command_id_name(uint32_t id)
 void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
 {
 #if SIDETNFS_DEBUG_DUMP_ON_SELECT
-    if (hd_folder == NULL)
-    {
-        return;
-    }
     char path[160];
-    int n = snprintf(path, sizeof(path), "%s/EVENTLOG.TXT", hd_folder);
-    if (n <= 0 || (size_t)n >= sizeof(path))
+    if (hd_folder != NULL)
     {
-        return;
+        int n = snprintf(path, sizeof(path), "%s/EVENTLOG.TXT", hd_folder);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+        {
+            return;
+        }
+    }
+    else
+    {
+        // TNFS reliability diagnostics: GEMDRIVE's own
+        // hd_folder is only populated once the first GEMDRVEMUL_PING
+        // round-trip completes (see gemdrvemul.c) -- if a crash happens
+        // before that, hd_folder is still NULL here and this dump used
+        // to silently write nothing at all, however many events were
+        // sitting in RAM. Best-effort, self-contained fallback: only
+        // attempt our own mount if nothing else has already claimed the
+        // card (mirrors the exact "give a card a second chance" contract
+        // GEMDRVEMUL_PING's own SD attempt already uses -- never
+        // re-mounts an already-READY card, which would invalidate any
+        // FatFS object another in-flight SD file operation still holds).
+        if (sidetnfs_sd_service_has_run() && sidetnfs_sd_global_status() == SIDETNFS_SD_STATUS_READY)
+        {
+            return; // card is mounted by someone else; not our place to guess a folder
+        }
+        static FATFS s_diag_fallback_fs;
+        if (!sd_init_driver())
+        {
+            return;
+        }
+        if (f_mount(&s_diag_fallback_fs, "0:", 1) != FR_OK)
+        {
+            return;
+        }
+        int n = snprintf(path, sizeof(path), "/EVENTLOG.TXT");
+        if (n <= 0 || (size_t)n >= sizeof(path))
+        {
+            return;
+        }
     }
 
     FIL file;
@@ -1383,6 +1486,39 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
     if (len > 0)
     {
         f_write(&file, line, (UINT)len, &written);
+    }
+
+    // TNFS reliability diagnostics: total envelope
+    // rejection count, tracked cheaply for the whole session (see
+    // s_fslisting_envelope_reject_count's own comment) -- always visible
+    // here even though only the first occurrence gets its own pair of
+    // FSLISTING_ENVELOPE_EXPECTED/_ACTUAL events below.
+    len = snprintf(line, sizeof(line), "fslisting envelope rejects: %lu\r\n",
+                    (unsigned long)s_fslisting_envelope_reject_count);
+    if (len > 0)
+    {
+        f_write(&file, line, (UINT)len, &written);
+    }
+    // Printed unconditionally, straight from the dedicated fields above --
+    // NOT from s_diag_events[], which may already have been full (and
+    // silently dropping new entries) by the time the first reject fired.
+    // See those fields' own comment for why this exists.
+    if (s_fslisting_envelope_reject_logged)
+    {
+        len = snprintf(line, sizeof(line),
+                        "envelope expected: addr=%08lx port=%u sid=%04x\r\n"
+                        "envelope actual: addr=%08lx port=%u sid=%04x reason=%u\r\n",
+                        (unsigned long)s_fslisting_envelope_reject_expected_addr,
+                        (unsigned)s_fslisting_envelope_reject_expected_port,
+                        (unsigned)s_fslisting_envelope_reject_expected_sid,
+                        (unsigned long)s_fslisting_envelope_reject_actual_addr,
+                        (unsigned)s_fslisting_envelope_reject_actual_port,
+                        (unsigned)s_fslisting_envelope_reject_actual_sid,
+                        (unsigned)s_fslisting_envelope_reject_reason);
+        if (len > 0)
+        {
+            f_write(&file, line, (UINT)len, &written);
+        }
     }
 
     // The single most important diagnostic question -- did a real
@@ -3390,21 +3526,48 @@ static void tnfs_fslisting_recv_callback(void *arg, struct udp_pcb *pcb, struct 
     // Reject anything not from the exact server/session the currently
     // outstanding request was sent to before it's ever stored as a
     // candidate match -- see s_fslisting_expected_addr's own comment.
-    if (addr == NULL || addr->addr != s_fslisting_expected_addr.addr || port != s_fslisting_expected_port)
+    //
+    // v1.0.3 reliability-fix diagnostics (temporary, deliberately light):
+    // a cheap running count of every rejection reason (three word-sized
+    // increments, no struct write, no pbuf walk beyond what the checks
+    // themselves already need) plus the actual expected-vs-actual values
+    // logged via sidetnfs_diag_log() exactly ONCE for the lifetime of the
+    // firmware -- never once more, however many further rejections
+    // follow -- so a field report of "the fix made things worse" can be
+    // root-caused from EVENTLOG.TXT without flooding the fixed 256-event
+    // budget or adding per-packet overhead in this hot callback. See
+    // SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED/_ACTUAL's own comment.
+    bool addr_ok = (addr != NULL && addr->addr == s_fslisting_expected_addr.addr);
+    bool port_ok = (port == s_fslisting_expected_port);
+    uint16_t resp_sid = 0;
+    bool sid_read = (p->tot_len >= 2);
+    if (sid_read)
     {
-        pbuf_free(p);
-        return;
+        uint8_t sid_bytes[2];
+        pbuf_copy_partial(p, sid_bytes, 2, 0);
+        resp_sid = (uint16_t)sid_bytes[0] | ((uint16_t)sid_bytes[1] << 8);
     }
-    if (p->tot_len < 2)
+    bool sid_ok = sid_read && (resp_sid == s_fslisting_expected_sid);
+
+    if (!addr_ok || !port_ok || !sid_ok)
     {
-        pbuf_free(p);
-        return;
-    }
-    uint8_t sid_bytes[2];
-    pbuf_copy_partial(p, sid_bytes, 2, 0);
-    uint16_t resp_sid = (uint16_t)sid_bytes[0] | ((uint16_t)sid_bytes[1] << 8);
-    if (resp_sid != s_fslisting_expected_sid)
-    {
+        uint8_t reason = !addr_ok ? 1u : (!port_ok ? 2u : 3u); /* which check failed first */
+        s_fslisting_envelope_reject_count++;
+        if (!s_fslisting_envelope_reject_logged)
+        {
+            s_fslisting_envelope_reject_logged = true;
+            s_fslisting_envelope_reject_expected_addr = s_fslisting_expected_addr.addr;
+            s_fslisting_envelope_reject_expected_port = s_fslisting_expected_port;
+            s_fslisting_envelope_reject_expected_sid = s_fslisting_expected_sid;
+            s_fslisting_envelope_reject_actual_addr = addr ? addr->addr : 0;
+            s_fslisting_envelope_reject_actual_port = port;
+            s_fslisting_envelope_reject_actual_sid = sid_read ? resp_sid : 0xFFFFu;
+            s_fslisting_envelope_reject_reason = reason;
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED, s_fslisting_expected_addr.addr, NULL, NULL,
+                               NULL, s_fslisting_expected_port, s_fslisting_expected_sid, 0, 0);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FSLISTING_ENVELOPE_ACTUAL, addr ? addr->addr : 0, NULL, NULL, NULL, port,
+                               sid_read ? resp_sid : 0xFFFFu, reason, 0);
+        }
         pbuf_free(p);
         return;
     }
@@ -4311,42 +4474,28 @@ static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t 
         sleep_us(SIDETNFS_FS_WAIT_STEP_US);
     }
 
-    // TIMEOUT for (expect_cmd, expect_seq). Its response may still be
-    // genuinely in flight, just later than this bounded wait allows --
-    // and s_readdirx_seq will eventually wrap back around to expect_seq
-    // again (every SIDETNFS_TNFS_READ_CHUNK_MAX-sized-round-trip's worth
-    // of requests later, e.g. ~256 rounds into a large file read). cmd+seq
-    // alone can't tell that later, unrelated request's response apart
-    // from this one's straggler if it arrives during that later request's
-    // own wait_for() call -- silently splicing stale bytes into whatever
-    // is being read then (SideTNFS v1.0.3's silent-corruption bug: a
-    // large .PRG loaded over TNFS occasionally executing garbage and
-    // hitting an illegal instruction, traced to exactly this gap). The
-    // addr/port/session-id check above doesn't close this either, since
-    // all three stay constant for the life of one session.
-    //
-    // Closing it deterministically, without any TNFS wire/protocol
-    // change: keep "waiting" for one more full window, unconditionally
-    // discarding anything that arrives (never matching, since this
-    // request has already been given up on). This drains a genuine
-    // straggler for THIS (expect_cmd, expect_seq) pair here, under its
-    // own identity, before returning control to the caller -- so by the
-    // time s_readdirx_seq wraps back around to expect_seq, this pair's
-    // previous use is guaranteed fully resolved (matched or drained) and
-    // can never again produce a stray match. Same bounded-margin
-    // reasoning as TCP's own TIME_WAIT before a 4-tuple/sequence range is
-    // reused -- not a proof against unbounded network delay, but the
-    // standard, deterministic way to bound reuse safety for a fixed-width
-    // wire sequence field. Costs latency only on this already-failing
-    // path; every successful read is completely unaffected.
-    for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
-    {
-        cyw43_arch_poll();
-        s_fslisting_resp.response_ready = false; // drain: never a match, always discard
-        sleep_us(SIDETNFS_FS_WAIT_STEP_US);
-    }
+    // TIMEOUT for (expect_cmd, expect_seq). v1.0.3 TNFS-reliability-fix
+    // regression chase: this used to be followed by a second, full
+    // SIDETNFS_FS_WAIT_MAX_ITER drain loop here, to close the (cmd, seq)
+    // wraparound gap deterministically (see git history). Real-hardware
+    // testing showed that unconditionally doubling the latency of EVERY
+    // timeout -- for all 16 call sites, not just the high-frequency
+    // sidetnfs_tnfs_file_read() round loop where wraparound risk is
+    // actually concentrated -- made the Atari-side crash reproducibly
+    // *worse* and earlier: this function is called synchronously from deep
+    // inside the main GEMDRIVE command loop (gemdrvemul.c), so the extra
+    // 200ms left the Atari bus completely unserviced for up to 400ms on
+    // any single dropped/late UDP packet, not just on genuine wraparound
+    // risk. The addr/port/session-id check above already closes off the
+    // dominant real-world case (a response entirely unrelated to this
+    // session or even this server being cross-matched by a bare cmd+seq
+    // coincidence, which is what made the original bug "almost always"
+    // reproducible); the narrower same-session (cmd,seq)-reuse-before-a-
+    // genuinely-delayed-straggler-arrives race this drain loop targeted is
+    // real but far rarer, and not worth this latency cost paid on every
+    // ordinary timeout. Reverted to a single bounded wait.
     s_fslisting_waiting = false;
-    return false; // bounded-wait timeout, straggler-drain complete
+    return false; // bounded-wait timeout
 }
 
 // /6D: send CLOSEDIR for dir_handle and wait (bounded -- same
@@ -4985,6 +5134,11 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
     // phase) -- the per-round detail above only fires under
     // SIDETNFS_DEBUG_FOCUS_FILE_IO.
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_TNFS_RC, guest_fd, NULL, NULL, NULL, tnfs_handle, total, last_rc, 0);
+    // FREAD_TNFS_OK/EOF only add a duplicate of the total/rc the summary
+    // line above already carries -- gemdrvemul.c's own unconditional
+    // READ_BUFF_RETURN covers the GEMDOS-level result, so these two are
+    // FILE_IO-focus-only budget, same as the per-round detail above.
+#if SIDETNFS_DEBUG_FOCUS_FILE_IO
     if (total == 0)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_EOF, guest_fd, NULL, NULL, NULL, tnfs_handle, 0, 0, 0);
@@ -4993,6 +5147,7 @@ bool sidetnfs_tnfs_file_read(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_TNFS_OK, guest_fd, NULL, NULL, NULL, tnfs_handle, total, 0, 0);
     }
+#endif
     return true;
 }
 

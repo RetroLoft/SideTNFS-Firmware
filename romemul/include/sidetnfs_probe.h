@@ -1437,6 +1437,19 @@ typedef enum
     SIDETNFS_DIAG_UPDATE_HEADERS_INCOMPLETE,
     SIDETNFS_DIAG_UPDATE_EMPTY_VERSION,
     SIDETNFS_DIAG_UPDATE_RESULT,
+    // TNFS envelope-mismatch diagnostics
+    // (tnfs_fslisting_recv_callback() in sidetnfs_probe.c). Logged
+    // whenever an incoming fs-listing response is rejected because it
+    // doesn't match the currently outstanding request's expected
+    // server/session envelope -- lets a field report of unexpected
+    // rejections be root-caused from EVENTLOG.TXT. Two events per
+    // rejection: ENVELOPE_EXPECTED (ndta=expected addr, index=expected
+    // port, count=expected session id) immediately followed by
+    // ENVELOPE_ACTUAL (ndta=actual addr, index=actual port, count=actual
+    // session id if read, result=1/2/3 for which check failed first:
+    // addr/port/session id).
+    SIDETNFS_DIAG_FSLISTING_ENVELOPE_EXPECTED,
+    SIDETNFS_DIAG_FSLISTING_ENVELOPE_ACTUAL,
 } SidetnfsDiagEventType;
 
 // SIDETNFS_DIAG_MAX_EVENTS itself is defined in debug.h.

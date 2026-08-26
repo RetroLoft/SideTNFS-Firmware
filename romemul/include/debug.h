@@ -61,11 +61,14 @@
 // File-I/O focus: full per-round TNFS READ detail
 // (SIDETNFS_DIAG_FREAD_TNFS_READ/READ_BUFF_TNFS_RC inside the internal
 // chunk-loop), at the cost of suppressing directory-listing detail events.
-// Defaults ON: a read failure on an existing file (e.g. copying a TNFS
-// file to a local drive) needs the TNFS response code/chunk sizes for
-// every round, not just a one-line summary per GEMDRVEMUL_READ_BUFF_CALL.
+// Off while chasing the v1.0.3 TNFS-reliability-fix regression: two real
+// captures now show this per-round detail clean (rc=0 every round) across
+// two full files, each burning ~200 of the 256-slot budget on 200-byte-
+// chunk rounds that never disagree with each other -- the crash itself
+// happens later than the budget can still reach with this on. Re-enable
+// if a read failure (not the bomb crash) needs the per-round detail again.
 #ifndef SIDETNFS_DEBUG_FOCUS_FILE_IO
-#define SIDETNFS_DEBUG_FOCUS_FILE_IO 1
+#define SIDETNFS_DEBUG_FOCUS_FILE_IO 0
 #endif
 
 // Fseek focus: narrows GEMDRVEMUL_COMMAND_ENTER logging to
@@ -78,24 +81,29 @@
 // Fdelete focus: adds GEMDRVEMUL_FDELETE_CALL to the COMMAND_ENTER
 // whitelist (composed with FSEEK's own -- either focus mode being on is
 // enough to show its own commands) and suppresses directory-listing
-// detail the same way.
+// detail the same way. Off while chasing the v1.0.3 TNFS-reliability-fix
+// regression (Fdelete never fires during a Pexec/.PRG load) -- re-enable
+// if that changes.
 #ifndef SIDETNFS_DEBUG_FOCUS_FDELETE
-#define SIDETNFS_DEBUG_FOCUS_FDELETE 1
+#define SIDETNFS_DEBUG_FOCUS_FDELETE 0
 #endif
 
-// Frename focus: same contract as FSEEK/FDELETE, for FRENAME.
+// Frename focus: same contract as FSEEK/FDELETE, for FRENAME. Off, same
+// reason as FDELETE above.
 #ifndef SIDETNFS_DEBUG_FOCUS_FRENAME
-#define SIDETNFS_DEBUG_FOCUS_FRENAME 1
+#define SIDETNFS_DEBUG_FOCUS_FRENAME 0
 #endif
 
-// Dcreate focus: same contract as FSEEK/FDELETE/FRENAME, for DCREATE.
+// Dcreate focus: same contract as FSEEK/FDELETE/FRENAME, for DCREATE. Off,
+// same reason as FDELETE above.
 #ifndef SIDETNFS_DEBUG_FOCUS_DCREATE
-#define SIDETNFS_DEBUG_FOCUS_DCREATE 1
+#define SIDETNFS_DEBUG_FOCUS_DCREATE 0
 #endif
 
-// Ddelete focus: same contract as FSEEK/FDELETE/FRENAME/DCREATE, for DDELETE.
+// Ddelete focus: same contract as FSEEK/FDELETE/FRENAME/DCREATE, for
+// DDELETE. Off, same reason as FDELETE above.
 #ifndef SIDETNFS_DEBUG_FOCUS_DDELETE
-#define SIDETNFS_DEBUG_FOCUS_DDELETE 1
+#define SIDETNFS_DEBUG_FOCUS_DDELETE 0
 #endif
 
 // True when ANY focus mode above is on -- directory-listing detail events
