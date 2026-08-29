@@ -258,31 +258,26 @@ char sidetnfs_probe_get_active_drive_letter(void)
 #define SIDETNFS_DEBUG_RAW_SIZE 16
 #define SIDETNFS_DEBUG_WRITE_MIN_INTERVAL_MS 250
 
-// Response parse buffer for the MOUNT/OPENDIRX/READDIRX probe channel
-// (tnfs_recv_callback()/SidetnfsProbeResponse's own buf below): large
-// enough for a READDIRX batch of a few entries with short 8.3-style Atari
-// names (the only thing that channel ever carries). NOT used by the
-// fs-listing channel below, which needs its own, much larger buffer for
-// FLOPPY.PRG's LFN browse (see SIDETNFS_FSLISTING_RX_BUF_SIZE).
-#define SIDETNFS_RX_BUF_SIZE 256
-
-// Response parse buffer for the fs-listing channel (SidetnfsFsListingResponse.buf
-// below -- Fsfirst/Fsnext's DTA-registry reads AND FLOPPY.PRG's LFN
-// browse both funnel through this one shared buffer). Sized for a
-// SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH-sized (15) batch of REAL LFN
-// names, not the short 8.3-style names SIDETNFS_RX_BUF_SIZE above was
-// sized for -- FLOPPY_BROWSE_NAME_LEN allows up to 255-byte names, so
-// even a handful of realistically long floppy-image filenames could
-// exceed the old 256-byte buffer, silently truncating a batched READDIRX
-// response and desyncing the server's own directory cursor from what got
-// parsed (see SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH's own comment in
-// sidetnfs_probe.c for why that particular failure mode is worse than a
-// merely-short response). 2048 comfortably covers 15 entries at a ~120-byte
-// average name (13-byte fixed header + name + NUL each) with real margin
-// to spare, while staying a small fraction of this project's available
-// static RAM (see the v1.0.4 ROM_IN_RAM/heap investigation in git history
-// for how that budget was established).
-#define SIDETNFS_FSLISTING_RX_BUF_SIZE 2048
+// Response parse buffer shared by every TNFS receive channel: the
+// boot-time MOUNT/OPENDIRX/READDIRX probe (tnfs_recv_callback()) AND the
+// fs-listing channel (SidetnfsFsListingResponse.buf -- Fsfirst/Fsnext's
+// DTA-registry reads, FLOPPY.PRG's LFN browse, and file READ/WRITE data
+// all funnel through this one buffer). Used to be two separate constants
+// (256 for the probe channel, 2048 for fs-listing) sized on worst-case
+// theory -- e.g. FLOPPY_BROWSE_NAME_LEN allows up to 255-byte names, so a
+// SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH-sized (15) batch could in theory
+// need much more than 256 bytes. In practice, real-hardware captures
+// (2026-08) of both a file READ session and a 3-page LFN-browse session
+// never showed a single TNFS response payload above 531 bytes -- this
+// TNFS server implementation appears to cap its own outgoing packets well
+// under that regardless of what a client requests or how many entries a
+// READDIRX batch could theoretically hold. One shared 768-byte buffer
+// gives that observed ceiling a comfortable margin, is simpler to reason
+// about than two differently-sized channels, and is still a small
+// fraction of this project's tight static RAM budget (see the v1.0.4
+// ROM_IN_RAM/heap investigation in git history for how that budget was
+// established).
+#define SIDETNFS_RX_BUF_SIZE 768
 
 // Entries requested per READDIRX round-trip, and a hard cap on the number
 // of round-trips so a pathological/misbehaving server can never turn this
@@ -291,27 +286,52 @@ char sidetnfs_probe_get_active_drive_letter(void)
 #define SIDETNFS_READDIRX_MAX_ROUNDS 32u
 
 // Max payload bytes requested per single TNFS READ wire
-// round-trip. Bounded well under SIDETNFS_RX_BUF_SIZE (256) so a full
-// response (header+rc+size+data) always fits s_fslisting_resp.buf with room
-// to spare, and well under a typical UDP MTU.
+// round-trip. The response (7-byte header: sid+seq+cmd+rc+size, then data)
+// is parsed into s_fslisting_resp.buf, SIDETNFS_RX_BUF_SIZE (768) bytes --
+// 512+7 leaves comfortable room to spare there. Also comfortably under a
+// typical Ethernet/WiFi MTU (1500), so a 512+7-byte UDP payload (plus
+// IP/UDP headers) stays a single non-fragmenting packet.
 //
-// Correction: this used to also be the effective per-
-// GEMDRVEMUL_READ_BUFF_CALL limit (one TNFS READ per guest call) -- that
-// was wrong. The SD/FatFS route's f_read() fills the *entire* requested
-// buff_size (up to DEFAULT_FOPEN_READ_BUFFER_SIZE=16384) in one guest call,
-// short only at real EOF; a copy operation that requests a large buff_size
-// per call was silently getting back only SIDETNFS_TNFS_READ_CHUNK_MAX
-// bytes with the rest of the shared buffer left stale/zeroed, corrupting
-// the copy without ever raising a GEMDOS error. This constant
-// still bounds each individual wire round-trip; sidetnfs_tnfs_file_read()
-// below now loops internally (bounded by SIDETNFS_TNFS_READ_MAX_ROUNDS) to
-// fill up to the full `requested` amount, matching f_read()'s contract.
-#define SIDETNFS_TNFS_READ_CHUNK_MAX 200u
+// Was raised from 200 to 1024 (2026-08), then brought back down to 512
+// once real-hardware tcpdump captures showed this TNFS server never
+// actually grants more than ~512 bytes of READ payload per round no
+// matter what a client requests -- decoding a captured request/response
+// pair byte-for-byte showed a 1024-byte request answered with an explicit
+// 512-byte size field in the response header. Asking for more than that
+// achieves nothing but a bigger number in the wire request, so 512 both
+// matches observed server behavior and keeps a request+response pair
+// safely under SIDETNFS_RX_BUF_SIZE with margin.
+//
+// Correction (still applies): this used to also be assumed to be the
+// effective per-GEMDRVEMUL_READ_BUFF_CALL limit (one TNFS READ per guest
+// call) -- that was wrong. The SD/FatFS route's f_read() fills the
+// *entire* requested buff_size (up to DEFAULT_FOPEN_READ_BUFFER_SIZE=16384)
+// in one guest call, short only at real EOF; a copy operation that
+// requests a large buff_size per call was silently getting back only
+// SIDETNFS_TNFS_READ_CHUNK_MAX bytes with the rest of the shared buffer
+// left stale/zeroed, corrupting the copy without ever raising a GEMDOS
+// error. This constant still bounds each individual wire round-trip;
+// sidetnfs_tnfs_file_read() below now loops internally (bounded by
+// SIDETNFS_TNFS_READ_MAX_ROUNDS) to fill up to the full `requested`
+// amount, matching f_read()'s contract.
+#define SIDETNFS_TNFS_READ_CHUNK_MAX 512u
 
 // Hard cap on internal TNFS READ round-trips per single
-// sidetnfs_tnfs_file_read() call. ceil(DEFAULT_FOPEN_READ_BUFFER_SIZE /
-// SIDETNFS_TNFS_READ_CHUNK_MAX) = ceil(16384/200) = 82 covers the largest
-// legitimate single-call fill with comfortable margin; a pathological
+// sidetnfs_tnfs_file_read() call. Deliberately NOT sized against
+// ceil(DEFAULT_FOPEN_READ_BUFFER_SIZE / SIDETNFS_TNFS_READ_CHUNK_MAX) --
+// that math assumes the server honors our full requested chunk every
+// round, which it may not (many TNFS server implementations cap their own
+// READ response well below what a client asks for, e.g. the traditional
+// 512-byte default). If the server actually grants less than
+// SIDETNFS_TNFS_READ_CHUNK_MAX per round, more rounds are needed to fill
+// `requested`, and this loop falls through to a silent `return true` with
+// total < requested once the cap is hit -- no error, no diag event, just
+// a truncated read (2026-08 regression: shrinking this to 24 alongside
+// the CHUNK_MAX bump broke .PRG loading over TNFS -- "loopt vast of geeft
+// bommen" -- while small transfers/directory listings, which don't go
+// through this loop, kept working fine). Kept at the original,
+// small-chunk-era value so a server that only ever grants ~200 bytes/round
+// still comfortably completes a full 16384-byte fill; a pathological
 // server that never signals EOF still cannot turn this into an unbounded
 // loop.
 #define SIDETNFS_TNFS_READ_MAX_ROUNDS 128u
@@ -328,13 +348,17 @@ char sidetnfs_probe_get_active_drive_letter(void)
 // server-accepted chunk rather than continuing (
 // a genuine partial-write condition, e.g. a full disk, behind further
 // chunks that would silently pad the guest's byte count).
-#define SIDETNFS_TNFS_WRITE_CHUNK_MAX 200u
+#define SIDETNFS_TNFS_WRITE_CHUNK_MAX 512u
 
 // Hard cap on internal TNFS WRITE round-trips per single
-// sidetnfs_tnfs_file_write() call. ceil(DEFAULT_FWRITE_BUFFER_SIZE /
-// SIDETNFS_TNFS_WRITE_CHUNK_MAX) = ceil(2048/200) = 11 covers the largest
-// legitimate single-call fill (one GEMDRVEMUL_WRITE_BUFF_CALL never asks
-// for more than DEFAULT_FWRITE_BUFFER_SIZE bytes) with comfortable margin.
+// sidetnfs_tnfs_file_write() call. Same reasoning as
+// SIDETNFS_TNFS_READ_MAX_ROUNDS's own comment for why this is NOT sized
+// against ceil(DEFAULT_FWRITE_BUFFER_SIZE / SIDETNFS_TNFS_WRITE_CHUNK_MAX)
+// -- WRITE already stops immediately on any short/partial server-accepted
+// chunk (see SIDETNFS_TNFS_WRITE_CHUNK_MAX's own comment), so this cap is
+// pure backstop, not a value this loop is expected to ever actually reach.
+// Kept at the original, small-chunk-era value for the same margin-over-an-
+// unknown-server-cap reasoning as the READ side.
 #define SIDETNFS_TNFS_WRITE_MAX_ROUNDS 16u
 
 // Small, fixed test set of GEMDOS-style patterns counted against
@@ -1910,7 +1934,7 @@ typedef struct
     volatile bool response_ready;
     uint8_t cmd;
     uint8_t seq; // echoed sequence number, for cmd+seq correlation
-    uint8_t buf[SIDETNFS_FSLISTING_RX_BUF_SIZE];
+    uint8_t buf[SIDETNFS_RX_BUF_SIZE];
     uint16_t len;
 } SidetnfsFsListingResponse;
 
@@ -4369,7 +4393,7 @@ static uint8_t fslisting_parse_batch(uint8_t batch, SidetnfsAtariDirEntry *out_e
 // readdirx/closedir, fslisting_wait_for, s_fslisting_resp, the per-slot
 // mount/session machinery) is reused as-is. Names are handed back exactly
 // as TNFS sent them, NUL-terminated, up to SIDETNFS_TNFS_RAW_NAME_MAX-1
-// bytes -- s_fslisting_resp.buf itself is only SIDETNFS_RX_BUF_SIZE (256)
+// bytes -- s_fslisting_resp.buf itself is SIDETNFS_RX_BUF_SIZE (768)
 // bytes, so a real name can never actually reach that bound; the
 // destination-size check in sidetnfs_tnfs_raw_readdir() below exists
 // purely as defense in depth, never as the primary bound.
@@ -4408,11 +4432,14 @@ static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t 
 // That failure mode is independent of batch size and reproduced even at
 // batch=1, so the multi-entry-parser-format worry above was never
 // actually confirmed as a real problem -- it just hadn't been
-// re-attempted with a properly-sized buffer yet. s_fslisting_resp.buf is
-// now SIDETNFS_FSLISTING_RX_BUF_SIZE (2048, see its own comment) instead
-// of the old 256, comfortably fitting a 15-entry batch of real LFN names
-// without the truncation/server-cursor-desync risk that size was never
-// meant to survive. Back to 15 -- one full FLOPPY_BROWSE_PAGE_ENTRIES
+// re-attempted with a properly-sized buffer yet. s_fslisting_resp.buf was
+// then raised to a dedicated SIDETNFS_FSLISTING_RX_BUF_SIZE (2048),
+// comfortably fitting a 15-entry batch of real LFN names without the
+// truncation/server-cursor-desync risk 256 was never meant to survive;
+// 2026-08 real-hardware captures later showed actual responses never
+// exceeding ~531 bytes, so this buffer and the probe channel's own were
+// unified back into one shared SIDETNFS_RX_BUF_SIZE (768, see its own
+// comment). Back to 15 -- one full FLOPPY_BROWSE_PAGE_ENTRIES
 // page's worth of dir-or-file entries in a single network round trip.
 #define SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH 15
 
