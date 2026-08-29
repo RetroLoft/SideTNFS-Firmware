@@ -4,6 +4,15 @@ All notable changes to SideTNFS are documented here. Older entries here describe
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-08-29
+
+### Added
+- Raspberry Pi Pico 2 W (RP2350) support alongside the Pico W, including the higher overclock and PIO timing it needs. Both boards use the same firmware source; `build.sh` picks the right one.
+- FLOPPY.PRG: a companion Atari-side tool for browsing real TNFS/SD directories by their actual long filenames (no more 8.3 conversion) and managing a small set of saved server profiles, so switching between floppy-image collections doesn't require reconfiguring SideTNFS itself.
+
+### Fixed
+- TNFS file and directory operations (opening, reading, writing, closing, seeking, renaming, deleting, listing) could fail outright on a single dropped or delayed network packet, with no retry -- on a large file this meant one bad moment anywhere across hundreds of read round trips could abort the whole load ("An error occurred while reading from the source file"), even though the file itself was never corrupted. Every TNFS operation now retries a few times before giving up.
+
 ## [1.0.4] - 2026-08-24
 
 ### Added
