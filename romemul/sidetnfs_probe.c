@@ -872,9 +872,30 @@ typedef struct
     // `SidetnfsTnfsDtaSearch *slot` local-variable convention used
     // throughout this file.
     int runtime_slot;
+    // Monotonic tick (see s_tnfs_dta_touch_counter below), bumped every
+    // time this search is actively used -- allocated/reused
+    // (insertTnfsDTA()) or advanced (tnfs_dta_find_next_match(), i.e. a
+    // real Fsnext continuation). Lets alloc_tnfs_dta_slot() evict the
+    // genuinely LEAST recently touched slot when all SIDETNFS_TNFS_DTA_SLOTS
+    // are full, instead of always slot[0] -- a real capture showed that
+    // fixed-index eviction can repeatedly sacrifice an actively-in-use
+    // search (e.g. the Desktop's own ongoing root-directory Fsnext walk,
+    // which tends to land in slot[0]) to make room for a completely
+    // different, abandoned search (a one-shot exact-filename Fsfirst that
+    // never calls Fsnext and is never released -- a normal, legitimate
+    // GEMDOS "does this file exist" idiom that this registry has no other
+    // way to reclaim). LRU eviction naturally prefers the abandoned,
+    // long-untouched entry over one still being walked.
+    uint32_t last_touched;
 } SidetnfsTnfsDtaSearch;
 
 static SidetnfsTnfsDtaSearch s_tnfs_dta_searches[SIDETNFS_TNFS_DTA_SLOTS] = {0};
+// 0 is a valid tick (first-ever touch could legitimately be 0), but every
+// slot starts at last_touched==0 too (static zero-init) -- harmless: on
+// the very first eviction (all 8 slots genuinely active), ties just break
+// toward the lowest index, same as the old fixed-slot-0 behavior used to
+// do unconditionally.
+static uint32_t s_tnfs_dta_touch_counter = 0;
 
 // TNFS reliability diagnostics: cheap, always-on
 // bookkeeping for fs-listing envelope rejections (see
@@ -4743,10 +4764,24 @@ static SidetnfsTnfsDtaSearch *alloc_tnfs_dta_slot(void)
             return &s_tnfs_dta_searches[i];
         }
     }
-    // Extremely unlikely: all slots active -- evict the first slot. Close
-    // its handle first (A) so an evicted-but-still-open search
+    // All slots active -- evict the LEAST RECENTLY TOUCHED one (see
+    // last_touched's own comment: a real capture showed always evicting a
+    // fixed slot[0] can repeatedly sacrifice an actively-in-use search --
+    // e.g. the Desktop's own ongoing directory walk, which tends to land
+    // in slot[0] as the very first search ever registered -- to make room
+    // for abandoned, never-Fsnext'd exact-filename existence checks,
+    // eventually leaving the Desktop's own listing permanently broken).
+    // Close the victim's handle first so an evicted-but-still-open search
     // doesn't leak its TNFS directory handle on the server.
-    SidetnfsTnfsDtaSearch *victim = &s_tnfs_dta_searches[0];
+    int victim_index = 0;
+    for (int i = 1; i < (int)SIDETNFS_TNFS_DTA_SLOTS; i++)
+    {
+        if (s_tnfs_dta_searches[i].last_touched < s_tnfs_dta_searches[victim_index].last_touched)
+        {
+            victim_index = i;
+        }
+    }
+    SidetnfsTnfsDtaSearch *victim = &s_tnfs_dta_searches[victim_index];
     if (victim->handle_valid)
     {
         tnfs_dta_closedir(victim->ndta, victim->dir_handle, victim->runtime_slot);
@@ -4801,6 +4836,7 @@ static SidetnfsTnfsDtaSearch *insertTnfsDTA(uint32_t ndta, const char *path, con
     // tnfs_dta_find_next_match()/releaseTnfsDTA()/tnfs_dta_closedir() for
     // every subsequent READDIRX/CLOSEDIR this search issues.
     slot->runtime_slot = runtime_slot;
+    slot->last_touched = ++s_tnfs_dta_touch_counter;
     // -diag: fires on every ordinary Fsfirst, not just a
     // Ddelete's own directory -- gated the same way as the READDIRX detail
     // events (see SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL) so routine Desktop
@@ -5016,6 +5052,11 @@ static void tnfs_dta_closedir(uint32_t ndta, uint8_t dir_handle, int runtime_slo
 // non-FOUND result), only search->eof is DTA-search state this helper owns.
 static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *search, SidetnfsAtariDirEntry *out_entry)
 {
+    // A real Fsnext continuation -- see last_touched's own comment on why
+    // this matters for LRU eviction (keeps an actively-walked search like
+    // the Desktop's own listing safe from being evicted in favor of a
+    // long-abandoned one-shot existence check).
+    search->last_touched = ++s_tnfs_dta_touch_counter;
     // This search's own slot's
     // host/port/session id -- read once per call (Fsnext calls this
     // again for every entry), never re-resolved mid-round. A slot that's
@@ -5193,6 +5234,28 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const c
         // NOT_FOUND (empty/exhausted listing) or ERROR -- release the
         // registry entry now, same as SD releasing its DTANode on a
         // failed Fsfirst (see gemdrvemul.c).
+        releaseTnfsDTA(ndta);
+    }
+    else if (strchr(pattern, '*') == NULL && strchr(pattern, '?') == NULL)
+    {
+        // Exact-filename (no-wildcard) pattern: GEMDOS semantics
+        // guarantee at most one match, so any follow-up Fsnext the caller
+        // might still make (many legitimately never do -- a one-shot
+        // "does this file exist" check via Fsfirst is a completely
+        // standard GEMDOS idiom, see SidetnfsTnfsDtaSearch's own
+        // last_touched comment) can only ever legitimately answer "no
+        // more files". Releasing the slot/handle right away, same as the
+        // NOT_FOUND/ERROR branch above, means this idiom no longer
+        // permanently consumes one of the SIDETNFS_TNFS_DTA_SLOTS scarce
+        // registry entries -- this was the actual root cause of the
+        // M:-drive-emptying bug (repeated one-shot MOUNT2.CFG/ACTIVE.CFG
+        // existence checks during FLOPPY.PRG's favorite-save flow
+        // exhausting the registry, then evicting/replacing an unrelated,
+        // still-in-use search). A follow-up Fsnext against an
+        // already-released exact-match search still gets the
+        // semantically correct GEMDOS_ENMFIL, via
+        // sidetnfs_tnfs_dta_next()'s own lookup-miss path
+        // (GEMDRVEMUL_FSNEXT_CALL in gemdrvemul.c).
         releaseTnfsDTA(ndta);
     }
     return result;
