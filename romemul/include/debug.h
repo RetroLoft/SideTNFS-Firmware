@@ -55,7 +55,7 @@
 // buffer -- so raising this is the only way to still see a bug that only
 // shows up after a long session.
 #ifndef SIDETNFS_DIAG_MAX_EVENTS
-#define SIDETNFS_DIAG_MAX_EVENTS 256
+#define SIDETNFS_DIAG_MAX_EVENTS 100
 #endif
 
 // File-I/O focus: full per-round TNFS READ detail
