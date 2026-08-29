@@ -4532,10 +4532,21 @@ int sidetnfs_tnfs_raw_readdir(int slot, uint8_t dir_handle, SidetnfsTnfsRawEntry
     // keep servicing the time-critical Atari bus -- see the v1.0.4
     // TNFS-reliability-fix regression this project already shipped once
     // (git history) for exactly how expensive an unbounded retry-on-
-    // timeout habit can get. 2 retries (3 attempts, worst case ~600ms) is
-    // enough to ride out an occasional slow tick without risking anywhere
-    // near that regression's territory.
-#define SIDETNFS_FLOPPY_BROWSE_READDIRX_NETWORK_RETRIES 2
+    // timeout habit can get.
+    //
+    // Raised from 2 to 3 (3->4 attempts, worst case ~600ms->~800ms) after
+    // real-hardware use showed an occasional FLOPPY_BROWSE_ERR_BACKEND_ERROR
+    // ("Could not list directory (error 13)", roughly 1 in 10 page
+    // fetches): not a new bug -- a full directory walk needs 10s of real
+    // network rounds (even with the 15-entry batch cache), so the
+    // cumulative chance of hitting 3-in-a-row loss SOMEWHERE in that
+    // sequence is the expected residual tail of any bounded retry, just
+    // more visible here than on a single-shot file operation. Still
+    // comfortably inside FLOPPY.PRG's own per-round-trip poll timeout
+    // (2s, see floppy_probe.c's browse_get_page_poll()), and the
+    // Atari-side client also retries a terminal BACKEND_ERROR itself now,
+    // so this only needs to reduce the residual rate, not eliminate it.
+#define SIDETNFS_FLOPPY_BROWSE_READDIRX_NETWORK_RETRIES 3
     int network_retries_left = SIDETNFS_FLOPPY_BROWSE_READDIRX_NETWORK_RETRIES;
 
     for (int round = 0; round < SIDETNFS_TNFS_RAW_READDIR_SKIP_ROUNDS; round++)
