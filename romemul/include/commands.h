@@ -241,6 +241,145 @@
 // unchanged (generation(4) + page_index(4)) -- no want_dirs parameter.
 #define GEMDRVEMUL_FLOPPY_BROWSE_GET_PAGE (APP_GEMDRVEMUL << 8 | 0x25)   // Fetch one combined page (dirs then files) of the active CWD
 
+// SideTNFS floppy emulator (Phase 2). Subcommands 0x26-0x2B, re-verified
+// free (highest used low code before this addition was 0x25/
+// GEMDRVEMUL_FLOPPY_BROWSE_GET_PAGE, next used is 0x36/GEMDRVEMUL_DFREE_CALL
+// -- 0x26-0x35 free). Entirely independent from the browser commands
+// above (0x1D-0x25): those describe browsing a source directory, these
+// describe an active floppy-emulation SESSION (one mounted .ST image on
+// virtual drive A:, one packed Favorites table). See
+// romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_FAVORITES/_SESSION) for
+// the wire layout and docs/sidetnfs-floppy-protocol.md for the full
+// protocol writeup, including the long-SELECT exit handshake and why
+// GEMDRVEMUL_FLOPPY_EXIT_ACK is deliberately a zero-payload, no-wait
+// command (it is sent from the Atari-side VBL handler, which must never
+// block on a Sidecart round-trip).
+//
+// FAVORITES_WRITE_CHUNK/_WRITE_CHECK mirror the existing
+// GEMDRVEMUL_WRITE_BUFF_CALL/_WRITE_BUFF_CHECK pattern exactly (chunk +
+// Pico-computed checksum, verify, then commit) -- see
+// SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX (gemdrvemul.h) for the per-round
+// size (2048 bytes, matching the Atari driver's own BUFFER_WRITE_SIZE).
+// This reuses the proven bulk-transfer transport instead of assuming
+// ROM3 is directly writable by the Atari -- it is not, on real hardware
+// (the cartridge ROM-select lines are read-only; every Atari->Pico byte,
+// bulk or scalar, is sent as an address-encoded read, never a plain
+// store).
+#define GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHUNK (APP_GEMDRVEMUL << 8 | 0x26) // Send one <=2048-byte chunk of the packed Favorites blob (offset+length+data)
+#define GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHECK (APP_GEMDRVEMUL << 8 | 0x27) // Verify the last chunk's checksum and commit it into the FAVORITES block
+#define GEMDRVEMUL_FLOPPY_FAVORITES_COMMIT (APP_GEMDRVEMUL << 8 | 0x28)      // All chunks sent -- validate table/strings, publish COUNT/ACTIVE_INDEX
+
+// Prepares a floppy session: validates the chosen image's
+// BPB/file-size/geometry (req #2) against the already-uploaded Favorites
+// (or a directly-supplied path) and, on success, publishes the
+// REQUESTED Atari boot configuration (GEMDRVEMUL_FLOPPY_SESSION_
+// INSTALL_GEMDRIVE/_INSTALL_FLOPPY). This does NOT switch any Pico-side
+// mode -- the firmware always runs the same single image, answering both
+// the GEMDOS-relay and floppy-session command sets regardless of these
+// flags. INSTALL_GEMDRIVE/_INSTALL_FLOPPY only take effect on the
+// ATARI's next boot, read by the Atari's own cartridge-init to decide
+// what to install (see GEMDRVEMUL_FLOPPY_SESSION's own comment in
+// gemdrvemul.h for the four valid combinations). FLOPPY.PRG sets these
+// two flags however it needs (e.g. NO/YES for a clean floppy-only boot,
+// YES/YES to keep GEMDOS drives too) before triggering its own reset;
+// this command does not reset the Atari itself. Request: active_slot(4)
+// + image path (string field). Response: status + geometry echo (see
+// GEMDRVEMUL_FLOPPY_SESSION_SIDES/_SECTORS_PER_TRACK/_TRACKS/_BYTES_PER_SECTOR).
+#define GEMDRVEMUL_FLOPPY_SESSION_START (APP_GEMDRVEMUL << 8 | 0x29) // Validate the image, prepare the floppy session, publish the requested Atari boot configuration
+
+// One logical sector, one round trip -- request carries ONLY the 0-based
+// logical sector index, sent as the command's own small payload
+// (uint32_t, 4 bytes -- read via GET_PAYLOAD_PARAM32(payloadPtr) in the
+// dispatch handler, exactly like every other GEMDRVEMUL_* request).
+// Phase 4 correction: this is NOT a pre-written ROM3 field -- ROM3 is not
+// Atari-writable on real hardware (see GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA's
+// own comment in gemdrvemul.h), so the LBA has to travel as an ordinary
+// command payload like anything else the Atari sends. No drive/track/
+// side/count fields: drive A: is implicit (the only drive this MVP
+// emulates), and the Atari-side hdv_rw hook is responsible for converting
+// TOS's own track/side/sector BIOS parameters into this one LBA value
+// before sending the request -- exactly the same layering the existing
+// GEMDOS relay already uses (GEMDOS-level concepts never leak into the
+// wire protocol as separate fields when a single derived value says the
+// same thing). Response: status + the LBA served (echoed back into
+// GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA, for the Atari's own desync
+// sanity-check only) + 512 bytes written directly into
+// GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA (same "response data placed
+// directly in the shared window" asymmetry GEMDRVEMUL_READ_BUFF already
+// relies on). Read-only MVP: there is no WRITE_SECTOR command -- Atari
+// writes are rejected by the driver itself, before ever reaching the
+// wire (req #6).
+#define GEMDRVEMUL_FLOPPY_READ_SECTOR (APP_GEMDRVEMUL << 8 | 0x2A) // Read one 512-byte logical sector from the mounted image (request: LBA(4) + caller_pc(4) + rwabs_count(4) payload -- caller_pc/rwabs_count are hardware bring-up diagnostics only; caller_pc is 0 from the not-yet-instrumented XBIOS Floprd path)
+
+// Fire-and-forget, zero-payload ACK sent by the Atari-side VBL handler in
+// response to GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (long-SELECT
+// exit). Deliberately payload_size=0 -- process_command() fires after
+// just 3 trigger reads (header/command/size), and the sender never waits
+// for write_random_token() the way every other command's caller does.
+// The Pico's handler still writes the token and resets active_command_id
+// like any other command (keeps the shared parser state clean for the
+// next real command) -- the Atari side just never looks for it. Full
+// exit sequence: Pico cleans up the floppy session -> publishes
+// RESET_REQUESTED -> Atari's VBL handler sees it -> sends this ACK ->
+// short safety interval / Atari begins its own reset -> Pico restores
+// the fail-safe default (INSTALL_GEMDRIVE=YES, INSTALL_FLOPPY=NO,
+// gemdrvemul.h) before/while that reset completes, so the Atari finds
+// plain SideTNFS GEMDOS drives on the other side, matching the same
+// state as a fresh Pico power-cycle.
+#define GEMDRVEMUL_FLOPPY_EXIT_ACK (APP_GEMDRVEMUL << 8 | 0x2B) // Atari VBL handler's non-blocking ack of a pending reset request
+
+// Sent once by the Atari's floppy-hook installer, right after it reads
+// (and before it overwrites) the current getbpb/rwabs/mediach vectors --
+// request: the three original vector values (12-byte payload, d3/d4/d5,
+// the maximum a plain send_sync call carries -- matches
+// GEMDRVEMUL_SAVE_VECTORS' own shape for the GEMDOS trap). The Pico just
+// stores them in GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_* (gemdrvemul.h) -- no
+// backend involvement. This exists because ROM4 (where the driver's own
+// code/data lives) is not Atari-writable either (same constraint
+// GEMDRVEMUL_SAVE_VECTORS already works around for the GEMDOS trap, see
+// gemdrive.s's old_handler comment), so none of these three old vectors
+// can be cached locally for the hooks' own "not our drive, fall through"
+// path -- they're stored here instead and read back with a fast,
+// ordinary local ROM3 load on every such fall-through (no command
+// round-trip per disk access). Response: status only.
+#define GEMDRVEMUL_FLOPPY_SAVE_VECTORS (APP_GEMDRVEMUL << 8 | 0x2C) // Save the original getbpb/rwabs/mediach vectors before the floppy hooks overwrite them
+
+// Same rationale as GEMDRVEMUL_FLOPPY_SAVE_VECTORS above, for the fourth
+// vector (the XBIOS trap) separately -- a plain send_sync payload is
+// capped at 12 bytes (d3/d4/d5), so the fourth longword needs its own
+// call. Request: the original XBIOS trap vector (4-byte payload, d3).
+// Stored in GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR -- entirely
+// separate from GEMDRIVE's own GEMDRVEMUL_OLD_XBIOS-style storage for its
+// RTC Y2K-patch trap (GEMDRVEMUL_SAVE_XBIOS_VECTOR, subcommand 0xA): each
+// installer only ever touches its own field, so both can coexist
+// (YES/YES) without collision regardless of install order. Response:
+// status only.
+#define GEMDRVEMUL_FLOPPY_SAVE_XBIOS_VECTOR (APP_GEMDRVEMUL << 8 | 0x2D) // Save the original XBIOS trap vector before the floppy Floprd/Flopwr/Flopfmt/Flopver handling chains in front of it
+
+// Phase 4A: sent by the Atari's mediach hook exactly once, the first time
+// it sees GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED nonzero -- clears that
+// field back to 0 so the NEXT mediach call reports "unchanged" without
+// needing a round trip at all (the common case). Zero-payload,
+// fire-and-forget in spirit (the Atari doesn't need to wait for anything
+// beyond the usual completion token) -- if it's ever lost to a network
+// glitch, the only consequence is mediach reporting "changed" one extra
+// time, which is harmless (TOS just re-fetches the BPB again). Designed
+// for the future short-SELECT favorite-switching flow (Phase 6) as much
+// as for the initial SESSION_START mount -- both are "a new image just
+// became active" events using the same one field.
+#define GEMDRVEMUL_FLOPPY_MEDIA_CHANGE_ACK (APP_GEMDRVEMUL << 8 | 0x2E) // Acknowledge a reported media change, clearing it back to unchanged
+// Hardware bring-up investigation: Getbpb/Mediach are pure local ROM3
+// reads on the Atari side (no wire round-trip needed for their actual
+// function), which made them a total blind spot in every trace so far --
+// these two zero-payload pings exist purely to make them visible.
+// GETBPB_PING fires on new_getbpb_routine's disk_number=0/floppy-active/
+// image-ready success path, right before it returns the BPB pointer.
+// MEDIACH_PING fires only on new_mediach_routine's steady-state
+// "unchanged" path -- the "changed" branch already has wire visibility
+// via GEMDRVEMUL_FLOPPY_MEDIA_CHANGE_ACK above, not duplicated here.
+#define GEMDRVEMUL_FLOPPY_GETBPB_PING (APP_GEMDRVEMUL << 8 | 0x2F) // Zero payload -- diagnostic only, see comment above
+#define GEMDRVEMUL_FLOPPY_MEDIACH_PING (APP_GEMDRVEMUL << 8 | 0x30) // Zero payload -- diagnostic only, see comment above
+
 typedef struct
 {
     unsigned int value;

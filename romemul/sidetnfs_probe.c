@@ -23,6 +23,7 @@
 #include "include/commands.h" // GEMDRVEMUL_*_CALL ids -- for COMMAND_ENTER name decode only
 #include "include/rtcemul.h"  // get_utc_offset_seconds() -- same local-time policy as NTP->RTC
 #include "include/sidetnfs_config.h" // sidetnfs_config_get_drive() -- source of the active server
+#include "include/sidetnfs_floppy_emul.h" // sidetnfs_floppy_emul_install_floppy() -- diag-log gate below
 
 // These used to be hardcoded compile-time constants. They are now
 // runtime state, loaded once at boot from the first usable (used, TNFS,
@@ -965,9 +966,26 @@ static uint8_t s_fslisting_envelope_reject_reason = 0;
 // below -- which reads s_diag_events -- is itself gated on
 // SIDETNFS_ENABLE_DEBUG (SIDETNFS_DEBUG_DUMP_ON_SELECT), independently of
 // SIDETNFS_ENABLE_DIAG.
+//
+// s_diag_events is a POINTER, not the ~6.8KB array itself -- the array
+// lives on init_gemdrvemul()'s own stack frame (gemdrvemul.c), handed in
+// once via sidetnfs_diag_set_event_buffer() before the main dispatch loop
+// starts. That function never returns, so the array's storage is valid
+// for the rest of the program's life, same as a static would be -- but it
+// comes out of the huge, mostly-idle stack region instead of permanently
+// growing .bss, which is the whole point: this buffer only exists at all
+// in a debug/diag build, and even there it shouldn't cost a dedicated
+// static reservation. A NULL pointer (buffer not set yet) is treated as
+// "diag not ready", same as if diag were compiled out -- silently drops
+// the event rather than crashing.
 #if SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
-static SidetnfsDiagEvent s_diag_events[SIDETNFS_DIAG_MAX_EVENTS];
+static SidetnfsDiagEvent *s_diag_events = NULL;
 static uint16_t s_diag_event_count = 0;
+
+void sidetnfs_diag_set_event_buffer(SidetnfsDiagEvent *buffer)
+{
+    s_diag_events = buffer;
+}
 
 // TNFS reliability diagnostics: directory browsing
 // itself (Fsfirst/Fsnext for desktop icon refresh) is already confirmed
@@ -1004,6 +1022,23 @@ void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *p
                         const char *pattern, const char *name, uint16_t index,
                         uint16_t count, uint8_t result, uint8_t attr)
 {
+    if (s_diag_events == NULL)
+    {
+        return; // sidetnfs_diag_set_event_buffer() hasn't run yet
+    }
+    // Only debug the floppy-emu investigation: record nothing at all
+    // until floppy-emu mode is actually active. A single cheap bool
+    // read, checked before anything else, so ordinary GEMDOS-relay
+    // traffic (FOPEN/FREAD/FSEEK/DSETPATH/... -- FLOPPY.PRG loading
+    // itself, reading its own config) never pays for this at all, and
+    // never fills the fixed-size budget before Start is even clicked.
+    // SIDETNFS_DIAG_BOOT_MARKER is the one deliberate exception -- see
+    // its own comment -- so the ring buffer / SD write path can be
+    // sanity-checked before floppy-emu ever activates.
+    if (event != SIDETNFS_DIAG_BOOT_MARKER && !sidetnfs_floppy_emul_install_floppy())
+    {
+        return;
+    }
     if (sidetnfs_diag_is_browse_noise(event))
     {
         return;
@@ -1414,6 +1449,26 @@ static const char *diag_event_name(SidetnfsDiagEventType event)
         return "FLOPPY_RAW_READDIR_FAIL";
     case SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR:
         return "FLOPPY_GET_PAGE_BACKEND_ERROR";
+    case SIDETNFS_DIAG_FLOPPY_SAVE_VECTORS:
+        return "FLOPPY_SAVE_VECTORS";
+    case SIDETNFS_DIAG_FLOPPY_SAVE_XBIOS_VECTOR:
+        return "FLOPPY_SAVE_XBIOS_VECTOR";
+    case SIDETNFS_DIAG_FLOPPY_BPB_RAW:
+        return "FLOPPY_BPB_RAW";
+    case SIDETNFS_DIAG_FLOPPY_BPB_COMPUTED:
+        return "FLOPPY_BPB_COMPUTED";
+    case SIDETNFS_DIAG_FLOPPY_READ_SECTOR:
+        return "FLOPPY_READ_SECTOR";
+    case SIDETNFS_DIAG_FLOPPY_MEDIA_CHANGE_ACK:
+        return "FLOPPY_MEDIA_CHANGE_ACK";
+    case SIDETNFS_DIAG_FLOPPY_GETBPB_PING:
+        return "FLOPPY_GETBPB_PING";
+    case SIDETNFS_DIAG_FLOPPY_MEDIACH_PING:
+        return "FLOPPY_MEDIACH_PING";
+    case SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED:
+        return "FLOPPY_CRASH_SUSPECTED";
+    case SIDETNFS_DIAG_BOOT_MARKER:
+        return "BOOT_MARKER";
     default:
         return "UNKNOWN";
     }
@@ -1476,7 +1531,7 @@ static const char *command_id_name(uint32_t id)
 }
 #endif // SIDETNFS_DEBUG_DUMP_ON_SELECT
 
-void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
+bool sidetnfs_eventlog_dump_to_file(const char *hd_folder)
 {
 #if SIDETNFS_DEBUG_DUMP_ON_SELECT
     char path[160];
@@ -1485,7 +1540,7 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
         int n = snprintf(path, sizeof(path), "%s/EVENTLOG.TXT", hd_folder);
         if (n <= 0 || (size_t)n >= sizeof(path))
         {
-            return;
+            return false;
         }
     }
     else
@@ -1503,16 +1558,16 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
         // FatFS object another in-flight SD file operation still holds).
         if (sidetnfs_sd_service_has_run() && sidetnfs_sd_global_status() == SIDETNFS_SD_STATUS_READY)
         {
-            return; // card is mounted by someone else; not our place to guess a folder
+            return false; // card is mounted by someone else; not our place to guess a folder
         }
         static FATFS s_diag_fallback_fs;
         if (!sd_init_driver())
         {
-            return;
+            return false;
         }
         if (f_mount(&s_diag_fallback_fs, "0:", 1) != FR_OK)
         {
-            return;
+            return false;
         }
         // Same "/hd" folder PARAM_GEMDRIVE_FOLDERS defaults to (config.c)
         // and the hd_folder-populated branch above already writes into --
@@ -1527,7 +1582,7 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
         int n = snprintf(path, sizeof(path), "/hd/EVENTLOG.TXT");
         if (n <= 0 || (size_t)n >= sizeof(path))
         {
-            return;
+            return false;
         }
     }
 
@@ -1535,7 +1590,7 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
     FRESULT fr = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
     if (fr != FR_OK)
     {
-        return; // stay silent, no crash
+        return false; // stay silent, no crash
     }
 
     // 5AA: 256, not 128 -- the per-event line format below can
@@ -1910,9 +1965,10 @@ void sidetnfs_eventlog_dump_to_file(const char *hd_folder)
         }
     }
 
-    f_close(&file);
+    return f_close(&file) == FR_OK;
 #else
     (void)hd_folder;
+    return true; // nothing to fail -- the dump doesn't exist in this build variant
 #endif
 }
 
@@ -7307,24 +7363,24 @@ int sidetnfs_diag_snapshot_find_dta_slot(uint32_t ndta)
 // Writes the compact runtime-state snapshot (SidetnfsDiagSnapshot) to
 // <hd_folder>/SNAPSHOT.TXT. Same f_open/f_write/f_close shape as
 // sidetnfs_eventlog_dump_to_file() elsewhere in this file.
-void sidetnfs_snapshot_dump_to_file(const char *hd_folder)
+bool sidetnfs_snapshot_dump_to_file(const char *hd_folder)
 {
     if (hd_folder == NULL)
     {
-        return;
+        return false;
     }
     char path[160];
     int n = snprintf(path, sizeof(path), "%s/SNAPSHOT.TXT", hd_folder);
     if (n <= 0 || (size_t)n >= sizeof(path))
     {
-        return;
+        return false;
     }
 
     FIL file;
     FRESULT fr = f_open(&file, path, FA_WRITE | FA_CREATE_ALWAYS);
     if (fr != FR_OK)
     {
-        return; // stay silent, no crash
+        return false; // stay silent, no crash
     }
 
     const SidetnfsDiagSnapshot *d = &s_diag_snapshot;
@@ -7682,7 +7738,7 @@ void sidetnfs_snapshot_dump_to_file(const char *hd_folder)
         f_write(&file, line, (UINT)len, &written);
     }
 
-    f_close(&file);
+    return f_close(&file) == FR_OK;
 }
 #endif // SIDETNFS_DIAG_DUMP_ON_SELECT
 
@@ -7692,9 +7748,35 @@ void sidetnfs_snapshot_dump_to_file(const char *hd_folder)
 // carries its own guard instead.
 void sidetnfs_diag_dump_on_select(const char *hd_folder)
 {
-    sidetnfs_eventlog_dump_to_file(hd_folder);
+    bool eventlog_ok = sidetnfs_eventlog_dump_to_file(hd_folder);
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
-    sidetnfs_snapshot_dump_to_file(hd_folder);
+    // Deliberately ignoring sidetnfs_snapshot_dump_to_file()'s own result
+    // for the fail signal below -- unlike sidetnfs_eventlog_dump_to_file(),
+    // it has no hd_folder==NULL fallback (a pre-existing gap, not
+    // something introduced here) and simply never succeeds on a
+    // TNFS-backend GEMDRIVE session where hd_folder is never populated.
+    // That's a separate, known limitation of SNAPSHOT.TXT, not evidence
+    // of the write failure this signal exists to catch -- EVENTLOG.TXT is
+    // the file this investigation actually needs.
+    (void)sidetnfs_snapshot_dump_to_file(hd_folder);
+    // Hardware bring-up investigation: a blink-regardless-of-outcome
+    // signal was indistinguishable from a genuine write failure (the SD
+    // card not being READY at this exact moment vs. the dump actually
+    // landing on disk) -- there were real cases of the LED blinking
+    // twice while EVENTLOG.TXT was never touched. On a write failure,
+    // light the LED solid and hang here for good instead of blinking --
+    // unambiguous, impossible to miss, deliberately never returns (this
+    // is a debug/diag-build-only diagnostic; Production never reaches
+    // this function at all since SELECT-press dumping is itself gated on
+    // SIDETNFS_ENABLE_DIAG/_DEBUG).
+    if (!eventlog_ok)
+    {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        for (;;)
+        {
+            tight_loop_contents();
+        }
+    }
     // Visual confirmation the dump was written -- there is no serial
     // feedback on this hardware, so blink the Pico W's onboard LED twice
     // (0.5s on / 0.5s off each). Blocking sleep_ms() here is the same
@@ -7707,5 +7789,7 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
         sleep_ms(500);
     }
+#else
+    (void)eventlog_ok;
 #endif
 }

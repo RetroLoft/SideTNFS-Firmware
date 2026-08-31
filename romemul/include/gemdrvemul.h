@@ -18,6 +18,7 @@
 #include "sidetnfs_update_check.h" // SIDETNFS_UPDATE_VERSION_LEN -- see GEMDRVEMUL_SIDETNFS_UPDATE below
 #include "sidetnfs_floppy_config.h" // SIDETNFS_FLOPPY_* lengths -- see GEMDRVEMUL_FLOPPY_PROFILE below
 #include "sidetnfs_floppy_browse.h" // FLOPPY_BROWSE_CWD_LEN/_PAGE_ENTRIES -- see GEMDRVEMUL_FLOPPY_BROWSE/_PAGE below
+#include "sidetnfs_floppy_emul.h" // sidetnfs_floppy_emul_open/close/read_sector, boot-policy flags -- see GEMDRVEMUL_FLOPPY_SESSION_START/_READ_SECTOR handlers in gemdrvemul.c
 #include "tprotocol.h" // MAX_PROTOCOL_PAYLOAD_SIZE -- see SET_FLOPPY_PROFILE_PAYLOAD_BYTES below
 #include "sidetnfs_probe.h" // SIDETNFS_NET_ERR_TEXT_MAX -- see FileDescriptors.net_err_text below
 #include "sidetnfs_sd_service.h" // SIDETNFS_SD_ERROR_TEXT_MAX -- see FileDescriptors.sd_error_text below
@@ -464,6 +465,199 @@ _Static_assert((GEMDRVEMUL_FLOPPY_PAGE_IS_DIR + (unsigned long)FLOPPY_BROWSE_PAG
 #define FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES (4UL + 2UL + (unsigned long)FLOPPY_BROWSE_NAME_LEN)
 _Static_assert(FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES == 262UL, "FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES drifted from the documented request payload size");
 _Static_assert(FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_SIZE - 64UL), "BROWSE_CHANGE_DIR request payload must fit within the protocol's payload channel");
+
+// ---------------------------------------------------------------------
+// SideTNFS floppy emulator (Phase 2): packed Favorites session +
+// floppy-emulation runtime state. Two separate blocks, one concern each
+// (same convention every GEMDRVEMUL_SIDETNFS_*/FLOPPY_* block above
+// already follows) -- neither is ever persisted to flash; both are pure
+// ROM3 RAM, valid only for the duration of one floppy-emulation session.
+// See docs/sidetnfs-floppy-protocol.md for the full command/wire writeup.
+// ---------------------------------------------------------------------
+
+// GEMDRVEMUL_FLOPPY_FAVORITES: packed Favorites table FLOPPY.PRG uploads
+// via GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHUNK/_WRITE_CHECK/_COMMIT before
+// GEMDRVEMUL_FLOPPY_SESSION_START. Deliberately NOT
+// SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT fixed per-entry buffers (that would
+// be ~15KB for 256-byte entries, or 30KB for 512-byte ones) -- a compact
+// offset table into one shared packed-string area instead, per explicit
+// instruction. SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX (16 KiB) is a
+// deliberately generous, round budget -- NOT computed from
+// MAX_COUNT * any per-path maximum -- real TNFS paths captured elsewhere
+// in this project run ~40-90 bytes, so 16 KiB comfortably covers 60
+// favorites with room to spare, while still leaving most of the ROM3
+// free tail available for the session block above and future extensions
+// (drive B:, .MSA, ...).
+#define SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT 60u
+#define SIDETNFS_FLOPPY_FAVORITE_PATH_MAX 512u        // one full TNFS/SD path, NUL included -- matches FLOPPY.PRG's own 256(dir)+256(name) favorite fields joined
+#define SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX 16384u  // 16 KiB packed-string budget (fixed; see comment above)
+#define SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET 0xFFFFu // table sentinel: this slot has no favorite
+#define SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX 2048u     // matches the Atari driver's own BUFFER_WRITE_SIZE (gemdrive.s) -- reuses the proven WRITE_BUFF_CALL/CHECK chunk size, 8 rounds for a full 16 KiB blob
+
+#define GEMDRVEMUL_FLOPPY_FAVORITES SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_PAGE_IS_DIR + (unsigned long)FLOPPY_BROWSE_PAGE_ENTRIES * 2UL)
+#define GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC (GEMDRVEMUL_FLOPPY_FAVORITES + 0)                       // uint32_t, swapped long -- "FAVS"
+#define GEMDRVEMUL_FLOPPY_FAVORITES_VERSION (GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC + 4)               // uint32_t, swapped long (1)
+#define GEMDRVEMUL_FLOPPY_FAVORITES_COUNT (GEMDRVEMUL_FLOPPY_FAVORITES_VERSION + 4)               // uint16_t, plain word -- non-empty favorite count, valid only after COMMIT
+#define GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX (GEMDRVEMUL_FLOPPY_FAVORITES_COUNT + 2)          // uint16_t, plain word -- 0..59, meaningful only if COUNT > 0
+#define GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED (GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX + 2)   // uint32_t, swapped long -- bytes of the packed-string area actually populated, valid only after COMMIT
+#define GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET (GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED + 4)   // uint32_t, swapped long -- WRITE_CHUNK request: byte offset into the strings area this chunk lands at
+#define GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH (GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET + 4)   // uint16_t, plain word -- WRITE_CHUNK request: bytes in this chunk, <= SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX
+#define GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM (GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH + 2) // uint16_t, plain word -- WRITE_CHUNK response: Pico's own running-word checksum of the bytes it received, same algorithm/width as the existing GEMDRVEMUL_WRITE_CHK the Atari driver already computes locally and compares against, so WRITE_CHECK can reuse that exact compare-then-retry idiom
+// Phase 5: repurposed from an unused alignment placeholder into the
+// shared status field for WRITE_CHUNK/WRITE_CHECK/COMMIT (same
+// established convention this protocol already uses elsewhere -- e.g.
+// GET/SET/DELETE_PROFILE all share one PROFILE_STATUS field -- rather
+// than inventing a status field per command). Same ROM3 offset as
+// before, so no layout change; only the meaning was ever "reserved".
+#define GEMDRVEMUL_FLOPPY_FAVORITES_STATUS (GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM + 2)       // uint32_t, swapped long -- 0 = OK, nonzero = error (also keeps TABLE 4-byte aligned; header = 28 bytes)
+#define GEMDRVEMUL_FLOPPY_FAVORITES_TABLE (GEMDRVEMUL_FLOPPY_FAVORITES_STATUS + 4)                // uint16_t[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT] -- packed-string byte offset per slot, SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET = empty
+#define GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS (GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT * 2UL) // uint8_t[SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX] -- NUL-terminated full paths, packed consecutively
+// Block ends at GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX
+// (28 + 120 + 16384 = 16532 bytes total).
+
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_VERSION % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_VERSION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_COUNT % 2 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_COUNT must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX % 2 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH % 2 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM % 2 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_TABLE % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_TABLE must be 4-byte aligned (header above it is exactly 28 bytes)");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS must be 4-byte aligned (table above it is 120 bytes)");
+_Static_assert(SIDETNFS_FLOPPY_FAVORITE_PATH_MAX % 2 == 0, "SIDETNFS_FLOPPY_FAVORITE_PATH_MAX must be even for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX) <= 0x10000u, "GEMDRVEMUL_FLOPPY_FAVORITES block must fit within the 64KB ROM3 window");
+
+// GEMDRVEMUL_FLOPPY_SESSION: mounted image/geometry, current favorite,
+// sector I/O staging, the requested Atari BOOT configuration, and the
+// long-SELECT exit handshake. Never persisted; valid only while a floppy
+// session is prepared/active.
+//
+// IMPORTANT (Phase 2B correction): the Pico firmware itself never has a
+// GEMDRIVE-vs-FLOPPY "mode" -- it always runs the same single firmware
+// image, always ready to answer both the GEMDOS-relay command set and
+// this floppy-session command set. What varies is only which
+// FUNCTIONALITY THE ATARI'S OWN BOOT-TIME CODE INSTALLS after the next
+// reset, controlled by two independent flags the Atari's cartridge-init
+// reads at boot:
+//   INSTALL_GEMDRIVE -- install the GEMDOS-relay driver (TNFS/SD drives)
+//   INSTALL_FLOPPY    -- install the hdv_bpb/hdv_rw/hdv_mediach/XBIOS
+//                        floppy hooks for virtual drive A:
+// All four combinations are valid (YES/NO = normal SideTNFS, NO/YES =
+// clean floppy-only boot, NO/NO = neither installed, YES/YES = both).
+// YES/NO is the mandatory fail-safe default, set in RAM on every Pico
+// power-cycle (never read from or written to flash -- these are pure
+// session/launch state, owned by FLOPPY.PRG for the duration of one
+// requested session) and restored exactly on a long-SELECT exit, before/
+// while the Atari resets (see RESET_REQUESTED below).
+//
+// RESET_REQUESTED/EXIT_ACK_SEEN are deliberately plain fields, not
+// commands: the Atari-side VBL handler reads RESET_REQUESTED with an
+// ordinary passive load (no DMA-IRQ/lookup-table interaction at all --
+// that channel is scoped to a separate, narrow trigger sub-range, see
+// docs/sidetnfs-floppy-protocol.md), so this read is safe
+// unconditionally, even if a GEMDOS-relay command happens to be
+// mid-flight on the lookup channel at the same instant. Sending the ACK
+// back does need the lookup channel (the Atari has no direct-write path
+// to ROM3 on real hardware -- see GEMDRVEMUL_FLOPPY_EXIT_ACK's own
+// comment in commands.h), which is why that half of the handshake is a
+// real (if trivial, zero-payload, non-waiting) command instead of a
+// plain field.
+#define GEMDRVEMUL_FLOPPY_SESSION SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX)
+#define GEMDRVEMUL_FLOPPY_SESSION_STATUS (GEMDRVEMUL_FLOPPY_SESSION + 0)                          // uint32_t, swapped long -- status/error code, 0 = OK
+#define GEMDRVEMUL_FLOPPY_SESSION_GENERATION (GEMDRVEMUL_FLOPPY_SESSION_STATUS + 4)               // uint32_t, swapped long -- bumped by SESSION_START, lets a stale READ_SECTOR response be detected
+#define GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT (GEMDRVEMUL_FLOPPY_SESSION_GENERATION + 4)          // uint32_t, swapped long -- which of the 8 TNFS/SD source profiles
+#define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE (GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT + 4)    // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the GEMDOS-relay driver. Power-cycle default (and long-SELECT-exit restore value) is 1 (YES).
+#define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE + 2) // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the floppy hdv_*/XBIOS hooks. Power-cycle default (and long-SELECT-exit restore value) is 0 (NO).
+#define GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)  // uint16_t, plain word -- 0 = none, nonzero = Pico wants the Atari to reset (long-SELECT exit). Pico restores INSTALL_GEMDRIVE=YES/INSTALL_FLOPPY=NO before/while setting this.
+#define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED + 2)   // uint16_t, plain word -- Pico sets this once GEMDRVEMUL_FLOPPY_EXIT_ACK is received; diagnostic only, the Pico's own exit state machine is driven by the command arriving, not by polling this field
+#define GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH (GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN + 2)        // char[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX] -- full path of the mounted image
+// SIDES/SECTORS_PER_TRACK/TRACKS are uint16_t, not uint8_t (Phase 3
+// correction) -- this codebase's shared-memory write macros
+// (WRITE_WORD/WRITE_AND_SWAP_LONGWORD, memfunc.h) only ever operate on
+// 16- or 32-bit granularity; no single-byte ROM3 write primitive exists
+// anywhere in this protocol, and none of this block's values need more
+// than a byte of range, so matching the established word-only convention
+// costs 3 bytes and avoids inventing a new write helper nothing else
+// uses.
+#define GEMDRVEMUL_FLOPPY_SESSION_SIDES (GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH + (unsigned long)SIDETNFS_FLOPPY_FAVORITE_PATH_MAX) // uint16_t, plain word -- 1 or 2
+#define GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK (GEMDRVEMUL_FLOPPY_SESSION_SIDES + 2)          // uint16_t, plain word -- 9, 10 or 11
+#define GEMDRVEMUL_FLOPPY_SESSION_TRACKS (GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK + 2)         // uint16_t, plain word -- 80..85, derived from file size (req #2), not trusted from the BPB alone
+#define GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR (GEMDRVEMUL_FLOPPY_SESSION_TRACKS + 2)          // uint16_t, plain word -- always NUM_BYTES_PER_SECTOR (512), validated not assumed (req #2)
+#define GEMDRVEMUL_FLOPPY_SESSION_CURRENT_FAVORITE (GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR + 2) // uint16_t, plain word -- index into the FAVORITES table, drives short-SELECT switching
+#define GEMDRVEMUL_FLOPPY_SESSION_RESERVED2 (GEMDRVEMUL_FLOPPY_SESSION_CURRENT_FAVORITE + 2)       // uint16_t, unused -- keeps SECTOR_LBA 4-byte aligned
+// Phase 4 correction: SECTOR_LBA is RESPONSE-only (an echo of the LBA the
+// Pico actually served), not a request field -- ROM3 is not Atari-writable
+// on real hardware (confirmed Phase 3B/gemdrive-85: every Atari->Pico byte
+// is an address-encoded read, never a plain store), so the Atari cannot
+// pre-populate this field before sending GEMDRVEMUL_FLOPPY_READ_SECTOR.
+// The actual LBA travels as the command's own small payload (matching
+// every other GEMDRVEMUL_* request), read via GET_PAYLOAD_PARAM32() in
+// the dispatch handler -- see gemdrvemul.c's own case comment.
+#define GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA (GEMDRVEMUL_FLOPPY_SESSION_RESERVED2 + 2)             // uint32_t, swapped long -- READ_SECTOR response: echoes the LBA just served, for the Atari's own desync sanity-check only
+#define GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA (GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA + 4)           // uint8_t[NUM_BYTES_PER_SECTOR] -- READ_SECTOR response: the 512-byte sector payload
+// Phase 4: the Atari-side hdv_bpb/hdv_rw/hdv_mediach hooks must fall
+// through to whatever vector was installed before ours for any
+// disk_number != 0 (drive B:, hard disks, ...). Since ROM4 (where the
+// driver's own code/data lives) is likewise not Atari-writable (confirmed
+// by this project's own existing GEMDOS-trap install: see gemdrive.s's
+// old_handler comment, "we can't modify this address because it's in
+// ROM, but we can modify it in the RP2040 memory"), the three old vector
+// values are sent to the Pico ONCE at install time
+// (GEMDRVEMUL_FLOPPY_SAVE_VECTORS) and stored here -- every subsequent
+// fall-through is then a fast, ordinary LOCAL ROM3 read on the Atari
+// side, no command round-trip per disk access.
+#define GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB (GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA + (unsigned long)NUM_BYTES_PER_SECTOR)     // uint32_t, swapped long -- original hdv_bpb vector, saved at install
+#define GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW (GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB + 4)           // uint32_t, swapped long -- original hdv_rw vector, saved at install
+#define GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH (GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW + 4)       // uint32_t, swapped long -- original hdv_mediach vector, saved at install
+#define GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR (GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH + 4) // uint32_t, swapped long -- the floppy XBIOS trap's OWN chain-through value (separate from GEMDRIVE's own GEMDRVEMUL_OLD_XBIOS-style slot elsewhere -- each installer only ever touches its own field, no collision even when both install in the YES/YES case)
+// Phase 4: the in-memory GEMDOS BPB record hdv_bpb must return a pointer
+// to (9 words: recsize/clsiz/clsizb/rdlen/fsiz/fatrec/datrec/numcl/bflags
+// -- the standard Atari BPB shape, NOT the same layout as the on-disk
+// boot-sector BPB bytes 11-29 used for Phase 3's own geometry validation).
+// Built by SESSION_START from the validated image's own on-disk BPB
+// fields (re-read via the existing, unmodified
+// sidetnfs_floppy_emul_read_sector() public API -- no backend change),
+// published here so the Atari's hdv_bpb can just return a pointer
+// straight into this ROM3 field -- it never needs to construct or store
+// the struct itself, sidestepping the same ROM4-not-writable constraint.
+#define GEMDRVEMUL_FLOPPY_SESSION_BPB (GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR + 4)             // uint16_t[9], plain words -- recsize,clsiz,clsizb,rdlen,fsiz,fatrec,datrec,numcl,bflags
+#define GEMDRVEMUL_FLOPPY_SESSION_BPB_WORDS 9u
+// Phase 4A: proper media-change state, replacing the earlier "always
+// report 2" placeholder. 0 = unchanged, nonzero = a new image was just
+// mounted (SESSION_START) or (future Phase 6) a short-SELECT favorite
+// switch happened -- the Atari's mediach hook reports 2 exactly once
+// then sends GEMDRVEMUL_FLOPPY_MEDIA_CHANGE_ACK to clear it back to 0,
+// matching how a real floppy's disk-change line behaves (asserted once
+// per actual change, not held forever). Deliberately a plain ROM3 field,
+// not Atari-side RAM -- ROM4 is not Atari-writable, same constraint as
+// everywhere else in this protocol.
+#define GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED (GEMDRVEMUL_FLOPPY_SESSION_BPB + (unsigned long)GEMDRVEMUL_FLOPPY_SESSION_BPB_WORDS * 2UL) // uint16_t, plain word
+// Block ends at GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED + 2
+// (4+4+4 + 2+2+2+2 + 512 + 2+2+2+2+2+2 + 4 + 512 + 4+4+4+4 + 18 + 2 = 1102 bytes total).
+
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_GENERATION % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_GENERATION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_SIDES % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_SIDES must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_TRACKS % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_TRACKS must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_CURRENT_FAVORITE % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_CURRENT_FAVORITE must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_BPB % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_BPB must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED must be 2-byte aligned for WRITE_WORD");
+_Static_assert((GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED + 2UL) <= 0x10000u, "GEMDRVEMUL_FLOPPY_SESSION block must fit within the 64KB ROM3 window");
 
 // Atari ST FATTRIB flag
 #define FATTRIB_INQUIRE 0x00

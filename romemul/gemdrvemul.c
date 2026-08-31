@@ -10,6 +10,7 @@
 #include "include/sidetnfs_probe.h"
 #include "include/sidetnfs_config_drive_backend.h"
 #include "include/sidetnfs_sd_service.h"
+#include "pico/time.h" // absolute_time_t/get_absolute_time()/absolute_time_diff_us() -- SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED
 
 // Fixed, TOS-safe GEMDOS Dfree
 // geometry reported for TNFS-backed runtime drives only (see
@@ -3587,6 +3588,169 @@ static void sidetnfs_slot_diag_dump_to_file(const char *hd_folder)
 // handles that case as before.
 #define SIDETNFS_NTP_INITIAL_TIMEOUT_MS 15000
 
+#if SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
+// Hardware bring-up investigation: automatic, human-free crash detection.
+// See SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED's own comment in
+// sidetnfs_probe.h for the full rationale -- a fast SELECT press already
+// proved raw event counts were measuring human reaction time, not actual
+// iterations-before-crash. Starting threshold, not yet calibrated against
+// a real known-good inter-command gap distribution -- see this feature's
+// own report-back comment when real numbers come in.
+#define SIDETNFS_FLOPPY_CRASH_SILENCE_THRESHOLD_US 150000ULL
+
+static absolute_time_t s_floppy_last_command_time;
+static bool s_floppy_session_seen = false;
+static bool s_floppy_crash_suspected_logged = false;
+
+// Call from every floppy command handler that's evidence "the wire is
+// still alive" (SAVE_VECTORS/SAVE_XBIOS_VECTOR/GETBPB_PING/MEDIACH_PING/
+// MEDIA_CHANGE_ACK/READ_SECTOR) -- SAVE_VECTORS specifically is what
+// flips s_floppy_session_seen true, since that's the earliest point a
+// floppy session is genuinely in progress (hook install confirmed).
+//
+// The "already logged" latch is reset on EVERY command, not just
+// SAVE_VECTORS -- first hardware test found the opposite (reset only on
+// a fresh session) fires exactly once on the ordinary idle gap between
+// "hooks installed" and the user's first double-click, then stays latched
+// through the real crash later in the same session, so the one silence
+// measurement that actually matters never gets recorded. Resetting on
+// every command means a silence gap can trigger a log more than once per
+// session; the real crash is still unambiguous in EVENTLOG.TXT -- it is
+// the one CRASH_SUSPECTED entry with no floppy command logged after it.
+static void floppy_note_command_seen(bool is_save_vectors)
+{
+    s_floppy_last_command_time = get_absolute_time();
+    s_floppy_crash_suspected_logged = false;
+    if (is_save_vectors)
+    {
+        s_floppy_session_seen = true;
+    }
+}
+
+// Real (not threshold-clamped) elapsed microseconds since the previous
+// floppy command -- call BEFORE floppy_note_command_seen() resets the
+// timestamp. floppy_check_crash_suspected()'s own ndta only ever reads
+// close to SIDETNFS_FLOPPY_CRASH_SILENCE_THRESHOLD_US, since it latches
+// the instant that threshold is crossed -- it cannot tell "151ms gap"
+// from "800ms gap". This gives the actual number, logged by callers with
+// spare idle bandwidth (GETBPB_PING/MEDIACH_PING/MEDIA_CHANGE_ACK -- all
+// already zero-payload, diagnostic-only pings with unused idx/count
+// fields), packed the same hi16/lo16 way READ_SECTOR already packs
+// caller_pc.
+static uint32_t floppy_gap_since_last_command_us(void)
+{
+    if (!s_floppy_session_seen)
+    {
+        return 0;
+    }
+    int64_t elapsed_us = absolute_time_diff_us(s_floppy_last_command_time, get_absolute_time());
+    return (elapsed_us < 0) ? 0u : (uint32_t)elapsed_us;
+}
+
+// Call once per main-loop iteration (see the SELECT-check call site in
+// init_gemdrvemul()). Logs SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED once per
+// silence gap once the wire has been quiet for longer than the threshold
+// -- no button press, no human involved. Latched until the next floppy
+// command (see floppy_note_command_seen()) so an ordinary idle gap only
+// logs once instead of spamming every loop iteration; if the Atari never
+// talks again (real crash), this is the last event in the trace. ndta
+// carries the actual elapsed microseconds so the log itself shows real
+// timing, not just "silence happened."
+static void floppy_check_crash_suspected(void)
+{
+    if (!s_floppy_session_seen || s_floppy_crash_suspected_logged)
+    {
+        return;
+    }
+    int64_t elapsed_us = absolute_time_diff_us(s_floppy_last_command_time, get_absolute_time());
+    if (elapsed_us < 0 || (uint64_t)elapsed_us < SIDETNFS_FLOPPY_CRASH_SILENCE_THRESHOLD_US)
+    {
+        return;
+    }
+    s_floppy_crash_suspected_logged = true;
+    sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED, (uint32_t)elapsed_us, NULL, NULL, NULL, 0, 0, 0, 0);
+}
+#else
+static inline void floppy_note_command_seen(bool is_save_vectors) { (void)is_save_vectors; }
+static inline void floppy_check_crash_suspected(void) {}
+static inline uint32_t floppy_gap_since_last_command_us(void) { return 0; }
+#endif // SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
+
+// Builds the standard 9-word GEMDOS in-memory BPB record (recsize/clsiz/
+// clsizb/rdlen/fsiz/fatrec/datrec/numcl/bflags) the Atari-side hdv_bpb
+// hook needs to return a pointer to, and publishes it into
+// GEMDRVEMUL_FLOPPY_SESSION_BPB. Deliberately NOT part of the Phase 3
+// backend (sidetnfs_floppy_emul.c/.h are untouched) -- re-reads sector 0
+// via the existing, public sidetnfs_floppy_emul_read_sector() exactly as
+// any other caller would, parses the on-disk BPB fields Phase 3's own
+// validation didn't need to keep (SPC/RES/FAT-count/DIR/SPF, same byte
+// offsets documented in sidetnfs_floppy_emul.c's own top-of-file
+// comment: 13, 14-15, 16, 17-18, 22-23), and applies the standard,
+// well-documented Atari on-disk-BPB-to-in-memory-BPB conversion. Called
+// once per SESSION_START, not cached -- Phase 4 explicitly asks not to
+// add caching, and one extra 512-byte sector read is negligible next to
+// everything else SESSION_START already does.
+static void publish_floppy_bpb(uint32_t memory_shared_address, uint32_t total_sectors)
+{
+    uint8_t sector0[NUM_BYTES_PER_SECTOR];
+    if (sidetnfs_floppy_emul_read_sector(0, sector0) != SIDETNFS_FLOPPY_EMUL_OK)
+    {
+        // Leave the BPB fields as whatever they were (SESSION_START's
+        // overall status already reflects the failure) -- a caller must
+        // never trust GEMDRVEMUL_FLOPPY_SESSION_BPB unless
+        // GEMDRVEMUL_FLOPPY_SESSION_STATUS is SIDETNFS_FLOPPY_EMUL_OK.
+        return;
+    }
+
+    uint16_t recsize = (uint16_t)((uint16_t)sector0[11] | ((uint16_t)sector0[12] << 8));
+    uint16_t clsiz = sector0[13];
+    uint16_t res = (uint16_t)((uint16_t)sector0[14] | ((uint16_t)sector0[15] << 8));
+    uint16_t fat_count = sector0[16];
+    uint16_t dir_entries = (uint16_t)((uint16_t)sector0[17] | ((uint16_t)sector0[18] << 8));
+    uint16_t spf = (uint16_t)((uint16_t)sector0[22] | ((uint16_t)sector0[23] << 8));
+
+    uint16_t clsizb = (uint16_t)(recsize * clsiz);
+    uint16_t rdlen = (uint16_t)(((uint32_t)dir_entries * 32u + (recsize - 1u)) / recsize);
+    // fatrec is the first record of the LAST FAT copy, not just the
+    // reserved-sector count -- GEMDOS derives its own root-directory
+    // offset from fatrec (roughly fatrec+fsiz), so the previous
+    // `fatrec = res` was wrong for any 2-FAT disk: with res=1/fsiz=5 it
+    // produced fatrec=1, and GEMDOS's fatrec+fsiz then landed on LBA 6 --
+    // the real start of the SECOND FAT copy, not the root directory,
+    // which is exactly the sector this investigation's entire "repeated
+    // read of the same LBA" trace turned out to be (see the floppy-emu
+    // bus-error investigation's own report). datrec is computed straight
+    // from res/fat_count/spf/rdlen rather than from fatrec, so it stays
+    // correct regardless.
+    uint16_t fatrec = (uint16_t)(res + (fat_count > 0u ? (fat_count - 1u) * spf : 0u));
+    uint16_t datrec = (uint16_t)(res + (uint32_t)fat_count * spf + rdlen);
+    uint16_t numcl = (clsiz != 0 && total_sectors > datrec) ? (uint16_t)((total_sectors - datrec) / clsiz) : 0;
+    // bit0: 16-bit FAT. bit1 (B_1FAT) means "device has only a single FAT
+    // copy" -- NOT "serial number present" as the previous comment here
+    // claimed. Unconditionally setting it regardless of fat_count told
+    // GEMDOS every image had one FAT even when fat_count was 2, which
+    // could itself have skewed its own FAT-copy-skipping math on top of
+    // the fatrec bug above.
+    uint16_t bflags = (uint16_t)((numcl > 4084u ? 1u : 0u) | (fat_count < 2u ? 2u : 0u));
+
+    const uint16_t bpb_words[GEMDRVEMUL_FLOPPY_SESSION_BPB_WORDS] = {recsize, clsiz,  clsizb, rdlen,  spf,
+                                                                       fatrec,  datrec, numcl,  bflags};
+    for (unsigned i = 0; i < GEMDRVEMUL_FLOPPY_SESSION_BPB_WORDS; i++)
+    {
+        WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_BPB + (unsigned long)i * 2UL, bpb_words[i]);
+    }
+
+    // Numeric fields only, no snprintf -- see sidetnfs_diag_log()'s own
+    // comment on why the hot path stays as cheap as possible. dir_entries/
+    // spf/total_sectors/numcl are dropped rather than packed into attr:
+    // all four can exceed uint8_t's range for a real disk (dir_entries up
+    // to 224, total_sectors/numcl in the thousands for HD media), and
+    // recsize/clsiz/res/fat_count/clsizb/rdlen/datrec/bflags already cover
+    // the actual crash-diagnosis question (a degenerate/zero BPB field).
+    sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_BPB_RAW, recsize, NULL, NULL, NULL, clsiz, res, (uint8_t)fat_count, 0);
+    sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_BPB_COMPUTED, clsizb, NULL, NULL, NULL, rdlen, datrec, (uint8_t)bflags, 0);
+}
+
 void init_gemdrvemul(bool safe_config_reboot)
 {
     FRESULT fr; /* FatFs function common result code */
@@ -3644,11 +3808,33 @@ void init_gemdrvemul(bool safe_config_reboot)
     bool write_config_only_once = true;
     active_command_id = 0xFFFF;
 
+#if SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
+    // The diagnostic eventlog's ~6.8KB backing array lives here, on this
+    // function's own stack frame, instead of as a static (.bss)
+    // reservation -- init_gemdrvemul() never returns, so this storage is
+    // valid for the rest of the program's life, exactly like a static
+    // would be, but it comes out of the large, mostly-idle stack region
+    // instead of permanently growing .bss in a diag/debug build. See
+    // sidetnfs_diag_set_event_buffer()'s own comment in sidetnfs_probe.c.
+    SidetnfsDiagEvent local_diag_events[SIDETNFS_DIAG_MAX_EVENTS]; // deliberately NOT static -- see comment above
+    sidetnfs_diag_set_event_buffer(local_diag_events);
+    // Exempt from the floppy-active gate (see SIDETNFS_DIAG_BOOT_MARKER's
+    // own comment) -- proves the buffer/SD write path works at all,
+    // independent of whether a floppy session ever starts.
+    sidetnfs_diag_log(SIDETNFS_DIAG_BOOT_MARKER, 0, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
+
     DPRINTF("Waiting for commands...\n");
     uint32_t memory_shared_address = ROM3_START_ADDRESS; // Start of the shared memory buffer
     uint32_t memory_firmware_code = ROM4_START_ADDRESS;  // Start of the firmware code
 
     init_variables(memory_shared_address);
+
+    // Phase 2B/3: mandatory fail-safe boot policy (install_gemdrive=YES,
+    // install_floppy=NO), set fresh on every Pico power-cycle -- RAM
+    // only, never read from or written to flash. Also closes any
+    // leftover floppy backend (defensive; none should exist this early).
+    sidetnfs_floppy_emul_init(memory_shared_address);
 
     *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RTC_STATUS)) = 0x0;
     *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0x0;
@@ -5235,6 +5421,367 @@ void init_gemdrvemul(bool safe_config_reboot)
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_COUNT, get_page_result.count);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_HAS_PREV, get_page_result.has_prev ? 1 : 0);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PAGE_HAS_NEXT, get_page_result.has_next ? 1 : 0);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHUNK:
+        {
+            // Phase 5: request: chunk_offset(4, param32) +
+            // chunk_length(2, param16) + chunk_length raw bytes (a byte
+            // blob, like any other string-shaped field -- must be even,
+            // matching CHANGE_ENDIANESS_BLOCK16's own whole-word
+            // requirement; the Atari-side packer pads the final chunk by
+            // one byte if needed). Written DIRECTLY into its final
+            // position in GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS -- no
+            // separate staging buffer, unlike GEMDRVEMUL_WRITE_BUFF_CALL's
+            // own two-phase pattern for TNFS/SD file writes: ROM3 *is*
+            // the final destination here (nothing external to flush to),
+            // so a failed/mismatched chunk is simply overwritten by the
+            // Atari's own retry, and GEMDRVEMUL_FLOPPY_FAVORITES_COMMIT
+            // is what makes the result trustworthy, not this call.
+            // Response: status + a running 16-bit word-sum checksum
+            // (same simple wraparound-add algorithm the existing GEMDOS
+            // write-buffer path already uses on the Atari side) of the
+            // bytes just written, for the Atari's own client-side compare.
+            uint32_t fav_chunk_offset = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint16_t fav_chunk_length = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+
+            uint32_t fav_write_status = SIDETNFS_FLOPPY_EMUL_OK;
+            uint16_t fav_checksum = 0;
+            if ((fav_chunk_length % 2) != 0 || fav_chunk_length > SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX ||
+                (uint64_t)fav_chunk_offset + fav_chunk_length > SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX)
+            {
+                fav_write_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR; // generic "bad chunk" -- bounds violation, never touches the strings area
+            }
+            else
+            {
+                uint32_t fav_dest = memory_shared_address + GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + fav_chunk_offset;
+                COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, (void *)fav_dest, fav_chunk_length);
+                const uint8_t *fav_written = (const uint8_t *)fav_dest;
+                for (uint16_t i = 0; i < fav_chunk_length; i += 2)
+                {
+                    fav_checksum = (uint16_t)(fav_checksum + (uint16_t)((fav_written[i] << 8) | fav_written[i + 1]));
+                }
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET, fav_chunk_offset);
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH, fav_chunk_length);
+            }
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM, fav_checksum);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STATUS, fav_write_status);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHECK:
+        {
+            // Phase 5: zero payload. Re-reads the range WRITE_CHUNK just
+            // wrote (offset/length already published by that call) and
+            // recomputes the SAME checksum algorithm directly from what's
+            // now sitting in ROM3, comparing against what WRITE_CHUNK
+            // reported -- a genuine post-write integrity check, not a
+            // rubber stamp: it catches storage corruption between the
+            // write and this call, which the Atari's own client-side
+            // compare (against WRITE_CHUNK's response) cannot see.
+            uint32_t fav_check_offset = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_OFFSET);
+            uint16_t fav_check_length = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH);
+            uint16_t fav_check_expected = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM);
+
+            const uint8_t *fav_check_data =
+                (const uint8_t *)(memory_shared_address + GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + fav_check_offset);
+            uint16_t fav_check_actual = 0;
+            for (uint16_t i = 0; i < fav_check_length; i += 2)
+            {
+                fav_check_actual = (uint16_t)(fav_check_actual + (uint16_t)((fav_check_data[i] << 8) | fav_check_data[i + 1]));
+            }
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STATUS,
+                                     (fav_check_actual == fav_check_expected) ? SIDETNFS_FLOPPY_EMUL_OK
+                                                                                : SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_FAVORITES_COMMIT:
+        {
+            // Phase 5: request: table[60] (60 sequential plain uint16_t
+            // words -- numeric offsets, NOT a byte-blob string field, so
+            // no CHANGE_ENDIANESS_BLOCK16 involved, just 60 ordinary
+            // param16 reads) + count(2, param16) + active_index(2,
+            // param16) + strings_used(4, param32). All chunks must
+            // already be written+checked before this call -- this is
+            // what makes GEMDRVEMUL_FLOPPY_FAVORITES_COUNT/_ACTIVE_INDEX/
+            // _STRINGS_USED trustworthy (see their own comments in
+            // gemdrvemul.h: "valid only after COMMIT").
+            uint16_t fav_table[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT];
+            for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
+            {
+                fav_table[i] = GET_PAYLOAD_PARAM16(payloadPtr);
+                payloadPtr += 1;
+            }
+            uint16_t fav_commit_count = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            uint16_t fav_commit_active_index = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            uint32_t fav_commit_strings_used = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            uint32_t fav_commit_status = SIDETNFS_FLOPPY_EMUL_OK;
+            if (fav_commit_count > SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT ||
+                fav_commit_strings_used > SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX ||
+                (fav_commit_count > 0 && fav_commit_active_index >= SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT))
+            {
+                fav_commit_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR;
+            }
+            else
+            {
+                for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
+                {
+                    if (fav_table[i] != SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET && fav_table[i] >= fav_commit_strings_used)
+                    {
+                        fav_commit_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR;
+                        break;
+                    }
+                }
+            }
+            if (fav_commit_status == SIDETNFS_FLOPPY_EMUL_OK)
+            {
+                for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
+                {
+                    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)i * 2UL, fav_table[i]);
+                }
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_COUNT, fav_commit_count);
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX, fav_commit_active_index);
+                WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED, fav_commit_strings_used);
+            }
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STATUS, fav_commit_status);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SESSION_START:
+        {
+            // Phase 3: prepares a floppy session and publishes the
+            // requested Atari boot configuration -- does NOT switch any
+            // Pico-side mode (see this command's own comment in
+            // commands.h). Request: active_slot(4) + install_gemdrive(2)
+            // + install_floppy(2) + image_path
+            // (SIDETNFS_FLOPPY_FAVORITE_PATH_MAX, string field, ignored
+            // when install_floppy==NO). Response: status + geometry
+            // echo, or a cleared/OK state when install_floppy==NO --
+            // "INSTALL_FLOPPY=NO must not require or validate an image".
+            uint32_t session_start_active_slot = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            bool session_start_install_gemdrive = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
+            payloadPtr += 1;
+            bool session_start_install_floppy = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
+            payloadPtr += 1;
+            char session_start_image_path[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, session_start_image_path, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
+            payloadPtr += SIDETNFS_FLOPPY_FAVORITE_PATH_MAX / 2;
+            session_start_image_path[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX - 1] = '\0';
+
+            sidetnfs_floppy_emul_status_t session_start_result;
+            sidetnfs_floppy_geometry_t session_start_geom;
+            memset(&session_start_geom, 0, sizeof(session_start_geom));
+
+            if (session_start_install_floppy)
+            {
+                session_start_result = sidetnfs_floppy_emul_open((uint8_t)session_start_active_slot,
+                                                                    session_start_image_path, sidetnfs_network_ok,
+                                                                    &session_start_geom);
+            }
+            else
+            {
+                // ACTIVE_SLOT/IMAGE_PATH/BPB/geometry are irrelevant in
+                // this state (NO/NO and YES/NO are both valid launches
+                // with no floppy image at all) -- just guarantee no
+                // stale backend survives and report OK.
+                sidetnfs_floppy_emul_close();
+                session_start_result = SIDETNFS_FLOPPY_EMUL_OK;
+            }
+
+            // Published regardless of the image-validation outcome above
+            // -- FLOPPY.PRG's chosen install_gemdrive/install_floppy
+            // combination is a launch request in its own right, not
+            // conditional on an image happening to validate.
+            sidetnfs_floppy_emul_set_boot_policy(memory_shared_address, session_start_install_gemdrive,
+                                                  session_start_install_floppy);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)session_start_result);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_GENERATION, (uint32_t)rand());
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT, session_start_active_slot);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SIDES, session_start_geom.sides);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK, session_start_geom.sectors_per_track);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_TRACKS, session_start_geom.tracks);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR, session_start_geom.bytes_per_sector);
+            memset((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH), 0, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
+            if (session_start_install_floppy && session_start_result == SIDETNFS_FLOPPY_EMUL_OK)
+            {
+                memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH), session_start_image_path,
+                       strnlen(session_start_image_path, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX - 1));
+                publish_floppy_bpb(memory_shared_address, session_start_geom.total_sectors);
+                // A newly-mounted image is always a "media changed" event
+                // -- the Atari's mediach hook must report this at least
+                // once so TOS (re)fetches the BPB just published above.
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED, 1u);
+            }
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_READ_SECTOR:
+        {
+            // Phase 4 correction: LBA arrives as the command's own small
+            // payload (the Atari cannot pre-write ROM3 -- see this
+            // command's own comment in commands.h), not from a ROM3
+            // field. One logical sector, one round trip. Response:
+            // status + the LBA served (echoed back for the Atari's own
+            // desync sanity-check) + 512 bytes in
+            // GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA. No drive/track/side
+            // fields -- see this command's own comment in commands.h.
+            //
+            // Hardware bring-up investigation: payload extended from 4 to
+            // 12 bytes -- lba(4) + caller_pc(4) + rwabs_count(4), the
+            // latter two captured at new_rwabs_routine's own entry on the
+            // Atari side (floppy.s) and threaded down unchanged.
+            // caller_pc: a nonzero value landing in TOS ROM (~0xE0xxxx,
+            // matching the old_hdv_bpb/old_hdv_rw addresses SAVE_VECTORS
+            // already captured) means GEMDOS/BIOS itself is the caller; a
+            // value near the boot sector's own relocated load address
+            // means the disk's own loader is calling Rwabs directly. Zero
+            // means the read came through the (not yet instrumented)
+            // XBIOS Floprd path instead -- see
+            // SIDETNFS_DIAG_FLOPPY_READ_SECTOR's own comment.
+            // rwabs_count: the ORIGINAL count argument from the Rwabs
+            // call this read is one iteration of (read independently of
+            // the Atari's own decrementing loop counter) -- distinguishes
+            // "TOS issued one count>1 multi-sector call" (a bug in the
+            // Atari's own per-sector loop would then be the next thing to
+            // check) from "TOS issued N separate count=1 calls" (a
+            // TOS-side repeat, nothing wrong with the multi-sector loop).
+            uint32_t read_sector_lba = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint32_t read_sector_caller_pc = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint32_t read_sector_rwabs_count = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            sidetnfs_floppy_emul_status_t read_sector_result =
+                sidetnfs_floppy_emul_read_sector(read_sector_lba, (uint8_t *)(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA));
+            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA, NUM_BYTES_PER_SECTOR);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)read_sector_result);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA, read_sector_lba);
+            // attr packs two small values (no free numeric field left):
+            // bit 7 = GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED's CURRENT
+            // value (a pure local ROM3 read on the Pico's own side, no
+            // wire cost) -- tests whether TOS re-arms/re-polls
+            // media-changed state between repeated reads; bits 0-6 =
+            // read_sector_rwabs_count clamped to 127 (always comfortably
+            // enough range for any real Rwabs count).
+            uint8_t read_sector_media_changed = (uint8_t)READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED);
+            uint8_t read_sector_attr = (uint8_t)(((read_sector_media_changed != 0) ? 0x80u : 0u) |
+                                                   (read_sector_rwabs_count > 127u ? 127u : read_sector_rwabs_count));
+            floppy_note_command_seen(false);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_READ_SECTOR, read_sector_lba, NULL, NULL, NULL,
+                               (uint16_t)(read_sector_caller_pc >> 16), (uint16_t)read_sector_caller_pc,
+                               (uint8_t)read_sector_result, read_sector_attr);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SAVE_VECTORS:
+        {
+            // Request: old_hdv_bpb(4) + old_hdv_rw(4) + old_hdv_mediach(4)
+            // -- sent once by the Atari's floppy-hook installer, before
+            // it overwrites those three vectors. Pure storage, no backend
+            // involvement -- see this command's own comment in
+            // commands.h for why the Atari can't just keep these locally.
+            uint32_t save_vectors_old_bpb = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint32_t save_vectors_old_rw = GET_PAYLOAD_PARAM32(payloadPtr);
+            payloadPtr += 2;
+            uint32_t save_vectors_old_mediach = GET_PAYLOAD_PARAM32(payloadPtr);
+
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB, save_vectors_old_bpb);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW, save_vectors_old_rw);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH, save_vectors_old_mediach);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)SIDETNFS_FLOPPY_EMUL_OK);
+            floppy_note_command_seen(true);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_SAVE_VECTORS, save_vectors_old_bpb, NULL, NULL, NULL,
+                               (uint16_t)(save_vectors_old_rw >> 16), (uint16_t)save_vectors_old_rw, 0, 0);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_SAVE_XBIOS_VECTOR:
+        {
+            // Request: old_xbios_vector(4) -- the fourth vector
+            // GEMDRVEMUL_FLOPPY_SAVE_VECTORS' own 12-byte payload cap
+            // couldn't carry. Pure storage, no backend involvement.
+            uint32_t save_xbios_old_vector = GET_PAYLOAD_PARAM32(payloadPtr);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR, save_xbios_old_vector);
+            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)SIDETNFS_FLOPPY_EMUL_OK);
+            floppy_note_command_seen(false);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_SAVE_XBIOS_VECTOR, save_xbios_old_vector, NULL, NULL, NULL, 0, 0, 0, 0);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_MEDIA_CHANGE_ACK:
+        {
+            // Zero payload. Clears GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED
+            // back to 0 -- see this command's own comment in commands.h.
+            uint16_t media_change_ack_prev = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED);
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED, 0u);
+            uint32_t media_change_ack_gap_us = floppy_gap_since_last_command_us();
+            floppy_note_command_seen(false);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_MEDIA_CHANGE_ACK, media_change_ack_prev, NULL, NULL, NULL,
+                               (uint16_t)(media_change_ack_gap_us >> 16), (uint16_t)media_change_ack_gap_us, 0, 0);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_GETBPB_PING:
+        {
+            // Zero payload -- diagnostic only, see this command's own
+            // comment in commands.h. ndta=1 (a marker value, not real
+            // payload data); idx/count carry the real elapsed
+            // microseconds since the previous floppy command (see
+            // floppy_gap_since_last_command_us()) -- unlike
+            // CRASH_SUSPECTED's own ndta, which only ever reads close to
+            // the fixed silence threshold, this gives the true inter-call
+            // gap.
+            uint32_t getbpb_ping_gap_us = floppy_gap_since_last_command_us();
+            floppy_note_command_seen(false);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_GETBPB_PING, 1, NULL, NULL, NULL,
+                               (uint16_t)(getbpb_ping_gap_us >> 16), (uint16_t)getbpb_ping_gap_us, 0, 0);
+
+            write_random_token(memory_shared_address);
+            active_command_id = 0xFFFF;
+            break;
+        }
+        case GEMDRVEMUL_FLOPPY_MEDIACH_PING:
+        {
+            // Zero payload -- diagnostic only, see this command's own
+            // comment in commands.h. ndta=2 (a marker value, not real
+            // payload data); idx/count carry the real elapsed
+            // microseconds since the previous floppy command -- see
+            // GETBPB_PING's own comment for why (same rationale).
+            uint32_t mediach_ping_gap_us = floppy_gap_since_last_command_us();
+            floppy_note_command_seen(false);
+            sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_MEDIACH_PING, 2, NULL, NULL, NULL,
+                               (uint16_t)(mediach_ping_gap_us >> 16), (uint16_t)mediach_ping_gap_us, 0, 0);
 
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
@@ -8644,6 +9191,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_diag_dump_on_select(hd_folder);
         }
         s_diag_select_prev_pressed = select_pressed_now;
+        // Automatic, human-free crash detection -- see
+        // SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED's own comment. Checked once
+        // per main-loop iteration, same cadence as the SELECT edge-check
+        // right above.
+        floppy_check_crash_suspected();
 #if SIDETNFS_ENABLE_SD_SLOT_DUMP
         // SD-only slot diagnosis. Same short-press,
         // edge-triggered (rising edge only) pattern as the diagnostic

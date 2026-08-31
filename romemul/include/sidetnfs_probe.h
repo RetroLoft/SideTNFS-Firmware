@@ -1526,6 +1526,82 @@ typedef enum
     // site's own comment for what they carry.
     SIDETNFS_DIAG_FLOPPY_RAW_READDIR_FAIL,
     SIDETNFS_DIAG_FLOPPY_GET_PAGE_BACKEND_ERROR,
+    // Hardware bring-up investigation ("two bombs" after a floppy Start):
+    // traces the install/BPB-publish/sector-read path from the Pico
+    // side, since the crash itself happens on the Atari (68k) side where
+    // nothing can be logged. All gated behind floppy-emu being active
+    // (see sidetnfs_diag_log()'s own gate) so none of this costs anything
+    // before Start is ever clicked. ndta/index/count/result/attr are
+    // repurposed per event -- see each call site's own comment.
+    //
+    // SAVE_VECTORS: confirms install_floppy_hooks's wire call actually
+    // arrived. ndta=old_hdv_bpb, index=old_hdv_rw high word,
+    // count=old_hdv_rw low word.
+    SIDETNFS_DIAG_FLOPPY_SAVE_VECTORS,
+    // SAVE_XBIOS_VECTOR: same idea for the separate XBIOS trap chain.
+    // ndta=old_xbios_vector.
+    SIDETNFS_DIAG_FLOPPY_SAVE_XBIOS_VECTOR,
+    // BPB_RAW: the on-disk boot-sector fields publish_floppy_bpb() just
+    // parsed out of sector 0, before any arithmetic -- the direct
+    // candidate for a garbage/non-standard boot sector silently
+    // producing a bad BPB. ndta=recsize, index=clsiz, count=res
+    // (reserved sectors), result=fat_count.
+    SIDETNFS_DIAG_FLOPPY_BPB_RAW,
+    // BPB_COMPUTED: the resulting in-memory BPB actually published to
+    // GEMDRVEMUL_FLOPPY_SESSION_BPB. ndta=clsizb, index=rdlen,
+    // count=datrec, result=bflags.
+    SIDETNFS_DIAG_FLOPPY_BPB_COMPUTED,
+    // READ_SECTOR: one entry per GEMDRVEMUL_FLOPPY_READ_SECTOR call --
+    // proves the Atari's rwabs hook actually fired. ndta=lba,
+    // index/count=caller_pc high/low words (0 = came through the
+    // not-yet-instrumented XBIOS Floprd path, see gemdrvemul.c's own
+    // comment at this command's handler), result=sidetnfs_floppy_emul_status_t
+    // read status, attr=bit7 MEDIA_CHANGED-at-this-moment | bits0-6
+    // original Rwabs count (clamped to 127) -- see gemdrvemul.c's own
+    // comment for what distinguishing count==1 vs count>1 tells us.
+    SIDETNFS_DIAG_FLOPPY_READ_SECTOR,
+    // MEDIA_CHANGE_ACK: one entry per ack received -- tests whether
+    // new_mediach_routine (floppy.s) keeps reporting "changed" forever.
+    // ndta=the MEDIA_CHANGED value as it was just before this ack
+    // cleared it (should be nonzero exactly once if the flag behaves).
+    SIDETNFS_DIAG_FLOPPY_MEDIA_CHANGE_ACK,
+    // GETBPB_PING / MEDIACH_PING: one entry per invocation of
+    // new_getbpb_routine's success path / new_mediach_routine's
+    // steady-state "unchanged" path (floppy.s) -- these are pure local
+    // ROM3 reads on the Atari side with no wire round-trip for their
+    // actual function, so without this they're a complete blind spot in
+    // every trace. Interleave these with SIDETNFS_DIAG_FLOPPY_READ_SECTOR
+    // (by sequence/seq number) to see the full Getbpb/Mediach/Rwabs call
+    // pattern around the repeated-sector-read bug. No payload fields --
+    // ndta/index/count/result/attr are all 0/unused for both.
+    SIDETNFS_DIAG_FLOPPY_GETBPB_PING,
+    SIDETNFS_DIAG_FLOPPY_MEDIACH_PING,
+    // CRASH_SUSPECTED: logged automatically by the Pico's own main loop,
+    // with NO button press and no human involved -- once a floppy
+    // command stream has genuinely started (SAVE_VECTORS seen), if more
+    // than SIDETNFS_FLOPPY_CRASH_SILENCE_THRESHOLD_US elapses with no
+    // further floppy-relevant command arriving, the wire has gone silent
+    // exactly the way it would if the 68000 just halted on an unhandled
+    // exception (it can never issue another ROM3 command again). This
+    // exists specifically because human SELECT-press reaction time turned
+    // out to be a real confound: a fast press captured only 1 completed
+    // READ_SECTOR where a normal-speed press captured 6-21, meaning the
+    // raw event counts in every earlier trace were measuring "iterations
+    // before a human reacted," not "iterations before the actual crash."
+    // ndta=elapsed microseconds since the last floppy command (the
+    // silence duration itself), logged only once per session (see
+    // gemdrvemul.c's own latch flag) so it doesn't re-fire on ordinary
+    // idle gaps after this point.
+    SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED,
+    // BOOT_MARKER: written once, right after sidetnfs_diag_set_event_buffer()
+    // runs in init_gemdrvemul(), BEFORE floppy-emu is ever active --
+    // deliberately exempt from sidetnfs_diag_log()'s own floppy-active
+    // gate (see that function's own comment) so the ring buffer/SD
+    // write path can be sanity-checked independently of whether a
+    // floppy session ever starts. If a SELECT-press dump ever comes back
+    // without at least this one event, the write path itself (not the
+    // floppy gate) is where to look.
+    SIDETNFS_DIAG_BOOT_MARKER,
 } SidetnfsDiagEventType;
 
 // SIDETNFS_DIAG_MAX_EVENTS itself is defined in debug.h.
@@ -1557,10 +1633,19 @@ typedef struct
 // a Production build carries none of the s_diag_events RAM array, the
 // function body, or the per-call argument setup.
 #if SIDETNFS_ENABLE_DIAG || SIDETNFS_ENABLE_DEBUG
+// Must be called once, with a SIDETNFS_DIAG_MAX_EVENTS-sized array, before
+// any sidetnfs_diag_log() call can do anything -- see sidetnfs_diag_log's
+// own definition in sidetnfs_probe.c for why this indirection exists
+// (keeping the ~6.8KB event array out of .bss, backed by a caller-owned
+// buffer instead). init_gemdrvemul() (gemdrvemul.c) is the only caller,
+// passing its own local array -- safe because that function never
+// returns, so the array's stack storage is never reclaimed.
+void sidetnfs_diag_set_event_buffer(SidetnfsDiagEvent *buffer);
 void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *path,
                         const char *pattern, const char *name, uint16_t index,
                         uint16_t count, uint8_t result, uint8_t attr);
 #else
+static inline void sidetnfs_diag_set_event_buffer(SidetnfsDiagEvent *buffer) { (void)buffer; }
 static inline void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta, const char *path,
                                        const char *pattern, const char *name, uint16_t index,
                                        uint16_t count, uint8_t result, uint8_t attr)
@@ -1582,7 +1667,7 @@ static inline void sidetnfs_diag_log(SidetnfsDiagEventType event, uint32_t ndta,
 // edge-handler in gemdrvemul.c (never automatically, never from
 // Fsfirst/Fsnext, never from a network callback). Silently does nothing if
 // hd_folder is NULL or the SD write fails -- never crashes.
-void sidetnfs_eventlog_dump_to_file(const char *hd_folder);
+bool sidetnfs_eventlog_dump_to_file(const char *hd_folder);
 
 // Debug build only: enable/disable everything below (the
 // SidetnfsDiagSnapshot struct updates, and sidetnfs_snapshot_dump_to_file()
@@ -1933,7 +2018,7 @@ int sidetnfs_diag_snapshot_find_dta_slot(uint32_t ndta);
 // Call only from the SELECT-button edge-handler. Silently does nothing if
 // hd_folder is NULL or the SD write fails -- never crashes, same contract
 // as sidetnfs_eventlog_dump_to_file() above.
-void sidetnfs_snapshot_dump_to_file(const char *hd_folder);
+bool sidetnfs_snapshot_dump_to_file(const char *hd_folder);
 
 // Temporary diagnostic build (BUGGYBGX/BULGX investigation
 // fixed-size, 16-entry RING buffer (oldest entry overwritten first, unlike
