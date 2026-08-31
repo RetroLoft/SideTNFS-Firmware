@@ -148,6 +148,36 @@ static inline sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_validate_geomet
 sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open(uint8_t profile_index, const char *image_path,
                                                           bool network_ok, sidetnfs_floppy_geometry_t *out_geom);
 
+// Phase 6A candidate-swap transaction -- see sidetnfs_floppy_emul_open()'s
+// own comment for why it can't be used for a runtime switch as-is: it
+// always closes the CURRENT backend FIRST, which is correct for its
+// original caller (SESSION_START, where there is no prior working image
+// to protect) but would destroy a working session before its replacement
+// is known to be valid. This trio replaces that risk with a
+// validate-then-atomic-swap sequence:
+//
+//   1. sidetnfs_floppy_emul_open_candidate() -- opens and fully validates
+//      image_path into a SEPARATE candidate slot, keeping its handle
+//      alive on success. s_state (the currently active backend) is never
+//      touched by this call, on any path.
+//   2. On SIDETNFS_FLOPPY_EMUL_OK, the caller publishes whatever metadata
+//      it needs from *out_geom, then calls
+//      sidetnfs_floppy_emul_commit_candidate() -- a pure, I/O-free struct
+//      swap (cannot fail) that makes the candidate the active backend
+//      BEFORE closing the old one, so the old backend's own close (which
+//      can perform TNFS/SD I/O) can never lose a validated, working
+//      replacement.
+//   3. On any other status, the failed candidate has already been closed
+//      internally; the caller does nothing further and the active
+//      backend is untouched. sidetnfs_floppy_emul_discard_candidate() is
+//      available for a caller that opened a candidate but decides, for
+//      its own reasons, not to commit it after all.
+sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open_candidate(uint8_t profile_index, const char *image_path,
+                                                                     bool network_ok,
+                                                                     sidetnfs_floppy_geometry_t *out_geom);
+void sidetnfs_floppy_emul_commit_candidate(void);
+void sidetnfs_floppy_emul_discard_candidate(void);
+
 // Closes whatever backend is open, if any (harmless no-op otherwise) and
 // clears the runtime geometry. Used both when opening a new image (see
 // sidetnfs_floppy_emul_open()'s own comment) and when INSTALL_FLOPPY=NO

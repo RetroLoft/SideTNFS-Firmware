@@ -10,6 +10,7 @@
 #include "include/sidetnfs_probe.h"
 #include "include/sidetnfs_config_drive_backend.h"
 #include "include/sidetnfs_sd_service.h"
+#include "include/sidetnfs_longpress.h" // sidetnfs_longpress_poll_step() -- floppy-emu SELECT short/long press (Phase 6A)
 #include "pico/time.h" // absolute_time_t/get_absolute_time()/absolute_time_diff_us() -- SIDETNFS_DIAG_FLOPPY_CRASH_SUSPECTED
 
 // Fixed, TOS-safe GEMDOS Dfree
@@ -3751,6 +3752,240 @@ static void publish_floppy_bpb(uint32_t memory_shared_address, uint32_t total_se
     sidetnfs_diag_log(SIDETNFS_DIAG_FLOPPY_BPB_COMPUTED, clsizb, NULL, NULL, NULL, rdlen, datrec, (uint8_t)bflags, 0);
 }
 
+// ---------------------------------------------------------------------
+// Phase 6A: runtime Favorite switching on a SELECT short-press. Long-press
+// (session exit) is Phase 6B, not implemented yet -- see
+// floppy_select_poll()'s own comment for the state machine this is
+// designed to slot into cleanly.
+// ---------------------------------------------------------------------
+
+// Not a real favorites-table offset -- reused as the "no active/matching
+// Favorite" sentinel for an INDEX (0..59 are the only real indices, so
+// 0xFFFF is unambiguous either way). Kept as its own name rather than
+// reusing SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET directly so the two
+// concepts (an empty TABLE slot vs. "no active index") read distinctly
+// at each call site, even though the numeric value is deliberately the
+// same.
+#define FLOPPY_FAVORITE_INDEX_NONE 0xFFFFu
+
+// Resolves favorites_table[index] into a validated, NUL-terminated path.
+// Never trusts the packed data: rejects an empty-sentinel slot, an offset
+// at/beyond the committed strings_used length, a string that isn't
+// NUL-terminated within that committed length (never scans into the
+// uncommitted rest of the 16KB buffer), and a string that would truncate
+// against out_path_size. Returns false, leaving *out_path untouched, on
+// any of the above.
+static bool floppy_favorites_get_path(uint32_t memory_shared_address, uint16_t index, char *out_path,
+                                       size_t out_path_size)
+{
+    if (index >= SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT || out_path == NULL || out_path_size == 0)
+    {
+        return false;
+    }
+    uint16_t offset = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)index * 2UL);
+    if (offset == SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET)
+    {
+        return false;
+    }
+    uint32_t strings_used = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED);
+    if (strings_used > SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX || offset >= strings_used)
+    {
+        return false;
+    }
+    const char *src = (const char *)(memory_shared_address + GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + offset);
+    size_t max_len = (size_t)(strings_used - offset);
+    size_t len = strnlen(src, max_len);
+    if (len >= max_len)
+    {
+        return false; // not NUL-terminated within the committed strings area
+    }
+    if (len >= out_path_size)
+    {
+        return false; // would truncate -- reject rather than silently cut the path
+    }
+    memcpy(out_path, src, len + 1);
+    return true;
+}
+
+// SESSION_START-time only: scans every slot (not just 0..count-1 -- Test B
+// requires tolerating holes) for one whose resolved path exactly matches
+// the image that was just mounted, so a runtime switch started later
+// knows where to resume from. No match (including a Browser-started
+// image, or an image that happens not to be in the table at all) is a
+// normal, expected outcome, not an error.
+static uint16_t floppy_favorites_find_active_index(uint32_t memory_shared_address, const char *mounted_path)
+{
+    if (mounted_path == NULL || mounted_path[0] == '\0')
+    {
+        return FLOPPY_FAVORITE_INDEX_NONE;
+    }
+    char candidate[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
+    for (uint16_t i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
+    {
+        if (floppy_favorites_get_path(memory_shared_address, i, candidate, sizeof(candidate)) &&
+            strcmp(candidate, mounted_path) == 0)
+        {
+            return i;
+        }
+    }
+    return FLOPPY_FAVORITE_INDEX_NONE;
+}
+
+// current_index == FLOPPY_FAVORITE_INDEX_NONE (Browser-started image, or
+// no match found at SESSION_START) starts the search at Favorite 0, per
+// spec (Test C). Otherwise searches current+1 .. 59, then wraps 0 ..
+// current-1, explicitly stopping if the search would land back on
+// current_index itself -- a single-Favorite library must report "nothing
+// else to switch to" (Test D), not reselect itself and cause a pointless
+// reopen/media-change. Skips every empty/invalid slot (Test B).
+static uint16_t floppy_favorites_find_next(uint32_t memory_shared_address, uint16_t current_index)
+{
+    char scratch[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
+    for (uint16_t step = 1; step <= SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; step++)
+    {
+        uint16_t candidate_index;
+        if (current_index == FLOPPY_FAVORITE_INDEX_NONE)
+        {
+            candidate_index = (uint16_t)(step - 1u);
+        }
+        else
+        {
+            candidate_index = (uint16_t)((current_index + step) % SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT);
+            if (candidate_index == current_index)
+            {
+                break; // wrapped all the way back to ourselves -- nothing else exists
+            }
+        }
+        if (floppy_favorites_get_path(memory_shared_address, candidate_index, scratch, sizeof(scratch)))
+        {
+            return candidate_index;
+        }
+    }
+    return FLOPPY_FAVORITE_INDEX_NONE;
+}
+
+// Orchestrates a SELECT-short-press Favorite switch: find the next
+// non-empty Favorite, opens+validates it into a separate candidate slot
+// WITHOUT disturbing the current backend, and only on confirmed success
+// commits the swap and publishes the new session metadata -- see
+// sidetnfs_floppy_emul_open_candidate()'s own comment for the full
+// validate-then-atomic-swap sequence and why it's structured this way
+// (closing the old backend as part of a plain "close current, open new"
+// leaves a window where a transient failure on the second open loses a
+// perfectly good, already-working session -- commit_candidate() makes
+// the new backend active before the old one is ever closed, so that
+// can't happen). Any failure leaves the current, working image untouched
+// and does not set MEDIA_CHANGED -- silent no-op, exactly like "no other
+// Favorite exists" (Test E). Invariant: once MEDIA_CHANGED becomes
+// visible to the Atari, s_state (via commit_candidate(), called first)
+// and every ROM3 field written below it already describe the new disk.
+static void floppy_select_switch_to_next_favorite(uint32_t memory_shared_address, bool network_ok)
+{
+    uint16_t current_index = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX);
+    uint16_t next_index = floppy_favorites_find_next(memory_shared_address, current_index);
+    if (next_index == FLOPPY_FAVORITE_INDEX_NONE)
+    {
+        return;
+    }
+
+    char candidate_path[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
+    if (!floppy_favorites_get_path(memory_shared_address, next_index, candidate_path, sizeof(candidate_path)))
+    {
+        return; // table changed under us / corrupt entry -- fail closed
+    }
+
+    uint32_t active_slot = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT);
+    sidetnfs_floppy_geometry_t candidate_geom;
+    if (sidetnfs_floppy_emul_open_candidate((uint8_t)active_slot, candidate_path, network_ok, &candidate_geom) !=
+        SIDETNFS_FLOPPY_EMUL_OK)
+    {
+        return; // candidate invalid -- current working image remains fully untouched, no media-change event
+    }
+
+    // Candidate is fully open and validated; s_state (the old image) is
+    // still untouched at this point. Commit the swap FIRST -- s_state
+    // becomes the new backend before the old one is closed -- then
+    // publish the metadata that now matches s_state, ending with
+    // MEDIA_CHANGED as the last externally-visible write.
+    sidetnfs_floppy_emul_commit_candidate();
+
+    WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)SIDETNFS_FLOPPY_EMUL_OK);
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SIDES, candidate_geom.sides);
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK, candidate_geom.sectors_per_track);
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_TRACKS, candidate_geom.tracks);
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR, candidate_geom.bytes_per_sector);
+    publish_floppy_bpb(memory_shared_address, candidate_geom.total_sectors);
+
+    memset((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH), 0, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
+    memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH), candidate_path,
+           strnlen(candidate_path, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX - 1));
+
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX, next_index);
+
+    // MEDIA_CHANGED must be the LAST thing set -- s_state and every ROM3
+    // field above it already describe the new disk by the time this
+    // becomes visible to the Atari.
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED, 1u);
+}
+
+// Threshold Phase 6B's long-press session-exit will also use -- defined
+// here, in the feature this session builds, rather than in Phase 6B's own
+// (not-yet-written) code, so both share one definition from the start.
+#define SIDETNFS_FLOPPY_SELECT_LONGPRESS_MS 1500u
+
+// SELECT press/release state machine for floppy-emu sessions, replacing
+// the plain immediate-reboot select_button_action() call while floppy-emu
+// is active (see this function's own call site in the main loop for why
+// that call must be skipped, not merely raced against).
+//
+// Deliberately decides on RELEASE, never on press -- "do NOT perform the
+// short-press action immediately" -- so a hold that will eventually become
+// a long press in Phase 6B never fires a short-press Favorite switch
+// first. Uses sidetnfs_longpress_poll_step() (the same pure decision
+// function the boot-time 10s factory-reset hold already uses) every tick
+// while held, purely so Phase 6B has an existing, obvious hook point
+// (the TRIGGERED branch below) to add real "arm the exit" behavior to
+// without touching this function's edge-detection at all. Phase 6A's own
+// TRIGGERED handling is intentionally just a latch: it stops the eventual
+// release from ALSO being treated as a short press, and does nothing
+// else.
+static void floppy_select_poll(bool pressed_now, uint32_t memory_shared_address, bool network_ok)
+{
+    static bool s_floppy_select_pressed_prev = false;
+    static absolute_time_t s_floppy_select_press_started_at;
+    static bool s_floppy_select_long_press_seen = false;
+
+    if (pressed_now && !s_floppy_select_pressed_prev)
+    {
+        s_floppy_select_press_started_at = get_absolute_time();
+        s_floppy_select_long_press_seen = false;
+    }
+
+    if (pressed_now)
+    {
+        uint32_t elapsed_ms =
+            (uint32_t)(absolute_time_diff_us(s_floppy_select_press_started_at, get_absolute_time()) / 1000);
+        if (sidetnfs_longpress_poll_step(true, elapsed_ms, SIDETNFS_FLOPPY_SELECT_LONGPRESS_MS) ==
+            SIDETNFS_LONGPRESS_TRIGGERED)
+        {
+            // Phase 6B: session exit goes here (or gets armed here and
+            // executed on release -- undecided, deliberately left to that
+            // phase's own audit). Phase 6A does nothing but latch.
+            s_floppy_select_long_press_seen = true;
+        }
+    }
+    else if (s_floppy_select_pressed_prev)
+    {
+        if (!s_floppy_select_long_press_seen)
+        {
+            floppy_select_switch_to_next_favorite(memory_shared_address, network_ok);
+        }
+        s_floppy_select_long_press_seen = false;
+    }
+
+    s_floppy_select_pressed_prev = pressed_now;
+}
+
 void init_gemdrvemul(bool safe_config_reboot)
 {
     FRESULT fr; /* FatFs function common result code */
@@ -5629,6 +5864,21 @@ void init_gemdrvemul(bool safe_config_reboot)
                 // -- the Atari's mediach hook must report this at least
                 // once so TOS (re)fetches the BPB just published above.
                 WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED, 1u);
+                // Phase 6A: a SELECT short-press switch needs to know
+                // where to resume searching from. SESSION_START's own
+                // request carries a path, not a Favorite index (FLOPPY.PRG
+                // may have launched this via Browse, not Favorites), so
+                // the only reliable source is matching the just-mounted
+                // path against the favorites table itself -- COMMIT's own
+                // ACTIVE_INDEX reflects FLOPPY.PRG's UI selection at
+                // upload time, which is not necessarily what actually got
+                // launched.
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX,
+                           floppy_favorites_find_active_index(memory_shared_address, session_start_image_path));
+            }
+            else
+            {
+                WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX, FLOPPY_FAVORITE_INDEX_NONE);
             }
             CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
 
@@ -9223,7 +9473,21 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         s_slot_diag_select_prev_pressed = select_pressed_now;
 #endif
-        if (select_pressed_now)
+        // Phase 6A: while a floppy-emu session is active, SELECT belongs
+        // to floppy_select_poll() (short press = Favorite switch; long
+        // press is reserved for Phase 6B) instead of the legacy
+        // select_button_action(), which -- in the common
+        // safe_config_reboot=false configuration -- reboots the whole
+        // Pico immediately on any press, with no debounce or duration
+        // check at all. Without this branch, every SELECT press during a
+        // floppy session would BOTH attempt a Favorite switch AND reboot
+        // the Pico out from under it. Outside floppy-emu, behavior is
+        // unchanged from before this phase.
+        if (sidetnfs_floppy_emul_install_floppy())
+        {
+            floppy_select_poll(select_pressed_now, memory_shared_address, sidetnfs_network_ok);
+        }
+        else if (select_pressed_now)
         {
             select_button_action(safe_config_reboot, write_config_only_once);
             // Write config only once to avoid hitting the flash too much
