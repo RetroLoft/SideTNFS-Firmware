@@ -249,11 +249,10 @@
 // describe an active floppy-emulation SESSION (one mounted .ST image on
 // virtual drive A:, one packed Favorites table). See
 // romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_FAVORITES/_SESSION) for
-// the wire layout and docs/sidetnfs-floppy-protocol.md for the full
-// protocol writeup, including the long-SELECT exit handshake and why
-// GEMDRVEMUL_FLOPPY_EXIT_ACK is deliberately a zero-payload, no-wait
-// command (it is sent from the Atari-side VBL handler, which must never
-// block on a Sidecart round-trip).
+// the wire layout. GEMDRVEMUL_FLOPPY_EXIT_ACK (0x2B) is RESERVED, UNUSED
+// -- see GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED's own comment in
+// gemdrvemul.h for why the automatic-reset design it was part of got
+// abandoned in favor of a manual Atari RESET.
 //
 // FAVORITES_WRITE_CHUNK/_WRITE_CHECK mirror the existing
 // GEMDRVEMUL_WRITE_BUFF_CALL/_WRITE_BUFF_CHECK pattern exactly (chunk +
@@ -311,22 +310,15 @@
 // wire (req #6).
 #define GEMDRVEMUL_FLOPPY_READ_SECTOR (APP_GEMDRVEMUL << 8 | 0x2A) // Read one 512-byte logical sector from the mounted image (request: LBA(4) + caller_pc(4) + rwabs_count(4) payload -- caller_pc/rwabs_count are hardware bring-up diagnostics only; caller_pc is 0 from the not-yet-instrumented XBIOS Floprd path)
 
-// Fire-and-forget, zero-payload ACK sent by the Atari-side VBL handler in
-// response to GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (long-SELECT
-// exit). Deliberately payload_size=0 -- process_command() fires after
-// just 3 trigger reads (header/command/size), and the sender never waits
-// for write_random_token() the way every other command's caller does.
-// The Pico's handler still writes the token and resets active_command_id
-// like any other command (keeps the shared parser state clean for the
-// next real command) -- the Atari side just never looks for it. Full
-// exit sequence: Pico cleans up the floppy session -> publishes
-// RESET_REQUESTED -> Atari's VBL handler sees it -> sends this ACK ->
-// short safety interval / Atari begins its own reset -> Pico restores
-// the fail-safe default (INSTALL_GEMDRIVE=YES, INSTALL_FLOPPY=NO,
-// gemdrvemul.h) before/while that reset completes, so the Atari finds
-// plain SideTNFS GEMDOS drives on the other side, matching the same
-// state as a fresh Pico power-cycle.
-#define GEMDRVEMUL_FLOPPY_EXIT_ACK (APP_GEMDRVEMUL << 8 | 0x2B) // Atari VBL handler's non-blocking ack of a pending reset request
+// RESERVED, UNUSED -- no handler exists on the Pico side. Was going to be
+// a fire-and-forget ACK an Atari-side VBL handler sent back in response
+// to GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED, as part of the abandoned
+// automatic-reset design (see that field's own comment in gemdrvemul.h).
+// Long-SELECT exit now disables floppy mode and confirms via LED
+// (floppy_select_trigger_exit() in gemdrvemul.c); the user presses Atari
+// RESET manually. Left defined, not renumbered, to avoid reshuffling the
+// command-ID space for no benefit.
+#define GEMDRVEMUL_FLOPPY_EXIT_ACK (APP_GEMDRVEMUL << 8 | 0x2B)
 
 // Sent once by the Atari's floppy-hook installer, right after it reads
 // (and before it overwrites) the current getbpb/rwabs/mediach vectors --

@@ -101,6 +101,9 @@ void sidetnfs_floppy_emul_init(uint32_t memory_shared_address)
     s_install_gemdrive = true;  // mandatory fail-safe default, every Pico power-cycle
     s_install_floppy = false;
     publish_boot_policy(memory_shared_address);
+    // GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED/_EXIT_ACK_SEEN are reserved,
+    // unused fields (see their own comments in gemdrvemul.h) -- nothing
+    // reads or writes them any more, so no initialization needed here.
 }
 
 bool sidetnfs_floppy_emul_install_gemdrive(void) { return s_install_gemdrive; }

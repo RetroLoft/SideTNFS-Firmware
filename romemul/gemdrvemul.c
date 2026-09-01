@@ -3928,27 +3928,74 @@ static void floppy_select_switch_to_next_favorite(uint32_t memory_shared_address
     WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED, 1u);
 }
 
-// Threshold Phase 6B's long-press session-exit will also use -- defined
-// here, in the feature this session builds, rather than in Phase 6B's own
-// (not-yet-written) code, so both share one definition from the start.
+// Threshold Phase 6B's long-press session-exit also uses.
 #define SIDETNFS_FLOPPY_SELECT_LONGPRESS_MS 1500u
+
+// Phase 6B (revised design): the original plan tried an Atari-side VBL
+// callback that would poll GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED and
+// trigger an automatic warm reset. Abandoned on real hardware -- TOS's
+// own one-time VBL-queue setup (nvbls/vblqueue) turned out to run later,
+// and less predictably, than any of several tested trigger points
+// (cartridge boot-time install, first real Getbpb call, first real
+// Mediach call) could reliably wait for; see this project's own Phase 6B
+// investigation notes for the full trace (including a real, if dormant,
+// memory-corruption bug the early boot-time-install attempt caused by
+// scanning/writing into an uninitialized $456 pointer). Manual Atari
+// RESET is now the intentional design -- this function disables floppy
+// mode and gives the user an unambiguous LED confirmation that it is
+// safe to press RESET themselves; nothing here waits for, or depends on,
+// the Atari doing anything on its own.
+static void floppy_select_exit_led_confirm(void)
+{
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    sleep_ms(600);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+    sleep_ms(200);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    sleep_ms(150);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+    sleep_ms(200);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    sleep_ms(600);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+}
+
+// Long SELECT press: disable floppy-emu boot mode and clean up the
+// session immediately (no reason left to leave the backend open waiting
+// for an Atari-side reset that no longer happens on its own -- the
+// Atari's floppy hooks already fall through to their saved originals the
+// instant INSTALL_FLOPPY reads 0 on their next call, regardless of
+// whether this backend is open or closed). The LED sequence
+// (LONG-SHORT-LONG, ~1.75s total, blocking -- same established pattern
+// as this project's other user-feedback blink sequences, e.g. the SD
+// diagnostic dump's own blinks) is the ONLY confirmation the user gets;
+// it must complete before this returns so floppy_select_poll()'s
+// one-shot latch (set by the caller right after this call) can't let a
+// second long-press-tick re-enter mid-sequence.
+static void floppy_select_trigger_exit(uint32_t memory_shared_address)
+{
+    sidetnfs_floppy_emul_set_boot_policy(memory_shared_address, true, false);
+    sidetnfs_floppy_emul_close();
+    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX, FLOPPY_FAVORITE_INDEX_NONE);
+    floppy_select_exit_led_confirm();
+}
 
 // SELECT press/release state machine for floppy-emu sessions, replacing
 // the plain immediate-reboot select_button_action() call while floppy-emu
 // is active (see this function's own call site in the main loop for why
 // that call must be skipped, not merely raced against).
 //
-// Deliberately decides on RELEASE, never on press -- "do NOT perform the
-// short-press action immediately" -- so a hold that will eventually become
-// a long press in Phase 6B never fires a short-press Favorite switch
-// first. Uses sidetnfs_longpress_poll_step() (the same pure decision
-// function the boot-time 10s factory-reset hold already uses) every tick
-// while held, purely so Phase 6B has an existing, obvious hook point
-// (the TRIGGERED branch below) to add real "arm the exit" behavior to
-// without touching this function's edge-detection at all. Phase 6A's own
-// TRIGGERED handling is intentionally just a latch: it stops the eventual
-// release from ALSO being treated as a short press, and does nothing
-// else.
+// Deliberately decides on RELEASE for the short-press action, never on
+// press -- "do NOT perform the short-press action immediately" -- so a
+// hold that goes on to become a long press never fires a short-press
+// Favorite switch first. Uses sidetnfs_longpress_poll_step() (the same
+// pure decision function the boot-time 10s factory-reset hold already
+// uses) every tick while held. The long-press action itself fires
+// exactly once, the instant the threshold is crossed (not deferred to
+// release) -- s_floppy_select_long_press_seen both gates the one-shot
+// trigger and, doing double duty, suppresses the short-press carousel on
+// the eventual release, satisfying "holding SELECT for 5 or 10 seconds
+// must still produce only one exit action" without a second flag.
 static void floppy_select_poll(bool pressed_now, uint32_t memory_shared_address, bool network_ok)
 {
     static bool s_floppy_select_pressed_prev = false;
@@ -3968,9 +4015,10 @@ static void floppy_select_poll(bool pressed_now, uint32_t memory_shared_address,
         if (sidetnfs_longpress_poll_step(true, elapsed_ms, SIDETNFS_FLOPPY_SELECT_LONGPRESS_MS) ==
             SIDETNFS_LONGPRESS_TRIGGERED)
         {
-            // Phase 6B: session exit goes here (or gets armed here and
-            // executed on release -- undecided, deliberately left to that
-            // phase's own audit). Phase 6A does nothing but latch.
+            if (!s_floppy_select_long_press_seen)
+            {
+                floppy_select_trigger_exit(memory_shared_address);
+            }
             s_floppy_select_long_press_seen = true;
         }
     }

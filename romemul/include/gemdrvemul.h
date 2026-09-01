@@ -549,29 +549,30 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 // YES/NO is the mandatory fail-safe default, set in RAM on every Pico
 // power-cycle (never read from or written to flash -- these are pure
 // session/launch state, owned by FLOPPY.PRG for the duration of one
-// requested session) and restored exactly on a long-SELECT exit, before/
-// while the Atari resets (see RESET_REQUESTED below).
+// requested session) and restored on a long-SELECT exit
+// (floppy_select_trigger_exit() in gemdrvemul.c) -- the user then presses
+// Atari RESET manually; see RESET_REQUESTED's own comment for why this
+// isn't automatic.
 //
-// RESET_REQUESTED/EXIT_ACK_SEEN are deliberately plain fields, not
-// commands: the Atari-side VBL handler reads RESET_REQUESTED with an
-// ordinary passive load (no DMA-IRQ/lookup-table interaction at all --
-// that channel is scoped to a separate, narrow trigger sub-range, see
-// docs/sidetnfs-floppy-protocol.md), so this read is safe
-// unconditionally, even if a GEMDOS-relay command happens to be
-// mid-flight on the lookup channel at the same instant. Sending the ACK
-// back does need the lookup channel (the Atari has no direct-write path
-// to ROM3 on real hardware -- see GEMDRVEMUL_FLOPPY_EXIT_ACK's own
-// comment in commands.h), which is why that half of the handshake is a
-// real (if trivial, zero-payload, non-waiting) command instead of a
-// plain field.
+// RESET_REQUESTED/EXIT_ACK_SEEN: reserved, unused fields. An earlier
+// design had an Atari-side VBL callback poll RESET_REQUESTED and trigger
+// an automatic warm reset, acknowledged via GEMDRVEMUL_FLOPPY_EXIT_ACK.
+// Abandoned on real hardware -- TOS's own one-time VBL-queue setup
+// (nvbls/vblqueue) turned out to run later, and less predictably, than
+// any tested trigger point could reliably wait for (boot-time install,
+// first real Getbpb, first real Mediach all still saw an uninitialized
+// queue). Manual Atari RESET is the current, intentional design. Left
+// defined rather than removed/renumbered to avoid reshuffling the
+// working ROM3 layout for no benefit -- a future feature could still
+// reclaim them, but nothing does today.
 #define GEMDRVEMUL_FLOPPY_SESSION SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX)
 #define GEMDRVEMUL_FLOPPY_SESSION_STATUS (GEMDRVEMUL_FLOPPY_SESSION + 0)                          // uint32_t, swapped long -- status/error code, 0 = OK
 #define GEMDRVEMUL_FLOPPY_SESSION_GENERATION (GEMDRVEMUL_FLOPPY_SESSION_STATUS + 4)               // uint32_t, swapped long -- bumped by SESSION_START, lets a stale READ_SECTOR response be detected
 #define GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT (GEMDRVEMUL_FLOPPY_SESSION_GENERATION + 4)          // uint32_t, swapped long -- which of the 8 TNFS/SD source profiles
 #define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE (GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT + 4)    // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the GEMDOS-relay driver. Power-cycle default (and long-SELECT-exit restore value) is 1 (YES).
 #define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE + 2) // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the floppy hdv_*/XBIOS hooks. Power-cycle default (and long-SELECT-exit restore value) is 0 (NO).
-#define GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)  // uint16_t, plain word -- 0 = none, nonzero = Pico wants the Atari to reset (long-SELECT exit). Pico restores INSTALL_GEMDRIVE=YES/INSTALL_FLOPPY=NO before/while setting this.
-#define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED + 2)   // uint16_t, plain word -- Pico sets this once GEMDRVEMUL_FLOPPY_EXIT_ACK is received; diagnostic only, the Pico's own exit state machine is driven by the command arriving, not by polling this field
+#define GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)  // uint16_t, plain word -- RESERVED, UNUSED. Was: nonzero = Pico wants the Atari to reset. See this field's own comment above GEMDRVEMUL_FLOPPY_SESSION's #define for why the automatic-reset design was abandoned.
+#define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED + 2)   // uint16_t, plain word -- RESERVED, UNUSED. Was: set once GEMDRVEMUL_FLOPPY_EXIT_ACK was received. Same rationale as RESET_REQUESTED above.
 #define GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH (GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN + 2)        // char[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX] -- full path of the mounted image
 // SIDES/SECTORS_PER_TRACK/TRACKS are uint16_t, not uint8_t (Phase 3
 // correction) -- this codebase's shared-memory write macros
