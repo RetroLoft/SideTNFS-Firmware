@@ -240,7 +240,7 @@ char sidetnfs_probe_get_active_drive_letter(void);
 // comment). An earlier version of this reserved 8 slots (one per profile
 // index) to avoid re-mounting on every OPEN of the same already-open
 // profile -- that traded ~1.4KB of static RAM for a savings this project's
-// own RAM-discipline history (see sidetnfs_floppy_config.h) says isn't
+// own RAM-discipline history says isn't
 // worth it; re-mounting on an actual profile switch costs one ~200ms MOUNT
 // round trip, not a correctness problem.
 //

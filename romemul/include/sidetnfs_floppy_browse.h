@@ -71,14 +71,16 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define FLOPPY_BROWSE_CWD_LEN 256   // matches SIDETNFS_FLOPPY_LASTDIR_LEN / the Step 2 spec's "CWD max 256 bytes incl. terminator"
+#include "sidetnfs_floppy_emul.h" // sidetnfs_floppy_source_t -- mixed-source redesign, see sidetnfs_floppy_browse_open()'s own comment
+
+#define FLOPPY_BROWSE_CWD_LEN 256   // matches the Step 2 spec's "CWD max 256 bytes incl. terminator"
 #define FLOPPY_BROWSE_NAME_LEN 256  // matches the Step 2 spec's "each name max 256 bytes incl. terminator"
 #define FLOPPY_BROWSE_PAGE_ENTRIES 15 // Step 3: matches FM_MAX_VISIBLE_FILES (the Atari-side file manager's visible row count) -- was 25 (separate dirs/files pages) in Step 2
 
 typedef enum
 {
     FLOPPY_BROWSE_OK = 0,
-    FLOPPY_BROWSE_ERR_INVALID_PROFILE = 1,          // index out of range, or the slot is EMPTY
+    FLOPPY_BROWSE_ERR_INVALID_SOURCE = 1,           // backend is neither TNFS nor SD
     FLOPPY_BROWSE_ERR_SOURCE_NOT_CONFIGURED = 2,     // backend's required field (host/sd_path) is blank
     FLOPPY_BROWSE_ERR_TNFS_NOT_CONNECTED = 3,        // no WiFi, or host never resolved
     FLOPPY_BROWSE_ERR_TNFS_HOST_UNREACHABLE = 4,     // MOUNT sent, no response within the bounded wait, or mount rc != OK
@@ -95,20 +97,24 @@ typedef enum
     FLOPPY_BROWSE_STATUS_IN_PROGRESS = 15             // NOT an error: GET_PAGE's walk isn't finished yet -- caller must re-issue the IDENTICAL request (same generation/page_index) to resume it. See sidetnfs_floppy_browse_get_page()'s own comment.
 } sidetnfs_floppy_browse_status_t;
 
-// Opens `profile_index` for browsing: resolves the backend, establishes
-// (or reuses) a TNFS session for TNFS profiles, sets the CWD to the
-// profile's own stored last_directory (or root "/" if empty or no longer
-// valid on the backend), and starts a new generation. Any previously
-// active browse session (a different profile, or a stale CWD) is replaced
-// outright. *out_cwd is always left NUL-terminated and valid (root "/" on
-// any failure that leaves no better answer); *out_generation is always
+// Opens `source` for browsing: establishes (or reuses) a TNFS session for
+// a TNFS source (always mounts "/" -- mixed-source redesign, no more
+// firmware-side profile/flash lookup, no per-source mount_path), sets the
+// CWD to `start_directory` (FLOPPY.PRG's own CONFIG.CFG-configured
+// Browser start directory, or last-remembered position -- the firmware
+// no longer stores or cares which; root "/" if empty or not valid on the
+// backend), and starts a new generation. Any previously active browse
+// session (a different source, or a stale CWD) is replaced outright.
+// *out_cwd is always left NUL-terminated and valid (root "/" on any
+// failure that leaves no better answer); *out_generation is always
 // written. out_cwd_size must be >= FLOPPY_BROWSE_CWD_LEN.
 // `network_ok` mirrors gemdrvemul.c's own boot-time-latched
 // sidetnfs_network_ok local (WiFi confirmed up at boot) -- the same value
 // already threaded into sidetnfs_probe_classify_slot_error() elsewhere in
-// that file. Only consulted for a TNFS profile, to tell "no WiFi at all"
+// that file. Only consulted for a TNFS source, to tell "no WiFi at all"
 // apart from "WiFi is up but this host never resolved/responded".
-sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_index, bool network_ok,
+sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(const sidetnfs_floppy_source_t *source,
+                                                              const char *start_directory, bool network_ok,
                                                               uint32_t *out_generation, char *out_cwd,
                                                               size_t out_cwd_size);
 

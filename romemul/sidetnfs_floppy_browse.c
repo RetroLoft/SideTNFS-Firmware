@@ -6,7 +6,6 @@
  * already makes.
  */
 #include "include/sidetnfs_floppy_browse.h"
-#include "include/sidetnfs_floppy_config.h"
 #include "include/sidetnfs_probe.h"
 #include "include/sidetnfs_sd_service.h"
 #include "include/memfunc.h"
@@ -19,13 +18,12 @@
 typedef struct
 {
     bool open;
-    uint8_t backend; // SIDETNFS_FLOPPY_BACKEND_TNFS / _SD
-    uint8_t profile_index;
+    uint8_t backend; // SIDETNFS_FLOPPY_SOURCE_TNFS / _SD
     int tnfs_slot; // SIDETNFS_PROBE_FLOPPY_SLOT_BASE (single shared slot), TNFS only; -1 for SD
     // No stored mount_path here: TNFS paths sent to OPENDIRX are the CWD
     // alone (MOUNT already scoped the slot's session root to mount_path
     // server-side) -- see sidetnfs_floppy_browse_open()'s own comment.
-    char sd_root[SIDETNFS_FLOPPY_SDPATH_LEN];
+    char sd_root[FLOPPY_BROWSE_CWD_LEN];
     char cwd[FLOPPY_BROWSE_CWD_LEN];
     uint32_t generation;
 
@@ -188,7 +186,7 @@ static bool join_root_and_cwd(const char *root, const char *cwd, char *out, size
 // on the server. Harmless no-op if no walk is active.
 static void abandon_walk(void)
 {
-    if (s_browse.walk_active && s_browse.backend == SIDETNFS_FLOPPY_BACKEND_TNFS && s_browse.walk_tnfs_handle_open)
+    if (s_browse.walk_active && s_browse.backend == SIDETNFS_FLOPPY_SOURCE_TNFS && s_browse.walk_tnfs_handle_open)
     {
         sidetnfs_tnfs_raw_closedir(s_browse.tnfs_slot, s_browse.walk_tnfs_handle);
     }
@@ -200,7 +198,8 @@ static void abandon_walk(void)
 // BROWSE_OPEN
 // ------------------------------------------------------------------
 
-sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_index, bool network_ok,
+sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(const sidetnfs_floppy_source_t *source,
+                                                              const char *start_directory, bool network_ok,
                                                               uint32_t *out_generation, char *out_cwd,
                                                               size_t out_cwd_size)
 {
@@ -212,27 +211,26 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_inde
     snprintf(out_cwd, out_cwd_size, "/");
     abandon_walk();
 
-    if (profile_index >= SIDETNFS_FLOPPY_MAX_PROFILES)
+    if (source == NULL)
     {
-        return FLOPPY_BROWSE_ERR_INVALID_PROFILE;
-    }
-    sidetnfs_floppy_profile_config_t profile;
-    sidetnfs_floppy_config_status_t cfg_status = sidetnfs_floppy_config_get_profile(profile_index, &profile);
-    if (cfg_status != SIDETNFS_FLOPPY_STATUS_OK || !sidetnfs_floppy_profile_is_configured(&profile))
-    {
-        return FLOPPY_BROWSE_ERR_INVALID_PROFILE;
+        return FLOPPY_BROWSE_ERR_INVALID_SOURCE;
     }
 
+    // Mixed-source redesign: start_directory comes straight from
+    // FLOPPY.PRG's own request (its CONFIG.CFG-configured Browser start
+    // directory, or a remembered last position -- the firmware doesn't
+    // store or care which) instead of a firmware-side flash profile's
+    // last_directory field.
     char requested_cwd[FLOPPY_BROWSE_CWD_LEN];
-    if (profile.last_directory[0] == '\0' ||
-        !floppy_normalize_path(profile.last_directory, requested_cwd, sizeof(requested_cwd)))
+    if (start_directory == NULL || start_directory[0] == '\0' ||
+        !floppy_normalize_path(start_directory, requested_cwd, sizeof(requested_cwd)))
     {
         snprintf(requested_cwd, sizeof(requested_cwd), "/");
     }
 
-    if (profile.backend == SIDETNFS_FLOPPY_BACKEND_TNFS)
+    if (source->backend == SIDETNFS_FLOPPY_SOURCE_TNFS)
     {
-        if (profile.fields.tnfs.host[0] == '\0')
+        if (source->host[0] == '\0')
         {
             return FLOPPY_BROWSE_ERR_SOURCE_NOT_CONFIGURED;
         }
@@ -241,19 +239,18 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_inde
 
         // Only re-populate (which resets any live session -- see
         // sidetnfs_probe_set_slot_context()'s own contract) when the
-        // profile's own connection fields actually differ from whatever
+        // source's own connection fields actually differ from whatever
         // this shared slot currently holds -- repeated BROWSE_OPEN calls
-        // on the SAME already-connected profile must not pay a fresh
+        // on the SAME already-connected server must not pay a fresh
         // ~200ms MOUNT round trip every time. Switching to a DIFFERENT
-        // TNFS profile always re-populates (host/port/mount_path won't
-        // match) and pays that cost once, which is the trade this shared
-        // slot makes for a much smaller static RAM footprint than one
-        // slot per profile (see sidetnfs_probe.h).
+        // TNFS server always re-populates (host/port won't match) and
+        // pays that cost once. Always mounts "/" now -- the mixed-source
+        // redesign's fixed convention, no more per-source mount_path.
         sidetnfs_slot_tnfs_context_t existing;
         bool need_repopulate = true;
         if (sidetnfs_probe_get_slot_context(slot, &existing) && existing.valid &&
-            strcmp(existing.host, profile.fields.tnfs.host) == 0 && existing.port == profile.port &&
-            strcmp(existing.mount_path, profile.fields.tnfs.mount_path) == 0)
+            strcmp(existing.host, source->host) == 0 && existing.port == source->port &&
+            strcmp(existing.mount_path, "/") == 0)
         {
             need_repopulate = false;
         }
@@ -265,10 +262,9 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_inde
             cfg.drive_letter = 0; // never published as a GEMDOS drive -- outside g_runtime_drives[]/g_drive_number_table
             cfg.type = SIDETNFS_DRIVE_TNFS;
             cfg.transport = SIDETNFS_TRANSPORT_UDP;
-            cfg.port = profile.port;
-            strncpy(cfg.nickname, profile.nickname, sizeof(cfg.nickname) - 1);
-            strncpy(cfg.host, profile.fields.tnfs.host, sizeof(cfg.host) - 1);
-            strncpy(cfg.mount_path, profile.fields.tnfs.mount_path, sizeof(cfg.mount_path) - 1);
+            cfg.port = source->port;
+            strncpy(cfg.host, source->host, sizeof(cfg.host) - 1);
+            strncpy(cfg.mount_path, "/", sizeof(cfg.mount_path) - 1);
             sidetnfs_probe_set_slot_context(slot, &cfg);
         }
 
@@ -284,17 +280,11 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_inde
         }
 
         // Validate the requested CWD actually opens; fall back to root
-        // once if it doesn't (a stale last_directory -- a subdirectory
-        // deleted since the last browse -- must never leave BROWSE_OPEN
-        // permanently stuck). NOTE: the path sent to OPENDIRX is the CWD
-        // ALONE, never mount_path+CWD -- TNFS's own MOUNT command already
-        // scopes this slot's session root to mount_path server-side (same
-        // contract sidetnfs_probe.c's own send_opendirx_probe() documents:
-        // "MOUNT already scoped the session to '/Atari.ST', so '/' is its
-        // root"); re-prepending mount_path here would ask the server for
-        // <mount_path>/<mount_path>/... one level too deep, which is
-        // exactly the bug that made a real profile's BROWSE_OPEN return
-        // DIR_NOT_FOUND against its own configured root.
+        // once if it doesn't (a stale start_directory -- a subdirectory
+        // deleted since it was configured/remembered -- must never leave
+        // BROWSE_OPEN permanently stuck). The path sent to OPENDIRX is the
+        // CWD alone -- the server's own root, since MOUNT now always
+        // scopes the session to "/".
         uint8_t handle;
         SidetnfsTnfsDirOpenResult open_result = sidetnfs_tnfs_raw_opendir(slot, requested_cwd, &handle);
         if (open_result != SIDETNFS_TNFS_DIR_OK && strcmp(requested_cwd, "/") != 0)
@@ -312,57 +302,47 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_open(uint8_t profile_inde
         sidetnfs_tnfs_raw_closedir(slot, handle);
 
         s_browse.open = true;
-        s_browse.backend = SIDETNFS_FLOPPY_BACKEND_TNFS;
-        s_browse.profile_index = profile_index;
+        s_browse.backend = SIDETNFS_FLOPPY_SOURCE_TNFS;
         s_browse.tnfs_slot = slot;
     }
-    else if (profile.backend == SIDETNFS_FLOPPY_BACKEND_SD)
+    else if (source->backend == SIDETNFS_FLOPPY_SOURCE_SD)
     {
-        if (profile.fields.sd.sd_path[0] == '\0')
-        {
-            return FLOPPY_BROWSE_ERR_SOURCE_NOT_CONFIGURED;
-        }
         if (!sidetnfs_sd_service_has_run() || sidetnfs_sd_global_status() != SIDETNFS_SD_STATUS_READY)
         {
             return FLOPPY_BROWSE_ERR_SD_NOT_PRESENT;
         }
 
-        char sd_root[SIDETNFS_FLOPPY_SDPATH_LEN + 4];
-        snprintf(sd_root, sizeof(sd_root), "0:%s", profile.fields.sd.sd_path);
-        char fatfs_path[FLOPPY_BROWSE_CWD_LEN + SIDETNFS_FLOPPY_SDPATH_LEN + 4];
-        if (!join_root_and_cwd(sd_root, requested_cwd, fatfs_path, sizeof(fatfs_path)))
+        // start_directory doubles as this browse session's own root
+        // boundary (mixed-source redesign: no separate configured
+        // "root folder" field any more, unlike the removed flash
+        // profile's sd_path) -- CWD is always relative to it, "/" here
+        // means start_directory itself, matching TNFS's own "the CWD sent
+        // to the backend is relative to whatever the session is scoped
+        // to" convention.
+        char sd_root[FLOPPY_BROWSE_CWD_LEN + 4];
+        snprintf(sd_root, sizeof(sd_root), "0:%s", start_directory ? start_directory : "");
+        char fatfs_path[FLOPPY_BROWSE_CWD_LEN * 2 + 4];
+        if (!join_root_and_cwd(sd_root, "/", fatfs_path, sizeof(fatfs_path)))
         {
             return FLOPPY_BROWSE_ERR_PATH_TOO_LONG;
         }
         FILINFO fno;
         FRESULT fr = f_stat(fatfs_path, &fno);
-        if (!(fr == FR_OK && (fno.fattrib & AM_DIR)) && strcmp(requested_cwd, "/") != 0)
-        {
-            snprintf(requested_cwd, sizeof(requested_cwd), "/");
-            if (!join_root_and_cwd(sd_root, requested_cwd, fatfs_path, sizeof(fatfs_path)))
-            {
-                return FLOPPY_BROWSE_ERR_PATH_TOO_LONG;
-            }
-            fr = f_stat(fatfs_path, &fno);
-        }
         if (!(fr == FR_OK && (fno.fattrib & AM_DIR)))
         {
             return FLOPPY_BROWSE_ERR_DIR_NOT_FOUND;
         }
+        snprintf(requested_cwd, sizeof(requested_cwd), "/");
 
         s_browse.open = true;
-        s_browse.backend = SIDETNFS_FLOPPY_BACKEND_SD;
-        s_browse.profile_index = profile_index;
+        s_browse.backend = SIDETNFS_FLOPPY_SOURCE_SD;
         s_browse.tnfs_slot = -1;
-        strncpy(s_browse.sd_root, profile.fields.sd.sd_path, sizeof(s_browse.sd_root) - 1);
+        strncpy(s_browse.sd_root, start_directory ? start_directory : "", sizeof(s_browse.sd_root) - 1);
         s_browse.sd_root[sizeof(s_browse.sd_root) - 1] = '\0';
     }
     else
     {
-        // Invalid backend value on an otherwise-configured slot --
-        // sidetnfs_floppy_config_set_profile() already rejects this at
-        // write time, so this should be unreachable; defensive only.
-        return FLOPPY_BROWSE_ERR_SOURCE_NOT_CONFIGURED;
+        return FLOPPY_BROWSE_ERR_INVALID_SOURCE;
     }
 
     strncpy(s_browse.cwd, requested_cwd, sizeof(s_browse.cwd) - 1);
@@ -449,7 +429,7 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
     // Verify the candidate actually opens before ever committing to it --
     // a failed CHANGE_DIR must never change the active CWD.
     sidetnfs_floppy_browse_status_t verify_status;
-    if (s_browse.backend == SIDETNFS_FLOPPY_BACKEND_TNFS)
+    if (s_browse.backend == SIDETNFS_FLOPPY_SOURCE_TNFS)
     {
         // candidate_cwd alone, never mount_path+candidate_cwd -- see
         // sidetnfs_floppy_browse_open()'s own comment on why.
@@ -471,9 +451,9 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
     }
     else
     {
-        char sd_root[SIDETNFS_FLOPPY_SDPATH_LEN + 4];
+        char sd_root[FLOPPY_BROWSE_CWD_LEN + 4];
         snprintf(sd_root, sizeof(sd_root), "0:%s", s_browse.sd_root);
-        char fatfs_path[FLOPPY_BROWSE_CWD_LEN + SIDETNFS_FLOPPY_SDPATH_LEN + 4];
+        char fatfs_path[FLOPPY_BROWSE_CWD_LEN + FLOPPY_BROWSE_CWD_LEN + 4];
         if (!join_root_and_cwd(sd_root, candidate_cwd, fatfs_path, sizeof(fatfs_path)))
         {
             verify_status = FLOPPY_BROWSE_ERR_PATH_TOO_LONG;
@@ -570,10 +550,9 @@ sidetnfs_floppy_browse_status_t sidetnfs_floppy_browse_change_dir(uint32_t gener
 
 // Writes one entry name directly into the ROM3 shared-memory window --
 // byte-copy + CHANGE_ENDIANESS_BLOCK16, the same Pico->Atari string-field
-// convention every other command in this protocol already uses (see
-// GEMDRVEMUL_FLOPPY_GET_PROFILE's own dispatch handler). No RAM page
-// buffer is ever allocated for this -- see this project's own
-// RAM-discipline history (sidetnfs_floppy_config.h's top-of-file note).
+// convention every other command in this protocol already uses. No RAM
+// page buffer is ever allocated for this -- see this project's own
+// RAM-discipline history (this file's own header comment).
 static void write_page_entry(uint32_t memory_shared_address, uint32_t entries_offset, uint16_t slot_index,
                               const char *name)
 {
@@ -681,7 +660,7 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     bool backend_error = false;
     bool finished = false;
 
-    if (s_browse.backend == SIDETNFS_FLOPPY_BACKEND_TNFS)
+    if (s_browse.backend == SIDETNFS_FLOPPY_SOURCE_TNFS)
     {
         // One round budget spans BOTH phases within this call -- if phase
         // dirs reaches real EOF partway through the budget, phase files
@@ -811,9 +790,9 @@ floppy_browse_page_result_t sidetnfs_floppy_browse_get_page(uint32_t generation,
     {
         // SD: both phases always finish within this one call (no
         // unbounded network wait to chunk around).
-        char sd_root[SIDETNFS_FLOPPY_SDPATH_LEN + 4];
+        char sd_root[FLOPPY_BROWSE_CWD_LEN + 4];
         snprintf(sd_root, sizeof(sd_root), "0:%s", s_browse.sd_root);
-        char fatfs_path[FLOPPY_BROWSE_CWD_LEN + SIDETNFS_FLOPPY_SDPATH_LEN + 4];
+        char fatfs_path[FLOPPY_BROWSE_CWD_LEN + FLOPPY_BROWSE_CWD_LEN + 4];
         if (!join_root_and_cwd(sd_root, s_browse.cwd, fatfs_path, sizeof(fatfs_path)))
         {
             s_browse.walk_active = false;

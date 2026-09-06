@@ -16,10 +16,9 @@
 #include "sidetnfs_netconfig.h"
 #include "sidetnfs_rtcconfig.h"
 #include "sidetnfs_update_check.h" // SIDETNFS_UPDATE_VERSION_LEN -- see GEMDRVEMUL_SIDETNFS_UPDATE below
-#include "sidetnfs_floppy_config.h" // SIDETNFS_FLOPPY_* lengths -- see GEMDRVEMUL_FLOPPY_PROFILE below
 #include "sidetnfs_floppy_browse.h" // FLOPPY_BROWSE_CWD_LEN/_PAGE_ENTRIES -- see GEMDRVEMUL_FLOPPY_BROWSE/_PAGE below
-#include "sidetnfs_floppy_emul.h" // sidetnfs_floppy_emul_open/close/read_sector, boot-policy flags -- see GEMDRVEMUL_FLOPPY_SESSION_START/_READ_SECTOR handlers in gemdrvemul.c
-#include "tprotocol.h" // MAX_PROTOCOL_PAYLOAD_SIZE -- see SET_FLOPPY_PROFILE_PAYLOAD_BYTES below
+#include "sidetnfs_floppy_emul.h" // sidetnfs_floppy_source_t/sidetnfs_floppy_emul_open/close/read_sector, boot-policy flags -- see GEMDRVEMUL_FLOPPY_SESSION_START/_READ_SECTOR handlers in gemdrvemul.c
+#include "tprotocol.h" // MAX_PROTOCOL_PAYLOAD_SIZE
 #include "sidetnfs_probe.h" // SIDETNFS_NET_ERR_TEXT_MAX -- see FileDescriptors.net_err_text below
 #include "sidetnfs_sd_service.h" // SIDETNFS_SD_ERROR_TEXT_MAX -- see FileDescriptors.sd_error_text below
 
@@ -343,77 +342,27 @@ _Static_assert(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION % 2 == 0, "GEMDRVEMU
 _Static_assert(SIDETNFS_UPDATE_VERSION_LEN % 2 == 0, "SIDETNFS_UPDATE_VERSION_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN) <= 0x10000u, "GEMDRVEMUL_SIDETNFS_UPDATE block must fit within the 64KB ROM3 window");
 
-// FLOPPY.PRG server-profile config blocks (SideTNFS-Floppy-emulation
-// project, Step 1). Immediately follow the CHECK_UPDATE block above, same
-// ALIGN4(previous block's own end) placement every prior block in this
-// chain uses -- see romemul/include/sidetnfs_floppy_config.h for the
-// record/flash layout this response block mirrors field-for-field (same
-// convention GEMDRVEMUL_SIDETNFS_DRIVE mirrors sidetnfs_drive_config_t).
-// Entirely independent of every GEMDRVEMUL_SIDETNFS_* block above -- no
-// shared offsets, no shared fields.
-#define GEMDRVEMUL_FLOPPY_CONFIG SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN)
-#define GEMDRVEMUL_FLOPPY_CONFIG_VERSION (GEMDRVEMUL_FLOPPY_CONFIG + 0)                          // uint32_t, protocol version (1)
-#define GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES (GEMDRVEMUL_FLOPPY_CONFIG_VERSION + 4)             // uint32_t, SIDETNFS_FLOPPY_MAX_PROFILES
-#define GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT (GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES + 4)       // uint32_t, configured (DISABLED+ENABLED) profile count
-#define GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX (GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT + 4)       // uint32_t, active_profile_index
-#define GEMDRVEMUL_FLOPPY_CONFIG_STATUS (GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX + 4)               // uint32_t, status code (0 = OK)
-// Block ends at GEMDRVEMUL_FLOPPY_CONFIG_STATUS + 4 (20 bytes total).
-
-// Shared by GET_PROFILE (full) and by SET/DELETE/SET_ACTIVE_PROFILE/
-// SAVE_PROFILES (STATUS field only -- none of those four need the rest at
-// the same time, same reasoning GEMDRVEMUL_SIDETNFS_DRIVE's own comment
-// gives).
-// Fields sent as three independent, always-present strings (host,
-// mount_path, sd_path) rather than mirroring the firmware's own
-// space-saving TNFS/SD union (sidetnfs_floppy_backend_fields_t) -- the
-// ROM3 window has ~46KB of free headroom (see RESEARCH-STEP0.md section
-// 4.4) and this is not a static-RAM allocation on either side, so the
-// union's complexity buys nothing here and a union-free wire layout is
-// less error-prone to pack/unpack correctly on the Atari side.
-#define GEMDRVEMUL_FLOPPY_PROFILE (GEMDRVEMUL_FLOPPY_CONFIG_STATUS + 4)
-#define GEMDRVEMUL_FLOPPY_PROFILE_STATUS (GEMDRVEMUL_FLOPPY_PROFILE + 0)                          // uint32_t, swapped long
-#define GEMDRVEMUL_FLOPPY_PROFILE_STATE (GEMDRVEMUL_FLOPPY_PROFILE_STATUS + 4)                    // uint16_t, plain word
-#define GEMDRVEMUL_FLOPPY_PROFILE_BACKEND (GEMDRVEMUL_FLOPPY_PROFILE_STATE + 2)                   // uint16_t, plain word -- sidetnfs_floppy_backend_t
-#define GEMDRVEMUL_FLOPPY_PROFILE_PORT (GEMDRVEMUL_FLOPPY_PROFILE_BACKEND + 2)                    // uint16_t, plain word -- TNFS only
-#define GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME (GEMDRVEMUL_FLOPPY_PROFILE_PORT + 2)                   // char[SIDETNFS_FLOPPY_NICKNAME_LEN]
-#define GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY (GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME + SIDETNFS_FLOPPY_NICKNAME_LEN) // char[SIDETNFS_FLOPPY_LASTDIR_LEN]
-#define GEMDRVEMUL_FLOPPY_PROFILE_HOST (GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY + SIDETNFS_FLOPPY_LASTDIR_LEN)      // char[SIDETNFS_FLOPPY_HOST_LEN] -- TNFS only
-#define GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH (GEMDRVEMUL_FLOPPY_PROFILE_HOST + SIDETNFS_FLOPPY_HOST_LEN)             // char[SIDETNFS_FLOPPY_MOUNTPATH_LEN] -- TNFS only
-#define GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH (GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH + SIDETNFS_FLOPPY_MOUNTPATH_LEN)     // char[SIDETNFS_FLOPPY_SDPATH_LEN] -- SD only
-// Block ends at GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH + SIDETNFS_FLOPPY_SDPATH_LEN (642 bytes total: 4 status + 2 state + 2 backend + 2 port + 24 nickname + 256 last_directory + 64 host + 32 mount_path + 256 sd_path).
-
-_Static_assert(GEMDRVEMUL_FLOPPY_CONFIG_VERSION % 4 == 0, "GEMDRVEMUL_FLOPPY_CONFIG_VERSION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_STATE % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_STATE must be 2-byte aligned for WRITE_WORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_BACKEND % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_BACKEND must be 2-byte aligned for WRITE_WORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_PORT % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_PORT must be 2-byte aligned for WRITE_WORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME % 2 == 0, "GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME must be 2-byte aligned for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert(SIDETNFS_FLOPPY_NICKNAME_LEN % 2 == 0, "SIDETNFS_FLOPPY_NICKNAME_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert(SIDETNFS_FLOPPY_HOST_LEN % 2 == 0, "SIDETNFS_FLOPPY_HOST_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert(SIDETNFS_FLOPPY_MOUNTPATH_LEN % 2 == 0, "SIDETNFS_FLOPPY_MOUNTPATH_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert(SIDETNFS_FLOPPY_LASTDIR_LEN % 2 == 0, "SIDETNFS_FLOPPY_LASTDIR_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert(SIDETNFS_FLOPPY_SDPATH_LEN % 2 == 0, "SIDETNFS_FLOPPY_SDPATH_LEN must be even for CHANGE_ENDIANESS_BLOCK16");
-_Static_assert((GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH + SIDETNFS_FLOPPY_SDPATH_LEN) <= 0x10000u, "GEMDRVEMUL_FLOPPY_PROFILE block must fit within the 64KB ROM3 window");
-
-// SET_PROFILE request payload size, excluding the 4-byte token: index(4) +
-// state+backend+port(2 each=6) + strings (24+256+64+32+256=632) = 642 bytes.
-#define SET_FLOPPY_PROFILE_PAYLOAD_BYTES \
-    (4UL + 2UL * 3UL + (unsigned long)SIDETNFS_FLOPPY_NICKNAME_LEN + (unsigned long)SIDETNFS_FLOPPY_LASTDIR_LEN + \
-     (unsigned long)SIDETNFS_FLOPPY_HOST_LEN + (unsigned long)SIDETNFS_FLOPPY_MOUNTPATH_LEN + (unsigned long)SIDETNFS_FLOPPY_SDPATH_LEN)
-_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES == 642UL, "SET_FLOPPY_PROFILE_PAYLOAD_BYTES drifted from the documented request payload size");
-_Static_assert(SET_FLOPPY_PROFILE_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_SIZE - 64UL), "SET_PROFILE request payload must fit within the protocol's payload channel");
+// Formerly GEMDRVEMUL_FLOPPY_CONFIG/GEMDRVEMUL_FLOPPY_PROFILE (FLOPPY.PRG
+// server-profile config blocks, SideTNFS-Floppy-emulation project Step
+// 1). Removed in the mixed-source Favorites/Carousel redesign -- the
+// firmware no longer persists or knows about floppy source/mount
+// profiles at all; FLOPPY.PRG owns its own Browser source configuration
+// on local disk now. GEMDRVEMUL_FLOPPY_BROWSE below chains directly from
+// the CHECK_UPDATE block above instead.
 
 // FLOPPY.PRG LFN directory browser response blocks (SideTNFS-Floppy-
-// emulation project, Step 2). Immediately follow GEMDRVEMUL_FLOPPY_PROFILE
+// emulation project, Step 2). Immediately follow the CHECK_UPDATE block
 // above, same ALIGN4(previous block's own end) placement every block in
 // this chain uses. See romemul/include/sidetnfs_floppy_browse.h for the
 // backend/paging logic these two blocks carry the results of.
 //
 // GEMDRVEMUL_FLOPPY_BROWSE: response to BROWSE_OPEN/BROWSE_CHANGE_DIR --
-// status + generation + the resulting CWD. Request payloads for both
-// commands are small (profile index; or generation+go_up+name) and travel
-// through the normal payload channel, not through this block.
-#define GEMDRVEMUL_FLOPPY_BROWSE SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH + SIDETNFS_FLOPPY_SDPATH_LEN)
+// status + generation + the resulting CWD. BROWSE_OPEN's own request
+// (backend+host+port+start_directory) travels via send_write_sync bulk
+// transfer, not through this block; BROWSE_CHANGE_DIR's request
+// (generation+go_up+name) is small and travels through the normal
+// payload channel.
+#define GEMDRVEMUL_FLOPPY_BROWSE SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_SIDETNFS_UPDATE_INSTALLED_VERSION + SIDETNFS_UPDATE_VERSION_LEN)
 #define GEMDRVEMUL_FLOPPY_BROWSE_STATUS (GEMDRVEMUL_FLOPPY_BROWSE + 0)                    // uint32_t, swapped long -- sidetnfs_floppy_browse_status_t
 #define GEMDRVEMUL_FLOPPY_BROWSE_GENERATION (GEMDRVEMUL_FLOPPY_BROWSE_STATUS + 4)         // uint32_t, swapped long
 #define GEMDRVEMUL_FLOPPY_BROWSE_CWD (GEMDRVEMUL_FLOPPY_BROWSE_GENERATION + 4)            // char[FLOPPY_BROWSE_CWD_LEN] (256)
@@ -475,28 +424,57 @@ _Static_assert(FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_S
 // See docs/sidetnfs-floppy-protocol.md for the full command/wire writeup.
 // ---------------------------------------------------------------------
 
-// GEMDRVEMUL_FLOPPY_FAVORITES: packed Favorites table FLOPPY.PRG uploads
-// via GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHUNK/_WRITE_CHECK/_COMMIT before
-// GEMDRVEMUL_FLOPPY_SESSION_START. Deliberately NOT
+// GEMDRVEMUL_FLOPPY_FAVORITES: packed Favorites/Carousel table FLOPPY.PRG
+// uploads via GEMDRVEMUL_FLOPPY_FAVORITES_WRITE_CHUNK/_WRITE_CHECK/_COMMIT
+// before GEMDRVEMUL_FLOPPY_SESSION_START. Deliberately NOT
 // SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT fixed per-entry buffers (that would
 // be ~15KB for 256-byte entries, or 30KB for 512-byte ones) -- a compact
-// offset table into one shared packed-string area instead, per explicit
-// instruction. SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX (16 KiB) is a
-// deliberately generous, round budget -- NOT computed from
+// fixed-size record per slot pointing into one shared packed-string area,
+// per explicit instruction. SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX (16 KiB)
+// is a deliberately generous, round budget -- NOT computed from
 // MAX_COUNT * any per-path maximum -- real TNFS paths captured elsewhere
 // in this project run ~40-90 bytes, so 16 KiB comfortably covers 60
-// favorites with room to spare, while still leaving most of the ROM3
-// free tail available for the session block above and future extensions
-// (drive B:, .MSA, ...).
+// favorites (paths AND hostnames both packed into the same blob) with
+// room to spare.
+//
+// Mixed-source redesign: each entry is now fully self-contained --
+// backend + (TNFS only) host/port + path -- no source IDs, no slot
+// numbers, no session-wide "active profile" concept. This is what makes a
+// single Favorites list or Carousel able to mix SD and TNFS entries, and
+// even multiple different TNFS servers, freely. TNFS entries always mount
+// "/" on their own server (same fixed convention GEMDRVEMUL_FLOPPY_BROWSE_OPEN
+// now uses) -- there is no per-entry mount path any more, only the
+// complete path from that server's root.
 #define SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT 60u
 #define SIDETNFS_FLOPPY_FAVORITE_PATH_MAX 512u        // one full TNFS/SD path, NUL included -- matches FLOPPY.PRG's own 256(dir)+256(name) favorite fields joined
 #define SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX 16384u  // 16 KiB packed-string budget (fixed; see comment above)
-#define SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET 0xFFFFu // table sentinel: this slot has no favorite
-#define SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX 2048u     // matches the Atari driver's own BUFFER_WRITE_SIZE (gemdrive.s) -- reuses the proven WRITE_BUFF_CALL/CHECK chunk size, 8 rounds for a full 16 KiB blob
+#define SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET 0xFFFFu // strings-blob sentinel: no string (host_offset when backend==SD, or any offset field in an empty slot)
+#define SIDETNFS_FLOPPY_FAVORITES_CHUNK_MAX 2048u     // matches the Atari driver's own BUFFER_WRITE_SIZE (gemdrive.s) -- reuses the proven WRITE_BUFF_CALL/CHECK chunk size
+
+// Per-entry backend selector -- 0 means "empty slot" (replaces the old
+// path-offset-based emptiness sentinel: emptiness is now a property of
+// the whole entry, checked once via this one field, not implied by a
+// string offset). Values otherwise match sidetnfs_floppy_emul.h's
+// SIDETNFS_FLOPPY_SOURCE_TNFS/_SD exactly, so Pico-side code can use one
+// value directly as the other with no translation.
+#define SIDETNFS_FLOPPY_FAVORITE_BACKEND_EMPTY 0u
+
+// One fixed-size table record: backend(2) + port(2, TNFS only, 0 for SD)
+// + host_offset(2, into the shared strings blob, EMPTY_OFFSET for SD) +
+// path_offset(2, into the shared strings blob, always valid unless the
+// slot is empty). 8 bytes/entry -- small next to the 16 KiB strings
+// budget even at all 60 slots (480 bytes total), and every string
+// (host AND path both) still lives exactly once in the shared blob, never
+// duplicated into a fixed-size per-entry buffer.
+#define SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE 8u
+#define SIDETNFS_FLOPPY_FAVORITE_ENTRY_BACKEND 0u     // uint16_t, plain word, relative to this entry's own base
+#define SIDETNFS_FLOPPY_FAVORITE_ENTRY_PORT 2u        // uint16_t, plain word
+#define SIDETNFS_FLOPPY_FAVORITE_ENTRY_HOST_OFFSET 4u // uint16_t, plain word
+#define SIDETNFS_FLOPPY_FAVORITE_ENTRY_PATH_OFFSET 6u // uint16_t, plain word
 
 #define GEMDRVEMUL_FLOPPY_FAVORITES SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_PAGE_IS_DIR + (unsigned long)FLOPPY_BROWSE_PAGE_ENTRIES * 2UL)
 #define GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC (GEMDRVEMUL_FLOPPY_FAVORITES + 0)                       // uint32_t, swapped long -- "FAVS"
-#define GEMDRVEMUL_FLOPPY_FAVORITES_VERSION (GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC + 4)               // uint32_t, swapped long (1)
+#define GEMDRVEMUL_FLOPPY_FAVORITES_VERSION (GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC + 4)               // uint32_t, swapped long (2 -- mixed-source entry format)
 #define GEMDRVEMUL_FLOPPY_FAVORITES_COUNT (GEMDRVEMUL_FLOPPY_FAVORITES_VERSION + 4)               // uint16_t, plain word -- non-empty favorite count, valid only after COMMIT
 #define GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX (GEMDRVEMUL_FLOPPY_FAVORITES_COUNT + 2)          // uint16_t, plain word -- 0..59, meaningful only if COUNT > 0
 #define GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED (GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX + 2)   // uint32_t, swapped long -- bytes of the packed-string area actually populated, valid only after COMMIT
@@ -505,15 +483,14 @@ _Static_assert(FLOPPY_BROWSE_CHANGE_DIR_PAYLOAD_BYTES <= (MAX_PROTOCOL_PAYLOAD_S
 #define GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM (GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH + 2) // uint16_t, plain word -- WRITE_CHUNK response: Pico's own running-word checksum of the bytes it received, same algorithm/width as the existing GEMDRVEMUL_WRITE_CHK the Atari driver already computes locally and compares against, so WRITE_CHECK can reuse that exact compare-then-retry idiom
 // Phase 5: repurposed from an unused alignment placeholder into the
 // shared status field for WRITE_CHUNK/WRITE_CHECK/COMMIT (same
-// established convention this protocol already uses elsewhere -- e.g.
-// GET/SET/DELETE_PROFILE all share one PROFILE_STATUS field -- rather
-// than inventing a status field per command). Same ROM3 offset as
-// before, so no layout change; only the meaning was ever "reserved".
+// established convention this protocol already uses elsewhere). Same
+// ROM3 offset as before, so no layout change; only the meaning was ever
+// "reserved".
 #define GEMDRVEMUL_FLOPPY_FAVORITES_STATUS (GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM + 2)       // uint32_t, swapped long -- 0 = OK, nonzero = error (also keeps TABLE 4-byte aligned; header = 28 bytes)
-#define GEMDRVEMUL_FLOPPY_FAVORITES_TABLE (GEMDRVEMUL_FLOPPY_FAVORITES_STATUS + 4)                // uint16_t[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT] -- packed-string byte offset per slot, SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET = empty
-#define GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS (GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT * 2UL) // uint8_t[SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX] -- NUL-terminated full paths, packed consecutively
+#define GEMDRVEMUL_FLOPPY_FAVORITES_TABLE (GEMDRVEMUL_FLOPPY_FAVORITES_STATUS + 4)                // SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE-byte record[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT] -- see SIDETNFS_FLOPPY_FAVORITE_ENTRY_* above
+#define GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS (GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT * (unsigned long)SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE) // uint8_t[SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX] -- NUL-terminated host/path strings, packed consecutively
 // Block ends at GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX
-// (28 + 120 + 16384 = 16532 bytes total).
+// (28 + 480 + 16384 = 16892 bytes total).
 
 _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_MAGIC must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_VERSION % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_VERSION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
@@ -525,7 +502,8 @@ _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_LENGTH % 2 == 0, "GEMDRVEMUL_FL
 _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM % 2 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_CHUNK_CHECKSUM must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_TABLE % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_TABLE must be 4-byte aligned (header above it is exactly 28 bytes)");
-_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS must be 4-byte aligned (table above it is 120 bytes)");
+_Static_assert(SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE % 4 == 0, "SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE must be 4-byte aligned so every entry in the table stays 4-byte aligned too");
+_Static_assert(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS % 4 == 0, "GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS must be 4-byte aligned (table above it is SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT * SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE bytes)");
 _Static_assert(SIDETNFS_FLOPPY_FAVORITE_PATH_MAX % 2 == 0, "SIDETNFS_FLOPPY_FAVORITE_PATH_MAX must be even for CHANGE_ENDIANESS_BLOCK16");
 _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX) <= 0x10000u, "GEMDRVEMUL_FLOPPY_FAVORITES block must fit within the 64KB ROM3 window");
 
@@ -568,8 +546,13 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 #define GEMDRVEMUL_FLOPPY_SESSION SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX)
 #define GEMDRVEMUL_FLOPPY_SESSION_STATUS (GEMDRVEMUL_FLOPPY_SESSION + 0)                          // uint32_t, swapped long -- status/error code, 0 = OK
 #define GEMDRVEMUL_FLOPPY_SESSION_GENERATION (GEMDRVEMUL_FLOPPY_SESSION_STATUS + 4)               // uint32_t, swapped long -- bumped by SESSION_START, lets a stale READ_SECTOR response be detected
-#define GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT (GEMDRVEMUL_FLOPPY_SESSION_GENERATION + 4)          // uint32_t, swapped long -- which of the 8 TNFS/SD source profiles
-#define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE (GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT + 4)    // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the GEMDOS-relay driver. Power-cycle default (and long-SELECT-exit restore value) is 1 (YES).
+// Formerly GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT (which of the 8 TNFS/SD
+// source profiles the whole session used) -- removed in the mixed-source
+// redesign: there is no session-wide source any more, each Favorite/
+// Carousel entry carries its own backend+host+port (see
+// GEMDRVEMUL_FLOPPY_FAVORITES_TABLE's SIDETNFS_FLOPPY_FAVORITE_ENTRY_*
+// fields above).
+#define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE (GEMDRVEMUL_FLOPPY_SESSION_GENERATION + 4)    // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the GEMDOS-relay driver. Power-cycle default (and long-SELECT-exit restore value) is 1 (YES).
 #define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE + 2) // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the floppy hdv_*/XBIOS hooks. Power-cycle default (and long-SELECT-exit restore value) is 0 (NO).
 #define GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)  // uint16_t, plain word -- RESERVED, UNUSED. Was: nonzero = Pico wants the Atari to reset. See this field's own comment above GEMDRVEMUL_FLOPPY_SESSION's #define for why the automatic-reset design was abandoned.
 #define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED + 2)   // uint16_t, plain word -- RESERVED, UNUSED. Was: set once GEMDRVEMUL_FLOPPY_EXIT_ACK was received. Same rationale as RESET_REQUESTED above.
@@ -640,7 +623,6 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_STATUS must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_GENERATION % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_GENERATION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED must be 2-byte aligned for WRITE_WORD");

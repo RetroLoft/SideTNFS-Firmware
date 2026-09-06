@@ -3775,20 +3775,14 @@ static void publish_floppy_bpb(uint32_t memory_shared_address, uint32_t total_se
 // uncommitted rest of the 16KB buffer), and a string that would truncate
 // against out_path_size. Returns false, leaving *out_path untouched, on
 // any of the above.
-static bool floppy_favorites_get_path(uint32_t memory_shared_address, uint16_t index, char *out_path,
-                                       size_t out_path_size)
+// Reads one NUL-terminated string out of the shared packed-strings blob
+// at `offset`, bounds-checked against `strings_used`. Shared by
+// floppy_favorites_get_entry() for both the host and path strings of one
+// entry.
+static bool floppy_favorites_read_string(uint32_t memory_shared_address, uint16_t offset, uint32_t strings_used,
+                                          char *out, size_t out_size)
 {
-    if (index >= SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT || out_path == NULL || out_path_size == 0)
-    {
-        return false;
-    }
-    uint16_t offset = READ_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)index * 2UL);
-    if (offset == SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET)
-    {
-        return false;
-    }
-    uint32_t strings_used = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED);
-    if (strings_used > SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX || offset >= strings_used)
+    if (out == NULL || out_size == 0 || strings_used > SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX || offset >= strings_used)
     {
         return false;
     }
@@ -3799,12 +3793,64 @@ static bool floppy_favorites_get_path(uint32_t memory_shared_address, uint16_t i
     {
         return false; // not NUL-terminated within the committed strings area
     }
-    if (len >= out_path_size)
+    if (len >= out_size)
     {
-        return false; // would truncate -- reject rather than silently cut the path
+        return false; // would truncate -- reject rather than silently cut the string
     }
-    memcpy(out_path, src, len + 1);
+    memcpy(out, src, len + 1);
     return true;
+}
+
+// Mixed-source redesign: reads one favorite's full self-contained
+// descriptor (backend + TNFS host/port + path) out of
+// GEMDRVEMUL_FLOPPY_FAVORITES_TABLE's fixed-size per-entry record. Every
+// piece needed to open the image lives right here -- no session-wide
+// slot/profile lookup any more. out_source may be NULL for a caller that
+// only needs the path (see floppy_favorites_get_path() below).
+static bool floppy_favorites_get_entry(uint32_t memory_shared_address, uint16_t index,
+                                        sidetnfs_floppy_source_t *out_source, char *out_path, size_t out_path_size)
+{
+    if (index >= SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT || out_path == NULL || out_path_size == 0)
+    {
+        return false;
+    }
+    uint32_t entry_base =
+        GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)index * (unsigned long)SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE;
+    uint16_t backend = READ_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_BACKEND);
+    if (backend == SIDETNFS_FLOPPY_FAVORITE_BACKEND_EMPTY)
+    {
+        return false;
+    }
+    uint16_t port = READ_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_PORT);
+    uint16_t host_offset = READ_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_HOST_OFFSET);
+    uint16_t path_offset = READ_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_PATH_OFFSET);
+    uint32_t strings_used = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS_USED);
+
+    if (!floppy_favorites_read_string(memory_shared_address, path_offset, strings_used, out_path, out_path_size))
+    {
+        return false;
+    }
+    if (out_source)
+    {
+        memset(out_source, 0, sizeof(*out_source));
+        out_source->backend = (uint8_t)backend;
+        out_source->port = port;
+        if (backend == SIDETNFS_FLOPPY_SOURCE_TNFS &&
+            !floppy_favorites_read_string(memory_shared_address, host_offset, strings_used, out_source->host,
+                                           sizeof(out_source->host)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Path-only convenience wrapper for callers that don't need the source
+// (floppy_favorites_find_active_index()'s own path comparison).
+static bool floppy_favorites_get_path(uint32_t memory_shared_address, uint16_t index, char *out_path,
+                                       size_t out_path_size)
+{
+    return floppy_favorites_get_entry(memory_shared_address, index, NULL, out_path, out_path_size);
 }
 
 // SESSION_START-time only: scans every slot (not just 0..count-1 -- Test B
@@ -3888,18 +3934,23 @@ static void floppy_select_switch_to_next_favorite(uint32_t memory_shared_address
         return;
     }
 
+    // Mixed-source redesign: each Favorite carries its own backend+
+    // host+port -- no more session-wide active_slot resolved the same
+    // way for every entry, so a Carousel/Favorites list can freely mix
+    // SD and TNFS (even different TNFS servers) entries.
     char candidate_path[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
-    if (!floppy_favorites_get_path(memory_shared_address, next_index, candidate_path, sizeof(candidate_path)))
+    sidetnfs_floppy_source_t candidate_source;
+    if (!floppy_favorites_get_entry(memory_shared_address, next_index, &candidate_source, candidate_path,
+                                     sizeof(candidate_path)))
     {
         return; // table changed under us / corrupt entry -- fail closed
     }
 
-    uint32_t active_slot = READ_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT);
     sidetnfs_floppy_geometry_t candidate_geom;
-    if (sidetnfs_floppy_emul_open_candidate((uint8_t)active_slot, candidate_path, network_ok, &candidate_geom) !=
+    if (sidetnfs_floppy_emul_open_candidate(&candidate_source, candidate_path, network_ok, &candidate_geom) !=
         SIDETNFS_FLOPPY_EMUL_OK)
     {
-        return; // candidate invalid -- current working image remains fully untouched, no media-change event
+        return; // candidate invalid (bad path, OR its own source unreachable) -- current working image remains fully untouched, no media-change event
     }
 
     // Candidate is fully open and validated; s_state (the old image) is
@@ -5440,189 +5491,45 @@ void init_gemdrvemul(bool safe_config_reboot)
             active_command_id = 0xFFFF;
             break;
         }
-        case GEMDRVEMUL_FLOPPY_GET_CONFIG_INFO:
-        {
-            // Minimal, read-only probe. No request payload, no
-            // SD/WiFi/TNFS/flash access. Mirrors GEMDRVEMUL_SIDETNFS_GET_CONFIG_INFO's
-            // shape exactly, for the entirely independent FLOPPY.PRG
-            // profile store -- see romemul/include/sidetnfs_floppy_config.h.
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_VERSION, SIDETNFS_FLOPPY_CONFIG_FLASH_VERSION);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_MAX_PROFILES, sidetnfs_floppy_config_get_max_profiles());
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_PROFILE_COUNT, sidetnfs_floppy_config_get_profile_count());
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_ACTIVE_INDEX, sidetnfs_floppy_config_get_active_profile_index());
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_CONFIG_STATUS, SIDETNFS_FLOPPY_STATUS_OK);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
-        case GEMDRVEMUL_FLOPPY_GET_PROFILE:
-        {
-            // Read-only lookup of one profile record from the RAM
-            // profile list. Request: one uint32_t index. status is OK for
-            // EMPTY as much as for DISABLED/ENABLED -- only an
-            // out-of-range index is ever non-OK; the caller reads
-            // PROFILE_STATE to tell the three apart (same convention
-            // GEMDRVEMUL_SIDETNFS_GET_DRIVE uses). host/mount_path are
-            // only meaningful when PROFILE_BACKEND == TNFS, sd_path only
-            // when == SD -- both are always sent regardless (the ROM3
-            // window has ample headroom, see GEMDRVEMUL_FLOPPY_PROFILE's
-            // own comment in gemdrvemul.h), the caller is expected to
-            // ignore whichever doesn't apply.
-            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
-
-            sidetnfs_floppy_profile_config_t profile;
-            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_get_profile((uint8_t)profile_index, &profile);
-
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATE, (uint16_t)profile.state);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_BACKEND, (uint16_t)profile.backend);
-            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_PORT, profile.port);
-
-            // Pico->Atari string transfer: byte-copy + CHANGE_ENDIANESS_BLOCK16
-            // in place -- same hardware-proven pattern GET_DRIVE/populate_dta
-            // already use (see that case's own comment for the full
-            // hardware-test rationale; not repeated here).
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME), profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_NICKNAME, SIDETNFS_FLOPPY_NICKNAME_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY), profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_LAST_DIRECTORY, SIDETNFS_FLOPPY_LASTDIR_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST), profile.fields.tnfs.host, SIDETNFS_FLOPPY_HOST_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_HOST, SIDETNFS_FLOPPY_HOST_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH), profile.fields.tnfs.mount_path, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_MOUNT_PATH, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            memcpy((void *)(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH), profile.fields.sd.sd_path, SIDETNFS_FLOPPY_SDPATH_LEN);
-            CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_FLOPPY_PROFILE_SD_PATH, SIDETNFS_FLOPPY_SDPATH_LEN);
-
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
-        case GEMDRVEMUL_FLOPPY_SET_PROFILE:
-        {
-            // RAM-only write of one profile record. No flash access.
-            // Request payload mirrors GET_PROFILE's response field order
-            // (minus status): index, state, backend, port, then
-            // nickname/last_directory/host/mount_path/sd_path, read
-            // sequentially from payloadPtr -- same
-            // COPY_AND_CHANGE_ENDIANESS_BLOCK16 convention
-            // GEMDRVEMUL_SIDETNFS_SET_DRIVE already uses.
-            //
-            // host/mount_path/sd_path are decoded into separate PLAIN
-            // (non-union) local buffers first, then only the relevant
-            // one(s) for the record's own `backend` are copied into
-            // profile.fields (a union). Decoding straight into
-            // profile.fields.tnfs.* and profile.fields.sd.sd_path in wire
-            // order would silently corrupt whichever member is copied
-            // first: sd_path (256 bytes) fully overlaps and is a strict
-            // superset of host+mount_path's own 96 bytes at the same
-            // union offset, so writing it after host/mount_path -- or
-            // reading host/mount_path after sd_path -- always clobbers
-            // one with the other. Keeping the wire-decode step entirely
-            // union-free avoids that class of bug outright.
-            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
-            payloadPtr += 2;
-
-            sidetnfs_floppy_profile_config_t profile;
-            memset(&profile, 0, sizeof(profile));
-
-            profile.state = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
-            payloadPtr += 1;
-            profile.backend = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
-            payloadPtr += 1;
-            profile.port = GET_PAYLOAD_PARAM16(payloadPtr);
-            payloadPtr += 1;
-
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.nickname, SIDETNFS_FLOPPY_NICKNAME_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_NICKNAME_LEN / 2;
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, profile.last_directory, SIDETNFS_FLOPPY_LASTDIR_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_LASTDIR_LEN / 2;
-
-            char host_buf[SIDETNFS_FLOPPY_HOST_LEN];
-            char mount_path_buf[SIDETNFS_FLOPPY_MOUNTPATH_LEN];
-            char sd_path_buf[SIDETNFS_FLOPPY_SDPATH_LEN];
-
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, host_buf, SIDETNFS_FLOPPY_HOST_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_HOST_LEN / 2;
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, mount_path_buf, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_MOUNTPATH_LEN / 2;
-            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, sd_path_buf, SIDETNFS_FLOPPY_SDPATH_LEN);
-            payloadPtr += SIDETNFS_FLOPPY_SDPATH_LEN / 2;
-
-            if (profile.backend == SIDETNFS_FLOPPY_BACKEND_SD)
-            {
-                memcpy(profile.fields.sd.sd_path, sd_path_buf, SIDETNFS_FLOPPY_SDPATH_LEN);
-            }
-            else
-            {
-                // Default to the TNFS interpretation for backend==TNFS
-                // AND for any invalid backend value -- an invalid backend
-                // is rejected by sidetnfs_floppy_config_set_profile()'s
-                // own validation regardless of which union member ends up
-                // populated here, so this default is only ever
-                // load-bearing for the genuine TNFS case.
-                memcpy(profile.fields.tnfs.host, host_buf, SIDETNFS_FLOPPY_HOST_LEN);
-                memcpy(profile.fields.tnfs.mount_path, mount_path_buf, SIDETNFS_FLOPPY_MOUNTPATH_LEN);
-            }
-
-            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_set_profile((uint8_t)profile_index, &profile);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
-        case GEMDRVEMUL_FLOPPY_DELETE_PROFILE:
-        {
-            // RAM-only clear of one profile record. Request: one
-            // uint32_t index. Response: status only.
-            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
-            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_delete_profile((uint8_t)profile_index);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
-        case GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE:
-        {
-            // RAM-only change of the active profile index. No flash
-            // access. Request: one uint32_t index. Response: status only.
-            uint32_t profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
-            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_set_active_profile((uint8_t)profile_index);
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
-        case GEMDRVEMUL_FLOPPY_SAVE_PROFILES:
-        {
-            // The only command in this protocol that ever touches
-            // flash. Validates the full RAM profile list, then
-            // erases+programs exactly one 4KB flash sector, reads it back
-            // via XIP, and verifies magic/version/CRC before reporting
-            // success. Request: none. Response: status only.
-            sidetnfs_floppy_config_status_t result = sidetnfs_floppy_config_save();
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_PROFILE_STATUS, (uint32_t)result);
-            write_random_token(memory_shared_address);
-            active_command_id = 0xFFFF;
-            break;
-        }
         case GEMDRVEMUL_FLOPPY_BROWSE_OPEN:
         {
-            // Opens one profile for real LFN directory browsing (Step 2,
-            // see sidetnfs_floppy_browse.h) -- resolves the backend
-            // (TNFS session or SD path), sets the CWD to the profile's
-            // own stored last_directory (or root), starts a new browse
-            // generation. Request: one uint32_t profile index. Response:
-            // status + generation + CWD (GEMDRVEMUL_FLOPPY_BROWSE_*).
+            // Opens a source for real LFN directory browsing (Step 2, see
+            // sidetnfs_floppy_browse.h) -- resolves the backend (TNFS
+            // session or SD), sets the CWD to the request's own
+            // start_directory (or root), starts a new browse generation.
+            // Mixed-source redesign: the firmware no longer has a stored
+            // profile to resolve a plain index against, so this now
+            // carries backend+host+port+start_directory directly. Payload
+            // shape: backend(2)+port(2)+host(64)+start_directory(256), no
+            // leading header/skip -- FLOPPY.PRG's own wire mechanism
+            // (floppy_probe.c's send_command_start()+send_param16/32/
+            // string_field()) never prepends one, for any command, bulk
+            // or small (confirmed against its existing FAVORITES_WRITE_CHUNK/
+            // the old SET_PROFILE, both proven working) -- this is NOT the
+            // GEMDRIVE.BIN cartridge-ROM protocol's send_write_sync
+            // convention, a different Atari-side client entirely, and the
+            // two must not be conflated. Response unchanged: status +
+            // generation + CWD (GEMDRVEMUL_FLOPPY_BROWSE_*).
             // sidetnfs_network_ok is this function's own boot-time-latched
             // WiFi flag, same value sidetnfs_probe_classify_slot_error()
             // is already fed elsewhere in this switch.
-            uint32_t browse_open_profile_index = GET_PAYLOAD_PARAM32(payloadPtr);
+            sidetnfs_floppy_source_t browse_open_source;
+            memset(&browse_open_source, 0, sizeof(browse_open_source));
+            browse_open_source.backend = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            browse_open_source.port = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, browse_open_source.host, sizeof(browse_open_source.host));
+            payloadPtr += sizeof(browse_open_source.host) / 2;
+            char browse_open_start_directory[FLOPPY_BROWSE_CWD_LEN];
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, browse_open_start_directory, sizeof(browse_open_start_directory));
+            payloadPtr += sizeof(browse_open_start_directory) / 2;
 
             uint32_t browse_open_generation = 0;
             char browse_open_cwd[FLOPPY_BROWSE_CWD_LEN];
             sidetnfs_floppy_browse_status_t browse_open_result = sidetnfs_floppy_browse_open(
-                (uint8_t)browse_open_profile_index, sidetnfs_network_ok, &browse_open_generation, browse_open_cwd,
-                sizeof(browse_open_cwd));
+                &browse_open_source, browse_open_start_directory, sidetnfs_network_ok, &browse_open_generation,
+                browse_open_cwd, sizeof(browse_open_cwd));
 
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_STATUS, (uint32_t)browse_open_result);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_BROWSE_GENERATION, browse_open_generation);
@@ -5791,20 +5698,25 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_FLOPPY_FAVORITES_COMMIT:
         {
-            // Phase 5: request: table[60] (60 sequential plain uint16_t
-            // words -- numeric offsets, NOT a byte-blob string field, so
-            // no CHANGE_ENDIANESS_BLOCK16 involved, just 60 ordinary
-            // param16 reads) + count(2, param16) + active_index(2,
-            // param16) + strings_used(4, param32). All chunks must
-            // already be written+checked before this call -- this is
-            // what makes GEMDRVEMUL_FLOPPY_FAVORITES_COUNT/_ACTIVE_INDEX/
+            // Mixed-source redesign: request: table[60] (60 sequential
+            // 4-word records -- backend, port, host_offset, path_offset,
+            // per SIDETNFS_FLOPPY_FAVORITE_ENTRY_* -- plain uint16_t
+            // words, NOT a byte-blob string field, so no
+            // CHANGE_ENDIANESS_BLOCK16 involved, just ordinary param16
+            // reads) + count(2, param16) + active_index(2, param16) +
+            // strings_used(4, param32). All chunks must already be
+            // written+checked before this call -- this is what makes
+            // GEMDRVEMUL_FLOPPY_FAVORITES_COUNT/_ACTIVE_INDEX/
             // _STRINGS_USED trustworthy (see their own comments in
             // gemdrvemul.h: "valid only after COMMIT").
-            uint16_t fav_table[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT];
+            uint16_t fav_table[SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT][4];
             for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
             {
-                fav_table[i] = GET_PAYLOAD_PARAM16(payloadPtr);
-                payloadPtr += 1;
+                for (unsigned f = 0; f < 4; f++)
+                {
+                    fav_table[i][f] = GET_PAYLOAD_PARAM16(payloadPtr);
+                    payloadPtr += 1;
+                }
             }
             uint16_t fav_commit_count = GET_PAYLOAD_PARAM16(payloadPtr);
             payloadPtr += 1;
@@ -5823,7 +5735,24 @@ void init_gemdrvemul(bool safe_config_reboot)
             {
                 for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
                 {
-                    if (fav_table[i] != SIDETNFS_FLOPPY_FAVORITES_EMPTY_OFFSET && fav_table[i] >= fav_commit_strings_used)
+                    uint16_t entry_backend = fav_table[i][0];
+                    uint16_t entry_host_offset = fav_table[i][2];
+                    uint16_t entry_path_offset = fav_table[i][3];
+                    if (entry_backend == SIDETNFS_FLOPPY_FAVORITE_BACKEND_EMPTY)
+                    {
+                        continue; // empty slot -- host/path offsets irrelevant
+                    }
+                    if (entry_backend != SIDETNFS_FLOPPY_SOURCE_TNFS && entry_backend != SIDETNFS_FLOPPY_SOURCE_SD)
+                    {
+                        fav_commit_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR;
+                        break;
+                    }
+                    if (entry_path_offset >= fav_commit_strings_used)
+                    {
+                        fav_commit_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR;
+                        break;
+                    }
+                    if (entry_backend == SIDETNFS_FLOPPY_SOURCE_TNFS && entry_host_offset >= fav_commit_strings_used)
                     {
                         fav_commit_status = SIDETNFS_FLOPPY_EMUL_ERR_BACKEND_ERROR;
                         break;
@@ -5834,7 +5763,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             {
                 for (unsigned i = 0; i < SIDETNFS_FLOPPY_FAVORITES_MAX_COUNT; i++)
                 {
-                    WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)i * 2UL, fav_table[i]);
+                    uint32_t entry_base = GEMDRVEMUL_FLOPPY_FAVORITES_TABLE + (unsigned long)i * (unsigned long)SIDETNFS_FLOPPY_FAVORITE_ENTRY_SIZE;
+                    WRITE_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_BACKEND, fav_table[i][0]);
+                    WRITE_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_PORT, fav_table[i][1]);
+                    WRITE_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_HOST_OFFSET, fav_table[i][2]);
+                    WRITE_WORD(memory_shared_address, entry_base + SIDETNFS_FLOPPY_FAVORITE_ENTRY_PATH_OFFSET, fav_table[i][3]);
                 }
                 WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_COUNT, fav_commit_count);
                 WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_FAVORITES_ACTIVE_INDEX, fav_commit_active_index);
@@ -5848,17 +5781,25 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_FLOPPY_SESSION_START:
         {
-            // Phase 3: prepares a floppy session and publishes the
-            // requested Atari boot configuration -- does NOT switch any
-            // Pico-side mode (see this command's own comment in
-            // commands.h). Request: active_slot(4) + install_gemdrive(2)
-            // + install_floppy(2) + image_path
+            // Mixed-source redesign: prepares a floppy session and
+            // publishes the requested Atari boot configuration -- does
+            // NOT switch any Pico-side mode (see this command's own
+            // comment in commands.h). Request: backend(2)+port(2)+
+            // host(64) (the FIRST Carousel entry's own self-contained
+            // source -- no more session-wide active_slot) +
+            // install_gemdrive(2) + install_floppy(2) + image_path
             // (SIDETNFS_FLOPPY_FAVORITE_PATH_MAX, string field, ignored
             // when install_floppy==NO). Response: status + geometry
             // echo, or a cleared/OK state when install_floppy==NO --
             // "INSTALL_FLOPPY=NO must not require or validate an image".
-            uint32_t session_start_active_slot = GET_PAYLOAD_PARAM32(payloadPtr);
-            payloadPtr += 2;
+            sidetnfs_floppy_source_t session_start_source;
+            memset(&session_start_source, 0, sizeof(session_start_source));
+            session_start_source.backend = (uint8_t)GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            session_start_source.port = GET_PAYLOAD_PARAM16(payloadPtr);
+            payloadPtr += 1;
+            COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, session_start_source.host, sizeof(session_start_source.host));
+            payloadPtr += sizeof(session_start_source.host) / 2;
             bool session_start_install_gemdrive = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
             payloadPtr += 1;
             bool session_start_install_floppy = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
@@ -5874,7 +5815,7 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             if (session_start_install_floppy)
             {
-                session_start_result = sidetnfs_floppy_emul_open((uint8_t)session_start_active_slot,
+                session_start_result = sidetnfs_floppy_emul_open(&session_start_source,
                                                                     session_start_image_path, sidetnfs_network_ok,
                                                                     &session_start_geom);
             }
@@ -5897,7 +5838,6 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)session_start_result);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_GENERATION, (uint32_t)rand());
-            WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT, session_start_active_slot);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SIDES, session_start_geom.sides);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK, session_start_geom.sectors_per_track);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_TRACKS, session_start_geom.tracks);

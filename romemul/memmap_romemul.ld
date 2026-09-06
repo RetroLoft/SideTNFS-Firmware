@@ -38,23 +38,14 @@ MEMORY
        reuse. See romemul/include/sidetnfs_config.h. */
     SIDETNFS_CONFIG_FLASH(rwx) : ORIGIN = 0x10100000, LENGTH = 4k
 
-    /* SideTNFS-Floppy-emulation project, Step 1: FLOPPY.PRG server-profile
-       config sector. sidetnfs_system_config.h's own SIDETNFS_SYSTEM_CONFIG_FLASH
-       sector (0x10101000, 4k) is NOT reserved here as a MEMORY region --
-       only documented in that header's own comment -- which the Step 0
-       research report flagged as a real (if narrow) risk: nothing but a
-       hand-written comment proves its offset doesn't collide with a future
-       sector. This sector follows the stronger SIDETNFS_CONFIG_FLASH
-       precedent instead: an actual MEMORY region, so a future flash-layout
-       change gets a linker-enforced collision check. Immediately follows
-       SIDETNFS_SYSTEM_CONFIG_FLASH (0x10101000 + 4k = 0x10102000).
-       LENGTH grew from 4k to 8k when the SD-backend feature was added (a
-       v2 record with its 256-byte sd_path no longer fits 8 records in
-       4KB) -- the extra 4KB (0x103000-0x104000) is, like the original
-       reservation, confirmed free flash (see RESEARCH-STEP0.md section 8;
-       ~880KB free from this point to the end of the FLASH region). See
-       romemul/include/sidetnfs_floppy_config.h. */
-    SIDETNFS_FLOPPY_CONFIG_FLASH(rwx) : ORIGIN = 0x10102000, LENGTH = 8k
+    /* 0x10102000-0x10104000 (8k): formerly SIDETNFS_FLOPPY_CONFIG_FLASH,
+       the FLOPPY.PRG server-profile config sector removed in the
+       mixed-source Favorites/Carousel redesign (the firmware no longer
+       persists or knows about floppy source/mount profiles at all --
+       FLOPPY.PRG owns its own Browser source configuration on local
+       disk now). Deliberately left unreserved here rather than
+       repurposed immediately -- confirmed free flash (see
+       RESEARCH-STEP0.md section 8), available for a future sector. */
 }
 
 ENTRY(_entry_point)

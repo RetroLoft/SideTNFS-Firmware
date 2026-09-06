@@ -25,10 +25,32 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+// Mixed-source redesign: a floppy image's source is now described
+// entirely by the caller, per call -- no profile index, no firmware-side
+// flash-persisted profile store (removed; FLOPPY.PRG owns Browser source
+// configuration on its own local disk now). TNFS always mounts "/" on
+// its own server -- there is no mount_path field any more, only the
+// complete path from that server's root (passed separately as
+// image_path/start_directory by each caller).
+typedef enum
+{
+    SIDETNFS_FLOPPY_SOURCE_TNFS = 1,
+    SIDETNFS_FLOPPY_SOURCE_SD = 2
+} sidetnfs_floppy_source_backend_t;
+
+#define SIDETNFS_FLOPPY_HOST_LEN 64u // TNFS hostname, NUL included
+
+typedef struct
+{
+    uint8_t backend;                    // sidetnfs_floppy_source_backend_t
+    uint16_t port;                      // TNFS only, meaningless for SD
+    char host[SIDETNFS_FLOPPY_HOST_LEN]; // TNFS only, meaningless/blank for SD
+} sidetnfs_floppy_source_t;
+
 typedef enum
 {
     SIDETNFS_FLOPPY_EMUL_OK = 0,
-    SIDETNFS_FLOPPY_EMUL_ERR_INVALID_PROFILE = 1,      // profile index out of range, EMPTY, or an invalid/unrecognized backend value
+    SIDETNFS_FLOPPY_EMUL_ERR_INVALID_SOURCE = 1,       // backend is neither TNFS nor SD
     SIDETNFS_FLOPPY_EMUL_ERR_SOURCE_NOT_CONFIGURED = 2, // backend's required field (host/sd_path) is blank
     SIDETNFS_FLOPPY_EMUL_ERR_TNFS_NOT_CONNECTED = 3,    // no WiFi, or host never resolved
     SIDETNFS_FLOPPY_EMUL_ERR_TNFS_HOST_UNREACHABLE = 4, // MOUNT sent, no response within the bounded wait, or mount rc != OK
@@ -138,14 +160,16 @@ static inline sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_validate_geomet
     return SIDETNFS_FLOPPY_EMUL_OK;
 }
 
-// Closes any open backend (TNFS handle or SD file), then resolves
-// profile_index's configured source, opens image_path read-only, and
-// validates it (file size, BPB, geometry -- see the .c file's own
+// Closes any open backend (TNFS handle or SD file), then opens the given
+// source's image_path read-only (a COMPLETE path -- from the TNFS
+// server's own root, since it always mounts "/", or the complete SD
+// path; there is no separate mount-path/root-folder concept any more)
+// and validates it (file size, BPB, geometry -- see the .c file's own
 // top-of-function comment for the exact algorithm). On ANY failure
-// (including image_path == NULL/empty), no backend is left open and
-// *out_geom is left zeroed. On success, *out_geom is filled and the
-// image is ready for sidetnfs_floppy_emul_read_sector().
-sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open(uint8_t profile_index, const char *image_path,
+// (including image_path == NULL/empty, or source == NULL), no backend is
+// left open and *out_geom is left zeroed. On success, *out_geom is
+// filled and the image is ready for sidetnfs_floppy_emul_read_sector().
+sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open(const sidetnfs_floppy_source_t *source, const char *image_path,
                                                           bool network_ok, sidetnfs_floppy_geometry_t *out_geom);
 
 // Phase 6A candidate-swap transaction -- see sidetnfs_floppy_emul_open()'s
@@ -172,7 +196,7 @@ sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open(uint8_t profile_index, c
 //      backend is untouched. sidetnfs_floppy_emul_discard_candidate() is
 //      available for a caller that opened a candidate but decides, for
 //      its own reasons, not to commit it after all.
-sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open_candidate(uint8_t profile_index, const char *image_path,
+sidetnfs_floppy_emul_status_t sidetnfs_floppy_emul_open_candidate(const sidetnfs_floppy_source_t *source, const char *image_path,
                                                                      bool network_ok,
                                                                      sidetnfs_floppy_geometry_t *out_geom);
 void sidetnfs_floppy_emul_commit_candidate(void);

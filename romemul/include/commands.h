@@ -202,38 +202,33 @@
 // in gemdrvemul.h.
 #define GEMDRVEMUL_SIDETNFS_CHECK_UPDATE (APP_GEMDRVEMUL << 8 | 0x1C) // Check github for a newer firmware version
 
-// FLOPPY.PRG server-profile config (SideTNFS-Floppy-emulation project,
-// Step 1). Subcommands 0x1D-0x22, re-verified free (highest used low code
-// before this addition was 0x1C/CHECK_UPDATE, next used is 0x36/
-// GEMDRVEMUL_DFREE_CALL -- 0x1D-0x35 free, see GEMDRVEMUL_REBOOT_PICO's own
-// comment above). Entirely independent from the SIDETNFS drive-list
-// commands above (0x0D-0x12): these describe up to
-// SIDETNFS_FLOPPY_MAX_PROFILES TNFS *sources* FLOPPY.PRG browses for
-// floppy images, never a GEMDOS drive -- no drive letter, no interaction
-// with the GEMDOS drive list or the active TNFS session. See
-// romemul/include/sidetnfs_floppy_config.h for the wire/flash format and
-// the SideTNFS-Floppy-emulation project's RESEARCH-STEP0.md for the design
-// rationale.
-#define GEMDRVEMUL_FLOPPY_GET_CONFIG_INFO (APP_GEMDRVEMUL << 8 | 0x1D)   // Get FLOPPY.PRG profile-store info (max/count/active index)
-#define GEMDRVEMUL_FLOPPY_GET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1E)      // Get one floppy server-profile record
-#define GEMDRVEMUL_FLOPPY_SET_PROFILE (APP_GEMDRVEMUL << 8 | 0x1F)      // Set one floppy server-profile record (RAM only)
-#define GEMDRVEMUL_FLOPPY_DELETE_PROFILE (APP_GEMDRVEMUL << 8 | 0x20)   // Delete one floppy server-profile record (RAM only)
-#define GEMDRVEMUL_FLOPPY_SET_ACTIVE_PROFILE (APP_GEMDRVEMUL << 8 | 0x21) // Set the active profile index (RAM only)
-#define GEMDRVEMUL_FLOPPY_SAVE_PROFILES (APP_GEMDRVEMUL << 8 | 0x22)    // Persist the RAM profile list to flash
+// Subcommands 0x1D-0x22: formerly FLOPPY.PRG server-profile config
+// (GET_CONFIG_INFO/GET_PROFILE/SET_PROFILE/DELETE_PROFILE/
+// SET_ACTIVE_PROFILE/SAVE_PROFILES). Removed in the mixed-source
+// Favorites/Carousel redesign -- the firmware no longer persists or
+// knows about floppy source/mount profiles in flash at all; FLOPPY.PRG
+// owns its own Browser source configuration (CONFIG.CFG) on local disk
+// now, with zero round-trips to the Pico for source management. Left
+// free, not reused immediately.
 
 // FLOPPY.PRG LFN directory browser (Step 2/3). Subcommands 0x23-0x25, from
 // the range the block above already reserved for this (0x26 free again as
 // of Step 3 -- GET_DIR_PAGE/GET_FILE_PAGE merged into one GET_PAGE, see
-// below). Browses ONE active profile's real TNFS/SD source directly -- no
-// GEMDOS drive/letter, no Fsfirst/Fsnext, no 8.3 conversion, no name
-// aliasing. Exactly one CWD is active at a time (see
-// sidetnfs_floppy_browse.h); a generation counter bumped by
-// OPEN/CHANGE_DIR lets GET_PAGE detect a stale request (e.g. the Atari
-// asking for a page from a directory it has since left). See
-// romemul/include/sidetnfs_floppy_browse.h for status codes and
+// below). Browses ONE active source directly -- no GEMDOS drive/letter,
+// no Fsfirst/Fsnext, no 8.3 conversion, no name aliasing. Exactly one CWD
+// is active at a time (see sidetnfs_floppy_browse.h); a generation
+// counter bumped by OPEN/CHANGE_DIR lets GET_PAGE detect a stale request
+// (e.g. the Atari asking for a page from a directory it has since left).
+// See romemul/include/sidetnfs_floppy_browse.h for status codes and
 // romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_BROWSE/_PAGE) for the
 // wire layout.
-#define GEMDRVEMUL_FLOPPY_BROWSE_OPEN (APP_GEMDRVEMUL << 8 | 0x23)       // Open a profile for browsing (resolves backend/session, CWD = last_directory or root)
+//
+// BROWSE_OPEN's request shape changed with the mixed-source redesign:
+// backend(2) + port(2) + host(64) + start_directory(256), in that order,
+// no leading header/skip of any kind -- since the firmware no longer has
+// a stored profile to resolve a plain index against. TNFS always mounts
+// "/" now; there is no mount_path field any more.
+#define GEMDRVEMUL_FLOPPY_BROWSE_OPEN (APP_GEMDRVEMUL << 8 | 0x23)       // Open a source for browsing (resolves backend/session, CWD = start_directory or root)
 #define GEMDRVEMUL_FLOPPY_BROWSE_CHANGE_DIR (APP_GEMDRVEMUL << 8 | 0x24) // Change the active CWD (subdir name, or go-up)
 // Step 3: ONE combined page (dirs listed before files, GEMDRVEMUL_FLOPPY_PAGE_IS_DIR
 // says which is which per slot) instead of separate dir/file pages -- was
@@ -281,8 +276,12 @@
 // gemdrvemul.h for the four valid combinations). FLOPPY.PRG sets these
 // two flags however it needs (e.g. NO/YES for a clean floppy-only boot,
 // YES/YES to keep GEMDOS drives too) before triggering its own reset;
-// this command does not reset the Atari itself. Request: active_slot(4)
-// + image path (string field). Response: status + geometry echo (see
+// this command does not reset the Atari itself. Mixed-source redesign:
+// request is now backend(2)+port(2)+host(64) (the FIRST Carousel entry's
+// own self-contained source, same shape as one Favorites/Carousel table
+// entry -- no more session-wide active_slot) + install_gemdrive(2) +
+// install_floppy(2) + image path (string field). Response: status +
+// geometry echo (see
 // GEMDRVEMUL_FLOPPY_SESSION_SIDES/_SECTORS_PER_TRACK/_TRACKS/_BYTES_PER_SECTOR).
 #define GEMDRVEMUL_FLOPPY_SESSION_START (APP_GEMDRVEMUL << 8 | 0x29) // Validate the image, prepare the floppy session, publish the requested Atari boot configuration
 
