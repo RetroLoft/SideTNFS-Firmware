@@ -5787,9 +5787,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             // comment in commands.h). Request: backend(2)+port(2)+
             // host(64) (the FIRST Carousel entry's own self-contained
             // source -- no more session-wide active_slot) +
-            // install_gemdrive(2) + install_floppy(2) + image_path
-            // (SIDETNFS_FLOPPY_FAVORITE_PATH_MAX, string field, ignored
-            // when install_floppy==NO). Response: status + geometry
+            // install_gemdrive(2) + install_floppy(2) + drive_number(2) +
+            // image_path (SIDETNFS_FLOPPY_FAVORITE_PATH_MAX, string field,
+            // ignored when install_floppy==NO). Response: status + geometry
             // echo, or a cleared/OK state when install_floppy==NO --
             // "INSTALL_FLOPPY=NO must not require or validate an image".
             sidetnfs_floppy_source_t session_start_source;
@@ -5803,6 +5803,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             bool session_start_install_gemdrive = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
             payloadPtr += 1;
             bool session_start_install_floppy = GET_PAYLOAD_PARAM16(payloadPtr) != 0;
+            payloadPtr += 1;
+            // Clamped, not trusted as-is -- floppy.s only ever compares a
+            // disk_number of 0 or 1 against this field; any other value
+            // would make the emulated drive unreachable from either unit.
+            uint16_t session_start_drive_number = GET_PAYLOAD_PARAM16(payloadPtr) != 0 ? 1u : 0u;
             payloadPtr += 1;
             char session_start_image_path[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX];
             COPY_AND_CHANGE_ENDIANESS_BLOCK16(payloadPtr, session_start_image_path, SIDETNFS_FLOPPY_FAVORITE_PATH_MAX);
@@ -5838,6 +5843,11 @@ void init_gemdrvemul(bool safe_config_reboot)
 
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_STATUS, (uint32_t)session_start_result);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_GENERATION, (uint32_t)rand());
+            // Published regardless of install_floppy/validation outcome, same
+            // as INSTALL_GEMDRIVE/INSTALL_FLOPPY above -- floppy.s reads it
+            // unconditionally on every hook call, gated by INSTALL_FLOPPY
+            // itself, not by this field's own freshness.
+            WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER, session_start_drive_number);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SIDES, session_start_geom.sides);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK, session_start_geom.sectors_per_track);
             WRITE_WORD(memory_shared_address, GEMDRVEMUL_FLOPPY_SESSION_TRACKS, session_start_geom.tracks);

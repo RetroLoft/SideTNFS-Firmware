@@ -242,10 +242,11 @@
 // -- 0x26-0x35 free). Entirely independent from the browser commands
 // above (0x1D-0x25): those describe browsing a source directory, these
 // describe an active floppy-emulation SESSION (one mounted .ST image on
-// virtual drive A:, one packed Favorites table). See
+// virtual drive A: or B: -- see GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,
+// exactly one of the two, never both -- one packed Favorites table). See
 // romemul/include/gemdrvemul.h (GEMDRVEMUL_FLOPPY_FAVORITES/_SESSION) for
 // the wire layout. GEMDRVEMUL_FLOPPY_EXIT_ACK (0x2B) is RESERVED, UNUSED
-// -- see GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED's own comment in
+// -- see GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN's own comment in
 // gemdrvemul.h for why the automatic-reset design it was part of got
 // abandoned in favor of a manual Atari RESET.
 //
@@ -280,8 +281,9 @@
 // request is now backend(2)+port(2)+host(64) (the FIRST Carousel entry's
 // own self-contained source, same shape as one Favorites/Carousel table
 // entry -- no more session-wide active_slot) + install_gemdrive(2) +
-// install_floppy(2) + image path (string field). Response: status +
-// geometry echo (see
+// install_floppy(2) + drive_number(2) (0=A:/1=B:, which unit
+// INSTALL_FLOPPY emulates -- ignored when install_floppy==NO) + image path
+// (string field). Response: status + geometry echo (see
 // GEMDRVEMUL_FLOPPY_SESSION_SIDES/_SECTORS_PER_TRACK/_TRACKS/_BYTES_PER_SECTOR).
 #define GEMDRVEMUL_FLOPPY_SESSION_START (APP_GEMDRVEMUL << 8 | 0x29) // Validate the image, prepare the floppy session, publish the requested Atari boot configuration
 
@@ -293,8 +295,11 @@
 // Atari-writable on real hardware (see GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA's
 // own comment in gemdrvemul.h), so the LBA has to travel as an ordinary
 // command payload like anything else the Atari sends. No drive/track/
-// side/count fields: drive A: is implicit (the only drive this MVP
-// emulates), and the Atari-side hdv_rw hook is responsible for converting
+// side/count fields: which drive (A: or B:, GEMDRVEMUL_FLOPPY_SESSION_
+// DRIVE_NUMBER) is implicit -- this session emulates exactly one drive at
+// a time, so once floppy.s's own hook has matched disk_number against it
+// there is nothing left to disambiguate here -- and the Atari-side hdv_rw
+// hook is responsible for converting
 // TOS's own track/side/sector BIOS parameters into this one LBA value
 // before sending the request -- exactly the same layering the existing
 // GEMDOS relay already uses (GEMDOS-level concepts never leak into the
@@ -311,8 +316,10 @@
 
 // RESERVED, UNUSED -- no handler exists on the Pico side. Was going to be
 // a fire-and-forget ACK an Atari-side VBL handler sent back in response
-// to GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED, as part of the abandoned
-// automatic-reset design (see that field's own comment in gemdrvemul.h).
+// to a "reset requested" flag (the slot that field used has since been
+// reclaimed for GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER), as part of the
+// abandoned automatic-reset design (see GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN's
+// own comment in gemdrvemul.h).
 // Long-SELECT exit now disables floppy mode and confirms via LED
 // (floppy_select_trigger_exit() in gemdrvemul.c); the user presses Atari
 // RESET manually. Left defined, not renumbered, to avoid reshuffling the

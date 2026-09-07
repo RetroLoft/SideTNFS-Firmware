@@ -521,7 +521,8 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 // reads at boot:
 //   INSTALL_GEMDRIVE -- install the GEMDOS-relay driver (TNFS/SD drives)
 //   INSTALL_FLOPPY    -- install the hdv_bpb/hdv_rw/hdv_mediach/XBIOS
-//                        floppy hooks for virtual drive A:
+//                        floppy hooks for virtual drive A: or B: (see
+//                        DRIVE_NUMBER below -- exactly one, never both)
 // All four combinations are valid (YES/NO = normal SideTNFS, NO/YES =
 // clean floppy-only boot, NO/NO = neither installed, YES/YES = both).
 // YES/NO is the mandatory fail-safe default, set in RAM on every Pico
@@ -532,9 +533,9 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 // Atari RESET manually; see RESET_REQUESTED's own comment for why this
 // isn't automatic.
 //
-// RESET_REQUESTED/EXIT_ACK_SEEN: reserved, unused fields. An earlier
-// design had an Atari-side VBL callback poll RESET_REQUESTED and trigger
-// an automatic warm reset, acknowledged via GEMDRVEMUL_FLOPPY_EXIT_ACK.
+// EXIT_ACK_SEEN: reserved, unused field. An earlier design had an
+// Atari-side VBL callback poll a "reset requested" flag and trigger an
+// automatic warm reset, acknowledged via GEMDRVEMUL_FLOPPY_EXIT_ACK.
 // Abandoned on real hardware -- TOS's own one-time VBL-queue setup
 // (nvbls/vblqueue) turned out to run later, and less predictably, than
 // any tested trigger point could reliably wait for (boot-time install,
@@ -542,7 +543,17 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 // queue). Manual Atari RESET is the current, intentional design. Left
 // defined rather than removed/renumbered to avoid reshuffling the
 // working ROM3 layout for no benefit -- a future feature could still
-// reclaim them, but nothing does today.
+// reclaim it, but nothing does today. Its neighbor (the old
+// RESET_REQUESTED slot) has already been reclaimed this way, for
+// DRIVE_NUMBER below.
+//
+// DRIVE_NUMBER (reclaimed from the former RESET_REQUESTED slot, same
+// offset -- see above): which Atari floppy unit INSTALL_FLOPPY emulates,
+// 0 = drive A: (the default, matching this block's own power-cycle
+// default policy), 1 = drive B:. The user picks A or B exclusively, never
+// both, in the Carousel's Start dialog -- floppy.s's hdv_bpb/hdv_rw/
+// hdv_mediach/XBIOS hooks compare the caller's disk_number against this
+// field instead of a hardcoded 0.
 #define GEMDRVEMUL_FLOPPY_SESSION SIDETNFS_NETWORK_ALIGN4(GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FLOPPY_FAVORITES_STRINGS_MAX)
 #define GEMDRVEMUL_FLOPPY_SESSION_STATUS (GEMDRVEMUL_FLOPPY_SESSION + 0)                          // uint32_t, swapped long -- status/error code, 0 = OK
 #define GEMDRVEMUL_FLOPPY_SESSION_GENERATION (GEMDRVEMUL_FLOPPY_SESSION_STATUS + 4)               // uint32_t, swapped long -- bumped by SESSION_START, lets a stale READ_SECTOR response be detected
@@ -554,8 +565,8 @@ _Static_assert((GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS + (unsigned long)SIDETNFS_FL
 // fields above).
 #define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE (GEMDRVEMUL_FLOPPY_SESSION_GENERATION + 4)    // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the GEMDOS-relay driver. Power-cycle default (and long-SELECT-exit restore value) is 1 (YES).
 #define GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE + 2) // uint16_t, plain word -- 0=NO/1=YES, requested Atari boot: install the floppy hdv_*/XBIOS hooks. Power-cycle default (and long-SELECT-exit restore value) is 0 (NO).
-#define GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)  // uint16_t, plain word -- RESERVED, UNUSED. Was: nonzero = Pico wants the Atari to reset. See this field's own comment above GEMDRVEMUL_FLOPPY_SESSION's #define for why the automatic-reset design was abandoned.
-#define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED + 2)   // uint16_t, plain word -- RESERVED, UNUSED. Was: set once GEMDRVEMUL_FLOPPY_EXIT_ACK was received. Same rationale as RESET_REQUESTED above.
+#define GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY + 2)      // uint16_t, plain word -- 0=drive A:/1=drive B:, which unit INSTALL_FLOPPY emulates. Reclaimed from the former RESET_REQUESTED slot (same offset) -- see this block's own comment above GEMDRVEMUL_FLOPPY_SESSION's #define.
+#define GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN (GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER + 2)       // uint16_t, plain word -- RESERVED, UNUSED. Was: set once GEMDRVEMUL_FLOPPY_EXIT_ACK was received. Same rationale as the abandoned automatic-reset design this block's own comment describes.
 #define GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH (GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN + 2)        // char[SIDETNFS_FLOPPY_FAVORITE_PATH_MAX] -- full path of the mounted image
 // SIDES/SECTORS_PER_TRACK/TRACKS are uint16_t, not uint8_t (Phase 3
 // correction) -- this codebase's shared-memory write macros
@@ -625,7 +636,7 @@ _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_STATUS % 4 == 0, "GEMDRVEMUL_FLOPPY_SES
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_GENERATION % 4 == 0, "GEMDRVEMUL_FLOPPY_SESSION_GENERATION must be 4-byte aligned for WRITE_AND_SWAP_LONGWORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY must be 2-byte aligned for WRITE_WORD");
-_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_RESET_REQUESTED must be 2-byte aligned for WRITE_WORD");
+_Static_assert(GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_EXIT_ACK_SEEN must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_SIDES % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_SIDES must be 2-byte aligned for WRITE_WORD");
 _Static_assert(GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK % 2 == 0, "GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK must be 2-byte aligned for WRITE_WORD");
