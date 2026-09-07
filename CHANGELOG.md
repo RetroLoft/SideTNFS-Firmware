@@ -4,6 +4,21 @@ All notable changes to SideTNFS are documented here. Older entries here describe
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-07
+
+### Added
+- Floppy drive emulation: FLOPPY.PRG can now load an ordinary `.ST` disk image from a TNFS server or microSD card and present it to the Atari as a real, bootable virtual floppy drive, using standard GEMDOS/BIOS disk vectors -- no physical floppy drive needed. Includes a persistent, up-to-60-slot Favorites list and a temporary, up-to-8-image Carousel for multi-disk games; a short press of the cartridge's SELECT button switches to the next Carousel entry while the game is running. Floppy emulation can run on its own ("Floppy Only") or alongside the normal SideTNFS TNFS/SD drives.
+- Choice of emulated drive letter, A: (the default) or B:, picked per Carousel session from FLOPPY.PRG's Start dialog.
+- A long SELECT press exits floppy mode, confirmed by the onboard LED; the user then does a manual Atari reset to return to normal SideTNFS operation.
+
+### Changed
+- FLOPPY.PRG's Sources/Favorites/Carousel architecture reworked: Browser Sources are now local-only shortcuts for browsing, while each Favorite and Carousel entry carries its own complete backend/server/path. A single Favorites list or Carousel can therefore freely mix images from different TNFS servers and a microSD card at once, rather than being tied to one shared source.
+
+### Fixed
+- A directory-corruption bug in the virtual floppy drive's BPB calculation (`fatrec`/`bflags`) that could scramble the emulated floppy's root directory.
+- TNFS DTA-registry exhaustion that could empty drive M: while FLOPPY.PRG saved a Favorite.
+- TNFS RX buffers unified into a single 768-byte buffer (read chunk size restored to 512) for more consistent network reads.
+
 ## [1.0.5] - 2026-08-29
 
 ### Added
