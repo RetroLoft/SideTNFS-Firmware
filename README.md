@@ -16,6 +16,7 @@ Just power on and access your files.
 
 - TNFS network storage
 - Up to eight independent network and/or microSD card drives
+- Floppy drive emulation from `.ST` disk images on TNFS or microSD, as drive A: or B:
 - Built-in read-only Settings Disk
 - Configuration utility running directly on the Atari ST
 - Read and write support
@@ -95,11 +96,21 @@ Releasing SELECT before the 10 seconds are up cancels the reset — nothing is c
 
 ---
 
-## Planned Features
+## Floppy Emulation
 
-- Floppy drive emulation
-- Advanced real-time clock (RTC) with automatic network time synchronization and time zone support
-- Falcon support where technically possible
+SideTNFS can emulate a virtual Atari floppy drive, loaded from an ordinary `.ST` disk image stored on a TNFS server or a microSD card — no physical floppy disk or drive required.
+
+Floppy emulation is run from **FLOPPY.PRG**, a separate program you launch from the GEM Desktop (not part of the Settings Disk):
+
+- Browse `.ST` images on up to 8 remembered TNFS or SD sources, with full long-filename support.
+- Keep a persistent list of up to 60 **Favorites**, mixing images from different SD and TNFS sources freely.
+- Build a temporary, up-to-8-image **Carousel** for multi-disk games — while the game is running, pressing **SELECT** on the cartridge switches to the next disk.
+- Start a single image immediately with **Start Now**, without building a Carousel first.
+- Choose whether the emulated drive is **A:** (the default) or **B:**, and whether the normal SideTNFS TNFS/SD GEMDOS drives stay available alongside it or not.
+
+Floppy emulation works through the standard GEMDOS/BIOS disk vectors, so it's compatible with ordinary GEMDOS software. Software that bypasses GEMDOS entirely — custom loaders, copy protection, or direct floppy-controller access — will not work correctly, or at all, under this kind of emulation.
+
+Download the latest **FLOPPY.PRG** from the [SideTNFS-Floppy-browser releases page](https://github.com/RetroLoft/SideTNFS-Floppy-browser/releases/latest). Full usage details, keyboard shortcuts, and known limitations are documented in the [FLOPPY.PRG README](https://github.com/RetroLoft/SideTNFS-Floppy-browser).
 
 ---
 
