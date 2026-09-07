@@ -18,12 +18,16 @@ Go to the official downloads page:
 
 **https://retroloft.net/sidetnfs**
 
-- Download only the normal Production firmware file for the Raspberry Pi Pico W:
+SideTNFS runs on two different Raspberry Pi Pico boards, and each needs its own firmware file:
 
-  **`sidetnfs_production.uf2`**
+- **`sidecart-pico_w.uf2`** — for the original **Raspberry Pi Pico W**.
+- **`sidecart-pico2_w.uf2`** — for the newer **Raspberry Pi Pico 2 W**.
+
+If you're not sure which board is in your cartridge, don't worry — you don't need to know beforehand. Step 3 below shows you an easy way to tell them apart once the Pico is in BOOTSEL mode, before you copy anything onto it.
 
 **Do not download:**
-- Any file with **debug** or a similar word in its name. These are development builds and are not meant for everyday use.
+- Any file with **debug** in its name. These are development builds and are not meant for everyday use.
+- The firmware file for the *other* board — it won't run correctly on the wrong hardware.
 
 ---
 
@@ -48,13 +52,16 @@ BOOTSEL mode makes the Pico appear as a plain USB drive so you can copy the new 
 
 3. While still holding BOOTSEL, connect the Pico to your computer with a USB data cable.
 4. Release BOOTSEL.
-5. A removable USB drive named **RPI-RP2** should appear on your computer, just like a USB stick.
+5. A removable USB drive should appear on your computer, just like a USB stick — its name tells you which board you have, and therefore which firmware file to use:
+
+   - **`RPI-RP2`** — this is the original **Raspberry Pi Pico W**. Use `sidecart-pico_w.uf2`.
+   - **`RP2350`** — this is the newer **Raspberry Pi Pico 2 W**. Use `sidecart-pico2_w.uf2`.
 
 ---
 
 ## 4. Install the New Firmware
 
-1. Copy or drag the downloaded `sidetnfs_production.uf2` file onto the **RPI-RP2** drive.
+1. Copy or drag the matching `.uf2` file (see step 3 above) onto the drive.
 2. The drive will usually disappear on its own once the file has been written — this is normal and means the Pico has restarted with the new firmware.
 3. Wait a few seconds to be sure.
 4. Unplug the USB cable.
@@ -62,7 +69,7 @@ BOOTSEL mode makes the Pico appear as a plain USB drive so you can copy the new 
 6. Switch the Atari **on**.
 7. Check the version number shown on the Atari's boot screen when SideTNFS starts, and compare it with the version you just downloaded (see the release notes on the downloads page).
 
-> If **RPI-RP2** disappears while you're still in the middle of copying the file, that's expected — it almost always just means the Pico has already restarted into the new firmware.
+> If the drive disappears while you're still in the middle of copying the file, that's expected — it almost always just means the Pico has already restarted into the new firmware.
 
 ---
 
@@ -76,9 +83,10 @@ As with any update, it's still good practice to jot down your Wi-Fi and drive se
 
 ## Troubleshooting
 
-- **RPI-RP2 doesn't appear:** Try again, but hold BOOTSEL down *before* plugging in the USB cable, and keep holding it until the drive shows up.
+- **The drive (RPI-RP2 or RP2350) doesn't appear:** Try again, but hold BOOTSEL down *before* plugging in the USB cable, and keep holding it until the drive shows up.
 - **Still nothing:** Make sure your USB cable supports data transfer — some cables are charge-only. Try a different USB port, and avoid using a USB hub.
-- **RPI-RP2 appears, but copying the file fails or doesn't finish:** Re-download the `.uf2` file (it may not have downloaded correctly) and try again.
+- **The drive appears, but copying the file fails or doesn't finish:** Re-download the `.uf2` file (it may not have downloaded correctly) and try again.
+- **SideTNFS doesn't start after updating, and you're not sure the file matched your board:** Repeat from step 3 to check the drive name (RPI-RP2 vs RP2350) against the file you used, and reflash with the matching one if they didn't match.
 - **SideTNFS doesn't start after updating:** Repeat the BOOTSEL steps above and reinstall the latest stable Production release.
 - Don't use a debug firmware build to troubleshoot a problem unless a developer specifically asks you to — it's a diagnostic tool, not a fix.
 
