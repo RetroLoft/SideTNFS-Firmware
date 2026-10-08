@@ -224,6 +224,9 @@ static int network_wifi_init_with_country_code(uint32_t country)
     if ((res = cyw43_arch_init_with_country(country)))
     {
         DPRINTF("Failed to initialize WiFi: %d\n", res);
+#if SIDETNFS_NATIVE_FALCON
+        cyw43_initialized = false;
+#endif
         return -1;
     }
 
@@ -399,6 +402,9 @@ int network_init_with_settings(bool force, bool async, char **pass, const sidetn
     {
         DPRINTF("Failed to get MAC address: %d\n", res);
         cyw43_arch_deinit();
+#if SIDETNFS_NATIVE_FALCON
+        cyw43_initialized = false;
+#endif
         return -2;
     }
 
@@ -941,3 +947,7 @@ void show_connection_data(ConnectionData *connection_data)
 // check anywhere in SideTNFS -- the lwIP HTTP stack (pico_lwip_http) is not
 // linked at all. Anything network-facing beyond the entry points above is
 // TNFS (sidetnfs_probe.c) or NTP (rtcemul.c).
+
+#if SIDETNFS_NATIVE_FALCON
+#include "native/network_adapter.h"
+#endif

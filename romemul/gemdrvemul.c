@@ -860,9 +860,9 @@ static void __not_in_flash_func(delete_file_by_fdesc)(FileDescriptors **head, ui
 }
 
 // Comparator function for qsort
-static uint16_t __not_in_flash_func(compare_fd)(const void *a, const void *b)
+static int __not_in_flash_func(compare_fd)(const void *a, const void *b)
 {
-    return (*(uint16_t *)a - *(uint16_t *)b);
+    return (int)*(const uint16_t *)a - (int)*(const uint16_t *)b;
 }
 
 static uint16_t __not_in_flash_func(get_first_available_fd)(FileDescriptors *head)
@@ -883,7 +883,7 @@ static uint16_t __not_in_flash_func(get_first_available_fd)(FileDescriptors *hea
     }
 
     count++;
-    int *fdArray = (int *)malloc((count) * sizeof(int));
+    uint16_t *fdArray = malloc((size_t)count * sizeof(*fdArray));
     if (!fdArray)
     {
         printf("Memory allocation failed\n");
@@ -1451,6 +1451,10 @@ static inline void __not_in_flash_func(handle_protocol_command)(const Transmissi
     }
 }
 
+#if SIDETNFS_NATIVE_FALCON
+#include "native/endpoint.h"
+#endif
+
 // Interrupt handler callback for DMA completion
 void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void)
 {
@@ -1461,7 +1465,12 @@ void __not_in_flash_func(gemdrvemul_dma_irq_handler_lookup_callback)(void)
     // DPRINTF("DMA LOOKUP: $%x\n", addr);
     if (addr >= ROM3_START_ADDRESS)
     {
+#if SIDETNFS_NATIVE_FALCON
+        if (!r02a_irq((uint16_t)addr, ROM3_START_ADDRESS))
+            parse_protocol(r12s_config_address((uint16_t)addr, sidetnfs_tp_shifted), handle_protocol_command);
+#else
         parse_protocol((uint16_t)(addr & 0xFFFF), handle_protocol_command);
+#endif
     }
 
     // Clear the interrupt request for the channel
@@ -4334,6 +4343,11 @@ void init_gemdrvemul(bool safe_config_reboot)
     // polling a torn-down network stack there previously caused a hang.
     bool sidetnfs_network_ok = false;
 
+#if SIDETNFS_NATIVE_FALCON
+    /* SD/guest activation must not wait for Wi-Fi, TNFS or NTP. */
+    if (sidetnfs_sd_global_status() == SIDETNFS_SD_STATUS_READY)
+        read_and_trim_file(WIFI_PASS_FILE_NAME, &wifi_password_file_content, MAX_WIFI_PASSWORD_LENGTH);
+#else
     // Only try to get the datetime from the network if the wifi is configured
     if (gemdrive_rtc_enabled && strlen(sys.ssid) > 0)
     {
@@ -4696,10 +4710,15 @@ void init_gemdrvemul(bool safe_config_reboot)
         *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_NETWORK_STATUS)) = 0x1;
     }
 
+#endif
+
     DPRINTF("Waiting for commands...\n");
 
     while (true)
     {
+#if SIDETNFS_NATIVE_FALCON
+        r12s_service(memory_shared_address, &sys, &wifi_password_file_content);
+#endif
         *((volatile uint32_t *)(memory_shared_address + GEMDRVEMUL_RANDOM_TOKEN_SEED)) = rand() % 0xFFFFFFFF;
         tight_loop_contents();
 
@@ -4745,6 +4764,11 @@ void init_gemdrvemul(bool safe_config_reboot)
             sidetnfs_diag_log(SIDETNFS_DIAG_COMMAND_ENTER, active_command_id, NULL, NULL, NULL, 0, 0, 0, 0);
         }
 #endif
+        /* Main-loop only: never format UART output inside the DMA IRQ. */
+        if (active_command_id >= 0x040d && active_command_id <= 0x0417)
+            LOG(GEMDOS,DEBUG,"F32 CONFIG request cmd=%04x shifted=%u fallback=%u hits=%lu\r\n",
+                active_command_id,sidetnfs_tp_shifted,
+                sidetnfs_tp_shift_fallback,(unsigned long)sidetnfs_tp_hits);
         switch (active_command_id)
         {
         case GEMDRVEMUL_DEBUG:
@@ -5123,6 +5147,9 @@ void init_gemdrvemul(bool safe_config_reboot)
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_COUNT, sidetnfs_config_get_drive_count());
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_DRIVE_LETTER, sidetnfs_config_get_config_drive_letter());
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_SIDETNFS_CONFIG_STATUS, SIDETNFS_CONFIG_STATUS_OK);
+            LOG(GEMDOS,DEBUG,"F32 CONFIG info version=%lu slots=%lu letter=%u status=0\r\n",
+                (unsigned long)SIDETNFS_CONFIG_PROTOCOL_VERSION,
+                (unsigned long)sidetnfs_config_get_max_drives(),(unsigned)sidetnfs_config_get_config_drive_letter());
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -5181,6 +5208,8 @@ void init_gemdrvemul(bool safe_config_reboot)
             memcpy((void *)(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH), drive.sd_path, SIDETNFS_SDPATH_LEN);
             CHANGE_ENDIANESS_BLOCK16(memory_shared_address + GEMDRVEMUL_SIDETNFS_DRIVE_SD_PATH, SIDETNFS_SDPATH_LEN);
 
+            LOG(GEMDOS,DEBUG,"F32 CONFIG drive slot=%lu status=%lu state=%u type=%u letter=%u\r\n",
+                (unsigned long)drive_index,(unsigned long)result,(unsigned)drive.state,(unsigned)drive.type,(unsigned)drive.drive_letter);
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;

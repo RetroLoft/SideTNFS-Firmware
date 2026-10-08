@@ -27,6 +27,10 @@ include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 # Set name of project (as PROJECT_NAME) and C/C   standards
 project(romemul C CXX ASM)
 set(CMAKE_C_STANDARD 11)
+option(SIDETNFS_NATIVE_FALCON "Build native Falcon guest and cooperative endpoint" OFF)
+if(SIDETNFS_NATIVE_FALCON AND NOT BOARD_TYPE STREQUAL "pico_w")
+    message(FATAL_ERROR "Native Falcon integration is currently validated for Pico W only")
+endif()
 
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
@@ -54,14 +58,42 @@ target_sources(${PROJECT_NAME} PRIVATE lwipopts.h)
 target_sources(${PROJECT_NAME} PRIVATE hw_config.c)
 target_sources(${PROJECT_NAME} PRIVATE commands.c)
 target_sources(${PROJECT_NAME} PRIVATE constants.c)
-target_sources(${PROJECT_NAME} PRIVATE firmware_gemdrvemul.c)
+if(SIDETNFS_NATIVE_FALCON)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE SIDETNFS_NATIVE_FALCON=1)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(SIDETNFS_NATIVE_ROM "${CMAKE_CURRENT_LIST_DIR}/../../SideTNFS-Gemdrive-integration/dist/native/native.bin" CACHE FILEPATH "Built native Falcon ROM")
+    if(NOT EXISTS "${SIDETNFS_NATIVE_ROM}")
+        message(FATAL_ERROR "Build the guest with make falcon first")
+    endif()
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native_rom.c"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_LIST_DIR}/../tools/embed_rom.py" "${SIDETNFS_NATIVE_ROM}" "${CMAKE_CURRENT_BINARY_DIR}/native_rom.c"
+        DEPENDS "${SIDETNFS_NATIVE_ROM}" "${CMAKE_CURRENT_LIST_DIR}/../tools/embed_rom.py" VERBATIM)
+    target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/native_rom.c")
+else()
+    target_sources(${PROJECT_NAME} PRIVATE firmware_gemdrvemul.c)
+endif()
 target_sources(${PROJECT_NAME} PRIVATE romemul.c)
-target_sources(${PROJECT_NAME} PRIVATE tprotocol.c)
+if(SIDETNFS_NATIVE_FALCON)
+    target_sources(${PROJECT_NAME} PRIVATE native/config_protocol.c native/sideeth21_nat.c)
+else()
+    target_sources(${PROJECT_NAME} PRIVATE tprotocol.c)
+endif()
 target_sources(${PROJECT_NAME} PRIVATE config.c)
 target_sources(${PROJECT_NAME} PRIVATE network.c)
 target_sources(${PROJECT_NAME} PRIVATE filesys.c)
 target_sources(${PROJECT_NAME} PRIVATE scfs.c)
-target_sources(${PROJECT_NAME} PRIVATE sidetnfs_probe.c)
+target_sources(${PROJECT_NAME} PRIVATE sidetnfs_probe.c sidetnfs_log.c)
+set(SIDETNFS_LOG_COMPILED_LEVEL "5" CACHE STRING "Logging ceiling: 0 OFF through 5 TRACE")
+set(SIDETNFS_LOG_DEFAULT_LEVEL "3" CACHE STRING "Initial component logging threshold")
+if(NOT SIDETNFS_LOG_COMPILED_LEVEL MATCHES "^[0-5]$" OR NOT SIDETNFS_LOG_DEFAULT_LEVEL MATCHES "^[0-5]$")
+    message(FATAL_ERROR "Logging levels must be 0..5")
+endif()
+if(SIDETNFS_LOG_DEFAULT_LEVEL GREATER SIDETNFS_LOG_COMPILED_LEVEL)
+    message(FATAL_ERROR "Logging default exceeds compiled ceiling")
+endif()
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+ SIDETNFS_LOG_COMPILED_LEVEL=${SIDETNFS_LOG_COMPILED_LEVEL}
+ SIDETNFS_LOG_DEFAULT_LEVEL=${SIDETNFS_LOG_DEFAULT_LEVEL})
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_update_check.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_resolve.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config.c)
@@ -70,7 +102,11 @@ target_sources(${PROJECT_NAME} PRIVATE sidetnfs_floppy_emul.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_system_config.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_netconfig.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_rtcconfig.c)
-target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive.c)
+if(SIDETNFS_NATIVE_FALCON)
+    target_sources(${PROJECT_NAME} PRIVATE native/config_drive.c)
+else()
+    target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive.c)
+endif()
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_config_drive_backend.c)
 target_sources(${PROJECT_NAME} PRIVATE sidetnfs_sd_service.c)
 target_sources(${PROJECT_NAME} PRIVATE rtcemul.c)
@@ -225,7 +261,8 @@ endif()
 
 # Debug outputs
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
-# UART is deliberately OFF unconditionally, in every build variant --
+# Upstream UART stays OFF; native Falcon explicitly enables diagnostics.
+# The rationale for the upstream default is unchanged:
 # not just a debug/production distinction. gemdrvemul.c alone has 349
 # DPRINTF() call sites throughout the TNFS-read/Pexec/bus-IRQ-adjacent
 # code paths, each a blocking UART character-by-character transmission
@@ -235,7 +272,11 @@ pico_enable_stdio_usb(${PROJECT_NAME} 0)
 # v1.0.3 TNFS-reliability-fix regression. The eventlog/SELECT-dump ring
 # buffer (see sidetnfs_diag_log() in sidetnfs_probe.c) never calls
 # DPRINTF, so debug builds stay fully diagnosable with UART off.
-pico_enable_stdio_uart(${PROJECT_NAME} 0)
+if(SIDETNFS_NATIVE_FALCON)
+    pico_enable_stdio_uart(${PROJECT_NAME} 1)
+else()
+    pico_enable_stdio_uart(${PROJECT_NAME} 0)
+endif()
 
 # Print the variables on screen
 message("Build variant: " ${_SIDETNFS_BUILD_VARIANT})

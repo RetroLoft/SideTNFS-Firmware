@@ -1,0 +1,38 @@
+[
+  {
+    "path": "RUNME.TOS",
+    "size": 3678,
+    "crc32": 38504166,
+    "sha256": "46fb809a33bfa6636dae70b4f9a8880d8df43ed75c6fc5999aa65481da19700a"
+  },
+  {
+    "path": "HAGA",
+    "size": 13448,
+    "crc32": 915446226,
+    "sha256": "afda52f0d98b1ba9f89ce2967001e0beeba5c9e1188562426ecf16b6203202e1"
+  },
+  {
+    "path": "FRT228.HST",
+    "size": 61104,
+    "crc32": 413749233,
+    "sha256": "71cfc2b06c6aff5906404626b9999abaf2bbc3b0e6e2170ab0b57a06c8adc72a"
+  },
+  {
+    "path": "RT240D.BMP",
+    "size": 77878,
+    "crc32": 156155059,
+    "sha256": "e5f5c31ba86b5c0cdb406da5d43c634c56c25653e352d338cd6b4f6797c84095"
+  },
+  {
+    "path": "FILES/RTYPE.FIC",
+    "size": 56371,
+    "crc32": 2626726996,
+    "sha256": "57051ce3c5c755e9136c281d2acb5fe87492326a15a0c2eb3fa31da6f5397d2f"
+  },
+  {
+    "path": "FILES/RRD",
+    "size": 224092,
+    "crc32": 67295541,
+    "sha256": "5814c06facdbe9b8c37ca385da176e821af4d20fbca64db8a4b77e4114c4cddb"
+  }
+]

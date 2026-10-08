@@ -69,3 +69,8 @@ secrets.sh
 build_artifacts/
 # Backup of fatfs-sdk/src/ff15/source/ffconf.h made by build.sh before patching
 ffconf.h.bak
+
+/build/falcon/
+/build/upstream-check/
+/dist/native/
+/dist/falcon/

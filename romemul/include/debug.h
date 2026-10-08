@@ -1,35 +1,22 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
-/**
- * @brief A macro to print debug
- *
- * @param fmt The format string for the debug message, similar to printf.
- * @param ... Variadic arguments corresponding to the format specifiers in the fmt parameter.
- */
+#include "sidetnfs_log.h"
+/* Keep existing debug-build gating; runtime LEGACY threshold also applies. */
 #if defined(_DEBUG) && (_DEBUG != 0)
 #include <string.h>
-// Named __dprintf_srcfile, not "file": many call sites pass a local
-// variable literally named `file` (e.g. FileDescriptors *file) as one of
-// the variadic arguments below, and a plainer name here would shadow it
-// for the rest of this expansion -- silently rebinding `file->x` in the
-// caller's own argument list to this macro-local `const char *` instead.
-#define DPRINTF(fmt, ...)                                                                              \
-    do                                                                                                 \
-    {                                                                                                  \
-        const char *__dprintf_srcfile = strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__; \
-        fprintf(stderr, "%s:%d:%s(): " fmt "", __dprintf_srcfile,                                       \
-                __LINE__, __func__, ##__VA_ARGS__);                                                     \
-    } while (0)
-#define DPRINTFRAW(fmt, ...)                 \
-    do                                       \
-    {                                        \
-        fprintf(stderr, fmt, ##__VA_ARGS__); \
-    } while (0)
-
+#define DPRINTF(fmt, ...) do { \
+    if(SL_DEBUG<=SIDETNFS_LOG_COMPILED_LEVEL && sidetnfs_log_enabled(SC_LEGACY,SL_DEBUG)) { \
+        const char *sl_file_=strrchr(__FILE__,'/'); \
+        LOG(LEGACY,DEBUG,"%s:%d:%s(): " fmt,sl_file_?sl_file_+1:__FILE__,__LINE__,__func__,##__VA_ARGS__); \
+    } \
+} while(0)
+#define DPRINTFRAW(...) do { \
+    if(SL_DEBUG<=SIDETNFS_LOG_COMPILED_LEVEL && sidetnfs_log_enabled(SC_LEGACY,SL_DEBUG))sidetnfs_log_raw(__VA_ARGS__); \
+} while(0)
 #else
-#define DPRINTF(fmt, ...)
-#define DPRINTFRAW(fmt, ...)
+#define DPRINTF(...)
+#define DPRINTFRAW(...)
 #endif
 
 /**

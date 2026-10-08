@@ -1,0 +1,8 @@
+{
+  "upstream_url": "https://github.com/RetroLoft/SideTNFS-Firmware.git",
+  "upstream_commit": "e580d1459689979f93fb6852ef93581451271a5a",
+  "tested_r16_commit": "fd1a7c4c8d47e09916fba7d37194e17c9dffb2c5",
+  "integration_branch": "falcon/native-integration",
+  "common_ancestor": "070bcc7930587901cf52b48096990bf52007531b",
+  "status": "F17 opt-in endpoint integration compiled; both Pico W firmware modes pass; hardware validation pending"
+}

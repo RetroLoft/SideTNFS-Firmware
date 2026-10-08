@@ -6,3 +6,9 @@ VERSION := $(shell cat version.txt)
 tag:
 	git tag $(VERSION) && git push origin $(VERSION) && \
 	echo "Tagged: $(VERSION)"
+
+.PHONY: falcon test-falcon
+falcon:
+	python3 tools/build_falcon.py
+test-falcon:
+	python3 tools/test_native.py
