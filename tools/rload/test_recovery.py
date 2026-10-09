@@ -8,7 +8,7 @@ code=r'''
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
-static char line[512],path[]="M:\\GAMES\\RTYPE\\FILES\\RRD";static unsigned used;
+static char line[512],path[]="M:\\RLOAD\\FILES\\FILE06.BIN";static unsigned used;
 static uint32_t cycles=16,session_start=0,cycle_start=4000,tick=5000,probe_tick;
 static int probe_count,write_count,write_ok=1;static int32_t probe_rc;
 static uint32_t rload_ticks(void){return tick++;}

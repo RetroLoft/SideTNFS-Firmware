@@ -1,8 +1,9 @@
+/* Deterministic generic-v1 fixtures; see generate_fixtures.py. */
 static const struct asset assets[] = {
- {"RUNME.TOS",3678UL,0x024b86e6UL},
- {"HAGA",13448UL,0x369099d2UL},
- {"FRT228.HST",61104UL,0x18a94ff1UL},
- {"RT240D.BMP",77878UL,0x094ebcb3UL},
- {"FILES\\RTYPE.FIC",56371UL,0x9c90ac54UL},
- {"FILES\\RRD",224092UL,0x0402d935UL},
+ {"FILE01.BIN",3678UL,0xaafcac7bUL},
+ {"FILE02.BIN",13448UL,0xd0e998fdUL},
+ {"FILE03.BIN",61104UL,0xd91f3f4dUL},
+ {"FILE04.BIN",77878UL,0xcaeae9c8UL},
+ {"FILES\\FILE05.BIN",56371UL,0x5ab47f98UL},
+ {"FILES\\FILE06.BIN",224092UL,0x63dfcb81UL},
 };

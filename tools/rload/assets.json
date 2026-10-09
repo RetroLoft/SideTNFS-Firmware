@@ -1,38 +1,38 @@
 [
   {
-    "path": "RUNME.TOS",
+    "path": "FILE01.BIN",
     "size": 3678,
-    "crc32": 38504166,
-    "sha256": "46fb809a33bfa6636dae70b4f9a8880d8df43ed75c6fc5999aa65481da19700a"
+    "crc32": 2868685947,
+    "sha256": "e446f164db9325da7796cca7337fa521e60c3a8f6aab31faa51aa9cad1bec8ca"
   },
   {
-    "path": "HAGA",
+    "path": "FILE02.BIN",
     "size": 13448,
-    "crc32": 915446226,
-    "sha256": "afda52f0d98b1ba9f89ce2967001e0beeba5c9e1188562426ecf16b6203202e1"
+    "crc32": 3504969981,
+    "sha256": "376176f955a3b41c95b0e00dce698d3739d6cbcce5da38a117dd4add5e32069a"
   },
   {
-    "path": "FRT228.HST",
+    "path": "FILE03.BIN",
     "size": 61104,
-    "crc32": 413749233,
-    "sha256": "71cfc2b06c6aff5906404626b9999abaf2bbc3b0e6e2170ab0b57a06c8adc72a"
+    "crc32": 3642703693,
+    "sha256": "a5b6675301bcfcf5e732de2bf47b74f97061a3fbc5fe37a5ecd9a368677ce76a"
   },
   {
-    "path": "RT240D.BMP",
+    "path": "FILE04.BIN",
     "size": 77878,
-    "crc32": 156155059,
-    "sha256": "e5f5c31ba86b5c0cdb406da5d43c634c56c25653e352d338cd6b4f6797c84095"
+    "crc32": 3404392904,
+    "sha256": "7cc3ead7d4ad38bbc8c64514bd622533300f7f58a69b99a23329b19b47473d03"
   },
   {
-    "path": "FILES/RTYPE.FIC",
+    "path": "FILES\\FILE05.BIN",
     "size": 56371,
-    "crc32": 2626726996,
-    "sha256": "57051ce3c5c755e9136c281d2acb5fe87492326a15a0c2eb3fa31da6f5397d2f"
+    "crc32": 1521778584,
+    "sha256": "12965fdba117c8e03278b6fbf4f6779d583089802695b63493526e93b7ad19e9"
   },
   {
-    "path": "FILES/RRD",
+    "path": "FILES\\FILE06.BIN",
     "size": 224092,
-    "crc32": 67295541,
-    "sha256": "5814c06facdbe9b8c37ca385da176e821af4d20fbca64db8a4b77e4114c4cddb"
+    "crc32": 1675611009,
+    "sha256": "81bb5af5f6e4d86b5abebb9e9b6f585baf0c2586adb9e015d11852a6ff2efe1f"
   }
 ]
