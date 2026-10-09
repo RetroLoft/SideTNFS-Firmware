@@ -41,13 +41,13 @@ CMake cache settings accept numeric levels 0..5:
 -DSIDETNFS_LOG_COMPILED_LEVEL=5 -DSIDETNFS_LOG_DEFAULT_LEVEL=3
 ```
 
-The default cannot exceed the ceiling. `tools/build_falcon.py` defaults to
+The default cannot exceed the ceiling. `tools/build_native.py` defaults to
 5/3 and explicitly overrides the CMake cache. To select another build policy:
 
 ```
-python3 tools/build_falcon.py --log-level TRACE
-python3 tools/build_falcon.py --log-level INFO --log-ceiling INFO
-python3 tools/build_falcon.py --log-level OFF --log-ceiling OFF
+python3 tools/build_native.py --log-level TRACE
+python3 tools/build_native.py --log-level INFO --log-ceiling INFO
+python3 tools/build_native.py --log-level OFF --log-ceiling OFF
 ```
 
 The manifest records the selected settings. Each build uses the same F30 output

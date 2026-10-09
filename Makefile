@@ -7,8 +7,12 @@ tag:
 	git tag $(VERSION) && git push origin $(VERSION) && \
 	echo "Tagged: $(VERSION)"
 
-.PHONY: falcon test-falcon
-falcon:
-	python3 tools/build_falcon.py
-test-falcon:
+.PHONY: native test-native falcon test-falcon
+native:
+	python3 tools/build_native.py
+test-native:
 	python3 tools/test_native.py
+
+# Compatibility aliases for existing build commands.
+falcon: native
+test-falcon: test-native

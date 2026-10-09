@@ -19,8 +19,11 @@ In this firmware repository, run:
 
 ```sh
 python3 tools/test_native.py
-python3 tools/build_falcon.py
+python3 tools/build_native.py
 ```
+
+The equivalent Make targets are `make test-native` and `make native`.
+The older `test-falcon` and `falcon` targets remain compatibility aliases.
 
 Set `SIDETNFS_GUEST_DIR` to the companion guest checkout and
 `SIDETNFS_CONFIG_DIR` to the Config checkout for tests. Defaults expect
