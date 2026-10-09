@@ -1,0 +1,38 @@
+[
+  {
+    "path": "FILE01.BIN",
+    "size": 3678,
+    "crc32": 2868685947,
+    "sha256": "e446f164db9325da7796cca7337fa521e60c3a8f6aab31faa51aa9cad1bec8ca"
+  },
+  {
+    "path": "FILE02.BIN",
+    "size": 13448,
+    "crc32": 3504969981,
+    "sha256": "376176f955a3b41c95b0e00dce698d3739d6cbcce5da38a117dd4add5e32069a"
+  },
+  {
+    "path": "FILE03.BIN",
+    "size": 61104,
+    "crc32": 3642703693,
+    "sha256": "a5b6675301bcfcf5e732de2bf47b74f97061a3fbc5fe37a5ecd9a368677ce76a"
+  },
+  {
+    "path": "FILE04.BIN",
+    "size": 77878,
+    "crc32": 3404392904,
+    "sha256": "7cc3ead7d4ad38bbc8c64514bd622533300f7f58a69b99a23329b19b47473d03"
+  },
+  {
+    "path": "FILES\\FILE05.BIN",
+    "size": 56371,
+    "crc32": 1521778584,
+    "sha256": "12965fdba117c8e03278b6fbf4f6779d583089802695b63493526e93b7ad19e9"
+  },
+  {
+    "path": "FILES\\FILE06.BIN",
+    "size": 224092,
+    "crc32": 1675611009,
+    "sha256": "81bb5af5f6e4d86b5abebb9e9b6f585baf0c2586adb9e015d11852a6ff2efe1f"
+  }
+]

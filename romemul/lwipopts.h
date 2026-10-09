@@ -26,6 +26,13 @@
 #define MEM_SANITY_CHECK            1
 #define MEM_OVERFLOW_CHECK          1
 
+#if SIDETNFS_NATIVE_FALCON
+/* F21 live NAT reservations coexist with native TNFS/DNS/NTP sockets. */
+#define MEMP_NUM_TCP_PCB 12
+#define MEMP_NUM_UDP_PCB 24
+#define LWIP_HOOK_FILENAME "native/sideeth21_hooks.h"
+#endif
+
 #define MEMP_NUM_TCP_SEG 32
 #define MEMP_NUM_ARP_QUEUE 10
 #define PBUF_POOL_SIZE 24

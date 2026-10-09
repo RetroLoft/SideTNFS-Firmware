@@ -147,3 +147,7 @@ Bug reports, ideas and feature requests are always welcome.
 SideTNFS is based on the excellent Atari Sidecartridge project and extends it with integrated TNFS support and modern network functionality.
 
 Many thanks to everyone involved in the original Sidecartridge project and to everyone helping test and improve SideTNFS.
+
+## Native cartridge build
+
+See [native build instructions](docs/FALCON-BUILD.md) for the optional native cartridge and SIDEETH build.

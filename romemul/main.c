@@ -265,9 +265,12 @@ int main()
     gpio_set_pulls(SELECT_GPIO, false, true); // Pull down (false, true)
     gpio_pull_down(SELECT_GPIO);
 
-#if _DEBUG
+#if _DEBUG || SIDETNFS_NATIVE_FALCON
     // Initialize chosen serial port
     stdio_init_all();
+#if SIDETNFS_NATIVE_FALCON
+    LOG(BOOT,INFO,"uart ok GP0 TX 115200 8N1 F37 standalone GEMDRIVE + SIDEETH\r\n");
+#endif
     setvbuf(stdout, NULL, _IONBF, 1); // specify that the stream should be unbuffered
 #endif
     // Only startup information to display

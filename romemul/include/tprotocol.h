@@ -1,3 +1,6 @@
+#if SIDETNFS_NATIVE_FALCON
+#include "../native/config_protocol.h"
+#else
 /**
  * File: tprotocol.h
  * Author: Diego Parrilla Santamaría
@@ -48,3 +51,5 @@ void init_protocol_parser();
 void terminate_protocol_parser();
 
 #endif // TPROTOCOL_H
+
+#endif

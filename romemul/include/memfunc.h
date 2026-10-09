@@ -282,6 +282,10 @@
         {                                                                  \
             tight_loop_contents();                                         \
         }                                                                  \
+        /* DMA moves 32-bit units; preserve an odd trailing 16-bit word. */ \
+        if ((emulROM_length) & 1u)                                        \
+            ((uint16_t *)&__rom_in_ram_start__)[(emulROM_length) - 1u] =   \
+                (emulROM)[(emulROM_length) - 1u];                          \
     } while (0)
 
 #endif // MEMFUNC_H
