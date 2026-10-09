@@ -1,4 +1,4 @@
-"""Generate redistributable RLOAD data; no game files or downloads required."""
+"""Generate redistributable GLOAD data; no game files or downloads required."""
 import argparse
 import hashlib
 import json
@@ -10,6 +10,7 @@ SIZES = (3678, 13448, 61104, 77878, 56371, 224092)
 
 
 def fixtures():
+    # Preserve the original generic-v1 seed so existing fixtures stay compatible.
     # Unique SHA-256 counter blocks expose repeated, reordered or stale reads.
     for index, size in enumerate(SIZES, 1):
         name = ('FILES/' if index > 4 else '') + f'FILE{index:02}.BIN'

@@ -17,7 +17,7 @@ static int32_t release(void*p){w(args,0x49);ptr(args+2,p);return r03_tos(args,6)
 static void print(const char*p){w(args,9);ptr(args+2,p);r03_tos(args,6);}
 struct asset {const char*path;uint32_t size,crc;};
 #include "assets.h"
-static char root[112],logroot[112],path[160],logname[160],logleaf[]="RLOAD000.LOG",line[512];
+static char root[112],logroot[112],path[160],logname[160],logleaf[]="GLOAD000.LOG",line[512];
 static uint32_t table[256],cycles,session_start,cycle_start;
 static unsigned used;
 static void add(const char*p){while(*p && used<sizeof(line)-1)line[used++]=*p++;line[used]=0;}
@@ -74,16 +74,16 @@ static int newlog(void){for(unsigned n=0;n<1000;n++){int h;unsigned i=0,j=0;logl
  h=openf(logname,0x3d);if(h>=0){if(closef(h))return 0;continue;}if(h!=-33)return 0;
  h=openf(logname,0x3c);if(h<0)return 0;return closef(h)==0;}return 0;}
 void r03_test_main(void){uint8_t input[114];unsigned i;int stop=0;
- print("RLOAD v4 - generic full asset read/CRC loop\r\nRead-only fixture checks. ESC stops between files.\r\nChoose a separate log folder; P: or a local HDD is recommended.\r\ngeneric directory [M:\\RLOAD]: ");
+ print("GLOAD v1 - generic full asset read/CRC loop\r\nRead-only fixture checks. ESC stops between files.\r\nChoose a separate log folder; P: or a local HDD is recommended.\r\ngeneric directory [M:\\GLOAD]: ");
  input[0]=110;input[1]=0;w(args,0x0a);ptr(args+2,input);r03_tos(args,6);print("\r\n");
- if(input[1]){for(i=0;i<input[1];i++)root[i]=input[i+2];root[i]=0;}else{const char*p="M:\\RLOAD";for(i=0;p[i];i++)root[i]=p[i];root[i]=0;}
- if(root[1]!=':' || root[2]!='\\'){print("Use an absolute Atari path, e.g. O:\\RLOAD\r\n");return;}
+ if(input[1]){for(i=0;i<input[1];i++)root[i]=input[i+2];root[i]=0;}else{const char*p="M:\\GLOAD";for(i=0;p[i];i++)root[i]=p[i];root[i]=0;}
+ if(root[1]!=':' || root[2]!='\\'){print("Use an absolute Atari path, e.g. O:\\GLOAD\r\n");return;}
  print("Log directory [P:\\]: ");input[0]=110;input[1]=0;w(args,0x0a);ptr(args+2,input);r03_tos(args,6);print("\r\n");
  if(input[1]){for(i=0;i<input[1];i++)logroot[i]=input[i+2];logroot[i]=0;}else{logroot[0]='P';logroot[1]=':';logroot[2]='\\';logroot[3]=0;}
  if(logroot[1]!=':' || logroot[2]!='\\'){print("Use an existing absolute log directory, e.g. P:\\ or C:\\TESTS\r\n");return;}
- if(!newlog()){print("Cannot create a fresh RLOADnnn.LOG in the selected log folder. Test not started.\r\n");return;}
+ if(!newlog()){print("Cannot create a fresh GLOADnnn.LOG in the selected log folder. Test not started.\r\n");return;}
  for(i=0;i<256;i++){uint32_t c=i;for(unsigned j=0;j<8;j++)c=(c>>1)^((c&1)?0xedb88320UL:0);table[i]=c;}
- begin("START RLOAD v4 source=");add(root);add(" log=");add(logname);add(" files=6 bytes=436571 expected=generic-v1");if(!logline()){print("Log failure; stopped.\r\n");return;}
+ begin("START GLOAD v1 source=");add(root);add(" log=");add(logname);add(" files=6 bytes=436571 expected=generic-v1");if(!logline()){print("Log failure; stopped.\r\n");return;}
  session_start=rload_ticks();
  while(!stop){cycle_start=rload_ticks();for(i=0;i<sizeof(assets)/sizeof(assets[0]);i++){if(stopped()){stop=1;break;}if(!load(&assets[i]))return;}
  if(!stop){uint32_t end=rload_ticks();cycles++;begin("PASS cycle=");num(cycles);add(" files=6 bytes=436571 CRC32=OK");timing(end);if(!logline()){print("Log failure; stopped.\r\n");return;}}}

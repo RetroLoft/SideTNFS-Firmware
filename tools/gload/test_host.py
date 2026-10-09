@@ -12,13 +12,13 @@ code=r'''
 #include <assert.h>
 #include <stdio.h>
 struct asset {const char*path;uint32_t size,crc;};
-static char root[]="M:\\RLOAD",path[160];
+static char root[]="M:\\GLOAD",path[160];
 static uint32_t table[256];
 static unsigned mode,live,opened,reads;static const char*stage;
 static uint8_t payload[4097];
 static void *alloc(uint32_t n){if(mode==1)return 0;live++;return malloc(n);}
 static int32_t release(void*p){assert(live);live--;free(p);return mode==9?-40:0;}
-static int openf(const char*p,unsigned op){assert(op==0x3d);assert(!strcmp(p,"M:\\RLOAD\\FILES\\FILE06.BIN"));if(mode==2)return -33;opened++;return 5;}
+static int openf(const char*p,unsigned op){assert(op==0x3d);assert(!strcmp(p,"M:\\GLOAD\\FILES\\FILE06.BIN"));if(mode==2)return -33;opened++;return 5;}
 static int32_t closef(int h){assert(h==5 && opened);opened--;return mode==8?-36:0;}
 static int32_t seekf(int h,unsigned m){assert(h==5);return m==2?(mode==3?4096:4097):(mode==4?-65:0);}
 static int32_t io(unsigned op,int h,void*p,uint32_t n){assert(op==0x3f && h==5);reads++;if(n==1)return mode==7?1:0;assert(n==4097);memcpy(p,payload,n);if(mode==6)((uint8_t*)p)[4000]^=1;return mode==5?4096:4097;}

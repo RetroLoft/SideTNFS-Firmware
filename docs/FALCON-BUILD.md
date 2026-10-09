@@ -49,6 +49,6 @@ are unsupported. Same-session TNFS sequence reuse remains a known limitation.
 
 The host suite covers native guest, storage, configuration and SIDEETH
 behavior. For repeatable file-read stress testing, see
-[the generic RLOAD utility](../tools/rload/README.txt).
+[the generic GLOAD utility](../tools/gload/README.txt).
 Host checks do not replace hardware validation of boot, network operation,
 and settings status/edit/save/reopen on the target Atari.

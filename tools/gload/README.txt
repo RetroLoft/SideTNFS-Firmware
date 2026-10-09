@@ -1,4 +1,4 @@
-RLOAD: read-only GEMDOS file stress test
+GLOAD: read-only GEMDOS file stress test
 ======================================
 
 Build and prepare (Python 3 and Docker required):
@@ -9,9 +9,9 @@ The builder uses a local image containing m68k-atari-mint-gcc, vasm and
 vlink. Set SIDETNFS_TOOLCHAIN_IMAGE to your toolchain image name; the
 fallback image ID is for an existing local toolchain. No image is pulled.
 
-Copy the contents of fixtures/ to an Atari-accessible RLOAD directory,
-preserving its FILES subdirectory. Run RLOAD4.TOS and enter that directory
-(default M:\RLOAD). Choose a separate writable directory for the logs;
+Copy the contents of fixtures/ to an Atari-accessible GLOAD directory,
+preserving its FILES subdirectory. Run GLOAD.TOS and enter that directory
+(default M:\GLOAD). Choose a separate writable directory for the logs;
 P:\ is the default, but a local disk is preferable when testing a network
 drive. Press ESC to stop between files or cycles.
 
@@ -29,10 +29,10 @@ Generated binaries are excluded from Git; anyone can reproduce them.
 Each cycle opens each file read-only, checks its length, rewinds, reads it
 in one GEMDOS Fread, checks IEEE CRC32 and EOF, then closes and frees it.
 This tests file transport, not executable loading or game compatibility.
-Logs use the first available RLOAD000.LOG through RLOAD999.LOG and never
+Logs use the first available GLOAD000.LOG through GLOAD999.LOG and never
 overwrite an existing log. START, PASS, FAIL and STOP include timing.
 
-On the first error, RLOAD retains the original stage and return code,
+On the first error, GLOAD retains the original stage and return code,
 waits ten seconds, probes the source directory with a private DTA,
 restores the previous DTA, logs the original failure and stops. It does
 not retry the failed file or hide the failure behind a later success.
