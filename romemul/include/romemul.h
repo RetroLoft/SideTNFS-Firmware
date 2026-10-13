@@ -24,7 +24,7 @@
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/cyw43_arch.h"
 
-#include "../../build/romemul.pio.h"
+#include "romemul.pio.h"
 
 typedef void (*IRQInterceptionCallback)();
 

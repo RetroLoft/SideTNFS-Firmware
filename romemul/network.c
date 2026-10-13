@@ -224,6 +224,7 @@ static int network_wifi_init_with_country_code(uint32_t country)
     if ((res = cyw43_arch_init_with_country(country)))
     {
         DPRINTF("Failed to initialize WiFi: %d\n", res);
+        cyw43_initialized = false;
         return -1;
     }
 
@@ -398,6 +399,7 @@ int network_init_with_settings(bool force, bool async, char **pass, const sidetn
     if ((res = cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, cyw43_mac)))
     {
         DPRINTF("Failed to get MAC address: %d\n", res);
+        cyw43_initialized = false;
         cyw43_arch_deinit();
         return -2;
     }

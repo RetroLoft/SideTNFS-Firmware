@@ -860,9 +860,9 @@ static void __not_in_flash_func(delete_file_by_fdesc)(FileDescriptors **head, ui
 }
 
 // Comparator function for qsort
-static uint16_t __not_in_flash_func(compare_fd)(const void *a, const void *b)
+static int __not_in_flash_func(compare_fd)(const void *a, const void *b)
 {
-    return (*(uint16_t *)a - *(uint16_t *)b);
+    return (*(const int *)a - *(const int *)b);
 }
 
 static uint16_t __not_in_flash_func(get_first_available_fd)(FileDescriptors *head)
@@ -899,7 +899,7 @@ static uint16_t __not_in_flash_func(get_first_available_fd)(FileDescriptors *hea
     }
 
     // Sort the array by fd
-    qsort(fdArray, count, sizeof(uint16_t), compare_fd);
+    qsort(fdArray, count, sizeof(fdArray[0]), compare_fd);
 
     // Find the smallest gap
     for (uint16_t i = 0; i < count - 1; i++)

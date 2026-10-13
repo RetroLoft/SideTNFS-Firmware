@@ -47,7 +47,7 @@
 #include "sd_card.h"
 #include "f_util.h"
 
-#include "../../build/romemul.pio.h"
+#include "romemul.pio.h"
 
 #include "tprotocol.h"
 #include "commands.h"
