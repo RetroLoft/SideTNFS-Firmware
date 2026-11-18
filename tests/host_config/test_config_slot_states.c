@@ -410,13 +410,13 @@ static void test_g_duplicate_letter_enabled_disabled(void)
 static void test_h_settings_letter_conflict(void)
 {
     printf("Test H: conflict with SETTINGS drive letter\n");
-    sidetnfs_config_init(); // fresh factory defaults, config_drive_letter == 'S'
-    CHECK(sidetnfs_config_get_config_drive_letter() == 'S', "factory settings letter is S");
+    sidetnfs_config_init(); // fresh factory defaults, config_drive_letter == 'I'
+    CHECK(sidetnfs_config_get_config_drive_letter() == 'I', "factory settings letter is I");
 
     sidetnfs_drive_config_t d;
     memset(&d, 0, sizeof(d));
     d.state = SIDETNFS_DRIVE_SLOT_DISABLED;
-    d.drive_letter = 'S'; // same as settings letter
+    d.drive_letter = 'I'; // same as settings letter
     d.type = SIDETNFS_DRIVE_TNFS;
     d.transport = SIDETNFS_TRANSPORT_UDP;
     d.port = 1;
@@ -634,7 +634,7 @@ static void test_8_factory_reset(void)
     sidetnfs_config_init();
     CHECK(sidetnfs_config_loaded_from_flash(), "post-reset config loaded_from_flash (really persisted)");
     CHECK(sidetnfs_config_migrated_from_version() == 0, "post-reset config is native v3, not a migration");
-    CHECK(sidetnfs_config_get_config_drive_letter() == 'S', "post-reset settings letter is factory default S");
+    CHECK(sidetnfs_config_get_config_drive_letter() == 'I', "post-reset settings letter is factory default I");
 
     sidetnfs_drive_config_t d;
     CHECK(sidetnfs_config_get_drive(0, &d) == SIDETNFS_CONFIG_STATUS_OK, "GET slot0 after reset ok");

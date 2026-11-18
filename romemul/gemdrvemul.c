@@ -3152,7 +3152,7 @@ static void sidetnfs_runtime_drives_init(char active_drive_letter, uint32_t acti
     uint8_t settings_letter = sidetnfs_config_get_config_drive_letter();
     if (settings_letter == 0)
     {
-        settings_letter = 'S'; // sidetnfs_config_init() not yet run -- should not happen this late, defensive only
+        settings_letter = 'I'; // sidetnfs_config_init() not yet run -- should not happen this late, defensive only
     }
 
     bool active_is_settings = (active_drive_letter != '\0') && ((uint8_t)active_drive_letter == settings_letter);

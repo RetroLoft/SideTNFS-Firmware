@@ -32,7 +32,10 @@ static const sidetnfs_drive_config_t SIDETNFS_DEFAULT_DRIVE = {
     .sd_path = {0},
 };
 
-#define SIDETNFS_DEFAULT_CONFIG_DRIVE_LETTER 'S'
+// I:, not S: -- the original TOS (GEMDOS) only knows A: to P:; a drive
+// after P: breaks everything that uses the current drive (e.g. the desktop
+// copying a folder there reports a name conflict).
+#define SIDETNFS_DEFAULT_CONFIG_DRIVE_LETTER 'I'
 
 static sidetnfs_drive_flash_t g_config;
 static bool g_config_ready = false;

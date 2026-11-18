@@ -2113,14 +2113,10 @@ void sidetnfs_send_udp_probe(void)
     cyw43_arch_lwip_end();
 }
 
-// Strict, uppercase-only 8.3 name check. Investigation traced
-// the missing "Atari.ST" root-listing entry to this lowercase rejection
-// (mixed-case names are silently dropped by sidetnfs_normalize_dir_entry(),
-// out->skipped = true, while an already-uppercase sibling like "DOS"
-// passes) -- confirmed unrelated to directory position, "."/".." handling,
-// or path normalization. Reverted back to rejecting lowercase on request:
-// entries with lowercase letters are intentionally ignored -- rename them
-// uppercase on the TNFS server instead of relaxing this check.
+// Strict, uppercase-only 8.3 name check. sidetnfs_normalize_dir_entry()
+// uppercases a server name before calling this, so a mixed-case name like
+// "Atari.ST" is listed as ATARI.ST; lowercase is still rejected here for any
+// caller that passes a name unconverted.
 bool sidetnfs_is_supported_83_name(const char *name)
 {
     if (name == NULL || name[0] == '\0')
@@ -2220,14 +2216,29 @@ bool sidetnfs_normalize_dir_entry(const char *tnfs_name, uint8_t tnfs_flags,
         out->skipped = true;
         return false;
     }
-    if (!sidetnfs_is_supported_83_name(tnfs_name))
+    // GEMDOS sees names in capitals: "ICDPro" on the server is listed as
+    // ICDPRO (ASCII letters only; bytes >= 0x80 are left alone). A lookup
+    // of ICDPRO finds the server's spelling again, see tnfs_case_resolve().
+    // Names that don't fit 8.3 stay hidden, as before.
+    char upper[sizeof(out->name)];
+    size_t name_len = strlen(tnfs_name);
+    if (name_len >= sizeof(upper))
+    {
+        out->skipped = true;
+        return false;
+    }
+    for (size_t i = 0; i <= name_len; i++)
+    {
+        char c = tnfs_name[i];
+        upper[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    }
+    if (!sidetnfs_is_supported_83_name(upper))
     {
         out->skipped = true;
         return false;
     }
 
-    strncpy(out->name, tnfs_name, sizeof(out->name) - 1);
-    out->name[sizeof(out->name) - 1] = '\0';
+    memcpy(out->name, upper, name_len + 1);
 
     bool is_dir = (tnfs_flags & TNFS_DIRENTRY_DIR) != 0;
     out->attr = 0;
@@ -5246,6 +5257,280 @@ static SidetnfsDirSearchResult tnfs_dta_find_next_match(SidetnfsTnfsDtaSearch *s
     return SIDETNFS_DIR_SEARCH_ERROR;
 }
 
+// ---------------------------------------------------------------------------
+// Case-insensitive TNFS path lookup.
+//
+// GEMDOS only ever sends names in capitals, while a TNFS server is usually
+// case-sensitive: "ICDPro" on the server is listed as ICDPRO (see
+// sidetnfs_normalize_dir_entry()), and the Atari then asks for "ICDPRO".
+// tnfs_case_resolve() turns such a path into the spelling the server
+// actually has.
+//
+// Callers use it in two ways:
+//  - try first, resolve on a miss (open for reading, stat, opendir,
+//    delete, rmdir, rename source): costs nothing when the spelling is
+//    already right, which is the common case;
+//  - resolve first (create, mkdir, rename destination): so that writing
+//    "README.TXT" next to an existing "readme.txt" reuses that file instead
+//    of creating a second one that differs only in case.
+//
+// Algorithm, iterative on purpose (the core-0 stack is only 4 KB):
+//  1. find the deepest prefix of the path that exists exactly as given,
+//     by STATing the path and then its parents, one level at a time;
+//  2. from there, walk down the remaining components, scanning each
+//     directory for an entry that matches case-insensitively (an exact
+//     match wins). A component the server doesn't have stays as given --
+//     that's the name a create/mkdir will use -- and so does the rest of
+//     the path after it.
+// ASCII letters only: bytes >= 0x80 must match exactly.
+// ---------------------------------------------------------------------------
+
+#define SIDETNFS_TNFS_CASE_PATH_MAX 256u
+#define SIDETNFS_TNFS_CASE_SCAN_MAX_ROUNDS 64 // 64 * 15 entries: bounds a scan of a huge directory
+
+// Two buffers so a rename can hold both a resolved source and destination.
+// Static rather than on the 4 KB core-0 stack.
+static char s_case_path_a[SIDETNFS_TNFS_CASE_PATH_MAX];
+static char s_case_path_b[SIDETNFS_TNFS_CASE_PATH_MAX];
+
+static bool tnfs_case_equal_n(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (ca >= 'a' && ca <= 'z')
+            ca = (unsigned char)(ca - 'a' + 'A');
+        if (cb >= 'a' && cb <= 'z')
+            cb = (unsigned char)(cb - 'a' + 'A');
+        if (ca != cb)
+            return false;
+    }
+    return true;
+}
+
+// True when the server answers TNFS_OK to a STAT of path exactly as given.
+// A timeout or any error counts as "not there".
+static bool tnfs_case_path_exists(const sidetnfs_slot_tnfs_context_t *ctx, const char *path)
+{
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        uint8_t seq = 0;
+        if (!fslisting_send_stat(ctx, path, &seq))
+        {
+            return false;
+        }
+        if (fslisting_wait_for(ctx, TNFS_CMD_STAT, seq))
+        {
+            uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+            s_fslisting_resp.response_ready = false;
+            return rc == TNFS_OK;
+        }
+    }
+    return false;
+}
+
+// Scans directory dir for the entry comp[0..comp_len) names, ignoring case.
+// On a match, overwrites comp in place with the server's spelling (same
+// length, ASCII case only) and returns true. An exact match ends the scan
+// at once; a case-insensitive one is kept while the scan goes on looking
+// for an exact one. Uses its own OPENDIRX/READDIRX/CLOSEDIR round trips,
+// not s_raw_readdir_cache, so an open floppy-browser walk is left alone.
+static bool tnfs_case_scan_dir(const sidetnfs_slot_tnfs_context_t *ctx, const char *dir, char *comp, size_t comp_len)
+{
+    uint8_t seq = 0;
+    if (!fslisting_send_opendirx(ctx, dir, &seq) || !fslisting_wait_for(ctx, TNFS_CMD_OPENDIRX, seq))
+    {
+        return false;
+    }
+    uint8_t rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+    uint8_t handle = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+    s_fslisting_resp.response_ready = false;
+    if (rc != TNFS_OK)
+    {
+        return false;
+    }
+
+    bool found_exact = false;
+    bool found_any = false;
+    int network_retries_left = 1;
+    for (int round = 0; round < SIDETNFS_TNFS_CASE_SCAN_MAX_ROUNDS && !found_exact; round++)
+    {
+        if (!fslisting_send_readdirx(ctx, handle, (uint8_t)SIDETNFS_FLOPPY_BROWSE_READDIRX_BATCH, &seq))
+        {
+            break;
+        }
+        if (!fslisting_wait_for(ctx, TNFS_CMD_READDIRX, seq))
+        {
+            if (network_retries_left-- > 0)
+            {
+                continue;
+            }
+            break;
+        }
+        rc = s_fslisting_resp.len > 4 ? s_fslisting_resp.buf[4] : 0xFFu;
+        uint8_t batch = s_fslisting_resp.len > 5 ? s_fslisting_resp.buf[5] : 0;
+        uint16_t resp_len = s_fslisting_resp.len;
+        s_fslisting_resp.response_ready = false;
+        if (rc != TNFS_OK && rc != TNFS_EOF)
+        {
+            break;
+        }
+        // Same READDIRX entry layout and truncation guards as
+        // sidetnfs_tnfs_raw_readdir(): entries start at offset 9, each is
+        // 13 bytes of flags/size/times followed by a NUL-terminated name.
+        const uint8_t *buf = s_fslisting_resp.buf;
+        uint16_t needle = 9;
+        for (uint8_t i = 0; i < batch && resp_len > 9; i++)
+        {
+            if ((uint32_t)needle + 13 >= resp_len)
+            {
+                break;
+            }
+            const char *name = (const char *)&buf[needle + 13];
+            uint16_t avail = (uint16_t)(resp_len - (needle + 13));
+            size_t nlen = strnlen(name, avail);
+            if (nlen >= avail)
+            {
+                break;
+            }
+            needle = (uint16_t)(needle + 13 + (uint16_t)nlen + 1);
+            if (nlen != comp_len)
+            {
+                continue;
+            }
+            if (memcmp(name, comp, comp_len) == 0)
+            {
+                found_exact = true; // already spelled right -- comp stays as is
+                break;
+            }
+            if (!found_any && tnfs_case_equal_n(name, comp, comp_len))
+            {
+                memcpy(comp, name, comp_len);
+                found_any = true;
+            }
+        }
+        if (rc == TNFS_EOF || batch == 0)
+        {
+            break;
+        }
+    }
+
+    uint8_t close_seq = 0;
+    if (fslisting_send_closedir(ctx, handle, &close_seq))
+    {
+        (void)fslisting_wait_for(ctx, TNFS_CMD_CLOSEDIR, close_seq);
+        s_fslisting_resp.response_ready = false;
+    }
+    return found_exact || found_any;
+}
+
+// Writes the server's spelling of path `in` to `out` (see the block comment
+// above). check_self = false skips the STAT of the full path, for callers
+// that just got "not found" for it. Returns true only when `out` differs
+// from `in`, i.e. when a retry with `out` is worth it.
+static bool tnfs_case_resolve(int slot, const char *in, bool check_self, char *out)
+{
+    size_t len = strlen(in);
+    if (len == 0 || len >= SIDETNFS_TNFS_CASE_PATH_MAX)
+    {
+        return false;
+    }
+    sidetnfs_slot_tnfs_context_t ctx;
+    if (!sidetnfs_probe_get_slot_context(slot, &ctx))
+    {
+        return false;
+    }
+    memcpy(out, in, len + 1);
+    if (check_self && tnfs_case_path_exists(&ctx, out))
+    {
+        return false;
+    }
+
+    // 1. Deepest prefix that exists as given. `known` is its length in
+    //    `out`; 0 or 1 means the root ("" or "/").
+    size_t known = len;
+    for (;;)
+    {
+        while (known > 0 && out[known - 1] != '/')
+        {
+            known--; // drop the last component
+        }
+        while (known > 1 && out[known - 1] == '/')
+        {
+            known--; // and the separator(s) before it, but keep a leading "/"
+        }
+        if (known == 1 && out[0] == '/')
+        {
+            known = 0; // "/" itself: the root
+        }
+        if (known == 0)
+        {
+            break; // reached the root, which always exists
+        }
+        char saved = out[known];
+        out[known] = '\0';
+        bool exists = tnfs_case_path_exists(&ctx, out);
+        out[known] = saved;
+        if (exists)
+        {
+            break;
+        }
+    }
+
+    // 2. Walk down from there, one component at a time.
+    size_t pos = known;
+    while (pos < len)
+    {
+        while (pos < len && out[pos] == '/')
+        {
+            pos++;
+        }
+        size_t start = pos;
+        while (pos < len && out[pos] != '/')
+        {
+            pos++;
+        }
+        size_t comp_len = pos - start;
+        if (comp_len == 0)
+        {
+            break;
+        }
+        if ((comp_len == 1 && out[start] == '.') || (comp_len == 2 && out[start] == '.' && out[start + 1] == '.'))
+        {
+            continue;
+        }
+        // The directory to scan is out[0..start) without its trailing
+        // separator(s), or "/" at the top.
+        size_t dir_len = start;
+        while (dir_len > 1 && out[dir_len - 1] == '/')
+        {
+            dir_len--;
+        }
+        bool at_root = (dir_len == 0) || (dir_len == 1 && out[0] == '/');
+        bool found;
+        if (at_root)
+        {
+            found = tnfs_case_scan_dir(&ctx, "/", &out[start], comp_len);
+        }
+        else
+        {
+            // out[dir_len] is a '/' before this component (dir_len < start
+            // here), so the temporary NUL never touches the name that
+            // tnfs_case_scan_dir() may rewrite in out[start..pos). The name
+            // it writes has the same length, so `len` and `pos` stay valid.
+            out[dir_len] = '\0';
+            found = tnfs_case_scan_dir(&ctx, out, &out[start], comp_len);
+            out[dir_len] = '/';
+        }
+        if (!found)
+        {
+            break; // not on the server: this component and the rest stay as given
+        }
+    }
+    return strcmp(out, in) != 0;
+}
+
 SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const char *path,
                                                   const char *pattern, uint8_t attribs,
                                                   SidetnfsAtariDirEntry *out_entry)
@@ -5270,6 +5555,12 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const c
     // repeat-continuation workaround was removed.
     // Bounded network-retry on a single timed-out round -- see
     // sidetnfs_tnfs_file_read()'s own comment.
+    // The path as GEMDOS gave it. The registry keeps this spelling, since
+    // sidetnfs_tnfs_dta_release_by_path()/_close_by_path() compare against
+    // paths built the same way; only the OPENDIRX uses the resolved one.
+    const char *registry_path = path;
+    bool case_retry_done = false;
+opendirx_again:;
     int opendirx_retries_left = 2;
     uint8_t seq = 0;
     bool opendirx_responded = false;
@@ -5302,6 +5593,15 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const c
     s_fslisting_resp.response_ready = false;
     if (rc != TNFS_OK)
     {
+        // A folder spelled differently on the server ("ICDPro" asked for
+        // as "ICDPRO"): look up its real spelling once and try again.
+        if ((rc == TNFS_ENOENT || rc == TNFS_ENOTDIR) && !case_retry_done &&
+            tnfs_case_resolve(slot, path, false, s_case_path_a))
+        {
+            case_retry_done = true;
+            path = s_case_path_a;
+            goto opendirx_again;
+        }
         sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_OPENDIRX_ERROR, ndta, path, NULL, NULL, 0, 0, rc, 0);
         return SIDETNFS_DIR_SEARCH_ERROR;
     }
@@ -5309,7 +5609,7 @@ SidetnfsDirSearchResult sidetnfs_tnfs_dta_start(uint32_t ndta, int slot, const c
     sidetnfs_diag_log(SIDETNFS_DIAG_TNFS_OPENDIRX_OK, ndta, path, NULL, NULL, 0, handle, 0, 0);
 #endif
 
-    SidetnfsTnfsDtaSearch *search = insertTnfsDTA(ndta, path, pattern, attribs, handle, slot);
+    SidetnfsTnfsDtaSearch *search = insertTnfsDTA(ndta, registry_path, pattern, attribs, handle, slot);
 
     SidetnfsDirSearchResult result = tnfs_dta_find_next_match(search, out_entry);
     if (result != SIDETNFS_DIR_SEARCH_FOUND)
@@ -5562,7 +5862,7 @@ uint16_t sidetnfs_tnfs_dta_count_active(void)
 // there, never indexes s_slot_contexts[] out of range) -- an invalid slot
 // is treated as a plain OPEN-send failure (SIDETNFS_FILE_OPEN_ERROR), same
 // as any other network-level failure this function already handles.
-static SidetnfsFileOpenResult tnfs_open_with_flags(int runtime_slot, const char *tnfs_path, uint16_t flags,
+static SidetnfsFileOpenResult tnfs_open_with_flags_exact(int runtime_slot, const char *tnfs_path, uint16_t flags,
                                                     uint16_t mode, uint8_t *out_handle)
 {
     bool is_create = (flags & TNFS_OPEN_CREAT) != 0;
@@ -5637,6 +5937,29 @@ static SidetnfsFileOpenResult tnfs_open_with_flags(int runtime_slot, const char 
     }
     sidetnfs_diag_log(SIDETNFS_DIAG_FOPEN_TNFS_ERROR, 0, tnfs_path, NULL, NULL, 0, 0, rc, 0);
     return (rc == TNFS_ENOENT) ? SIDETNFS_FILE_OPEN_NOT_FOUND : SIDETNFS_FILE_OPEN_ERROR;
+}
+
+// tnfs_open_with_flags_exact() with the case-insensitive lookup (see
+// tnfs_case_resolve()): a create resolves first, so it reuses an existing
+// file spelled differently; any other open tries as given and resolves
+// only on "not found".
+static SidetnfsFileOpenResult tnfs_open_with_flags(int runtime_slot, const char *tnfs_path, uint16_t flags,
+                                                   uint16_t mode, uint8_t *out_handle)
+{
+    if (flags & TNFS_OPEN_CREAT)
+    {
+        if (tnfs_case_resolve(runtime_slot, tnfs_path, true, s_case_path_a))
+        {
+            tnfs_path = s_case_path_a;
+        }
+        return tnfs_open_with_flags_exact(runtime_slot, tnfs_path, flags, mode, out_handle);
+    }
+    SidetnfsFileOpenResult r = tnfs_open_with_flags_exact(runtime_slot, tnfs_path, flags, mode, out_handle);
+    if (r == SIDETNFS_FILE_OPEN_NOT_FOUND && tnfs_case_resolve(runtime_slot, tnfs_path, false, s_case_path_a))
+    {
+        r = tnfs_open_with_flags_exact(runtime_slot, s_case_path_a, flags, mode, out_handle);
+    }
+    return r;
 }
 
 // TNFS OPEN for GEMDOS Fopen. gemdos_mode is the raw Fopen mode
@@ -6036,7 +6359,7 @@ void sidetnfs_tnfs_file_close(uint32_t guest_fd, uint8_t tnfs_handle, int runtim
 // stays exactly as before (implicitly slot 0's session), so slot 0's
 // context is resolved here directly rather than threading a slot
 // parameter through a call chain this phase doesn't otherwise touch.
-bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+static bool tnfs_directory_exists_exact(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
 #if SIDETNFS_DIAG_DUMP_ON_SELECT
     // Reset this call's record up front so a bail-out below still leaves a
@@ -6224,7 +6547,7 @@ bool sidetnfs_tnfs_file_seek(uint32_t guest_fd, uint8_t tnfs_handle, int runtime
 // gemdrvemul.c) always treats as "not deleted", never as success -- so a
 // directory can never be silently reported as deleted regardless of the
 // exact rc the server happens to return for that case.
-SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+static SidetnfsFileDeleteResult tnfs_file_delete_exact(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
@@ -6292,7 +6615,7 @@ SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char 
 // surface as EEXIST, unverified against this specific server), that is
 // folded into ACCESS_DENIED rather than silently overwriting or inventing
 // a delete-then-rename fallback.
-SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char *old_path, const char *new_path,
+static SidetnfsFileRenameResult tnfs_file_rename_exact(int runtime_slot, const char *old_path, const char *new_path,
                                                     uint8_t *out_rc)
 {
     if (out_rc)
@@ -6357,7 +6680,7 @@ SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char 
 
 // TNFS MKDIR. No pre-check of existence -- no directory listing,
 // no separate stat. The wire rc alone determines the result.
-SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+static SidetnfsDirCreateResult tnfs_directory_create_exact(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
@@ -6424,7 +6747,7 @@ SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const c
 // TNFS RMDIR. No pre-check, no directory enumeration to see
 // whether the directory is empty -- the server must bear that
 // responsibility atomically. Never falls back to TNFS_CMD_UNLINK.
-SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+static SidetnfsDirDeleteResult tnfs_directory_delete_exact(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
 {
     if (out_rc)
     {
@@ -6651,12 +6974,26 @@ static uint8_t tnfs_mode_to_st_attribs(uint16_t mode)
     return attribs;
 }
 
+// tnfs_stat_raw() that retries once with the server's spelling of the path
+// (see tnfs_case_resolve()) when the path as given isn't found.
+static SidetnfsTnfsStatResult tnfs_stat_resolved(int runtime_slot, const char *tnfs_path,
+                                                 SidetnfsTnfsRawStat *out_stat, uint8_t *out_rc)
+{
+    SidetnfsTnfsStatResult r = tnfs_stat_raw(runtime_slot, tnfs_path, out_stat, out_rc);
+    if ((r == SIDETNFS_TNFS_STAT_NOT_FOUND || r == SIDETNFS_TNFS_STAT_PATH_NOT_FOUND) &&
+        tnfs_case_resolve(runtime_slot, tnfs_path, false, s_case_path_a))
+    {
+        r = tnfs_stat_raw(runtime_slot, s_case_path_a, out_stat, out_rc);
+    }
+    return r;
+}
+
 // TNFS STAT -> GEMDOS/DOS-style attributes, for Fattrib inquire.
 SidetnfsAttrResult sidetnfs_tnfs_get_attributes(int runtime_slot, const char *tnfs_path, uint8_t *out_st_attribs,
                                                  uint8_t *out_rc)
 {
     SidetnfsTnfsRawStat stat = {0};
-    SidetnfsTnfsStatResult result = tnfs_stat_raw(runtime_slot, tnfs_path, &stat, out_rc);
+    SidetnfsTnfsStatResult result = tnfs_stat_resolved(runtime_slot, tnfs_path, &stat, out_rc);
     if (result != SIDETNFS_TNFS_STAT_OK)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FATTRIB_STAT_ERROR, 0, tnfs_path, NULL, NULL, 0, 0,
@@ -6761,7 +7098,7 @@ SidetnfsAttrResult sidetnfs_tnfs_get_datetime(int runtime_slot, const char *tnfs
                                                uint16_t *out_gemdos_time, uint32_t *out_unix_mtime, uint8_t *out_rc)
 {
     SidetnfsTnfsRawStat stat = {0};
-    SidetnfsTnfsStatResult result = tnfs_stat_raw(runtime_slot, tnfs_path, &stat, out_rc);
+    SidetnfsTnfsStatResult result = tnfs_stat_resolved(runtime_slot, tnfs_path, &stat, out_rc);
     if (result != SIDETNFS_TNFS_STAT_OK)
     {
         sidetnfs_diag_log(SIDETNFS_DIAG_FDATIME_INQUIRE_ERR, 0, tnfs_path, NULL, NULL, 0, 0,
@@ -7792,4 +8129,73 @@ void sidetnfs_diag_dump_on_select(const char *hd_folder)
 #else
     (void)eventlog_ok;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Public TNFS path operations with the case-insensitive lookup (see
+// tnfs_case_resolve()). Each tries the path as given first and, only when
+// the server says it isn't there, retries once with the server's spelling.
+// mkdir and a rename destination resolve first instead: they name
+// something that may not exist yet, and must not create a second entry
+// next to one that differs only in case.
+// ---------------------------------------------------------------------------
+
+bool sidetnfs_tnfs_directory_exists(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+{
+    uint8_t rc = 0xFFu;
+    bool exists = tnfs_directory_exists_exact(runtime_slot, tnfs_path, &rc);
+    if (!exists && (rc == TNFS_ENOENT || rc == TNFS_ENOTDIR) &&
+        tnfs_case_resolve(runtime_slot, tnfs_path, false, s_case_path_a))
+    {
+        exists = tnfs_directory_exists_exact(runtime_slot, s_case_path_a, &rc);
+    }
+    if (out_rc)
+    {
+        *out_rc = rc;
+    }
+    return exists;
+}
+
+SidetnfsFileDeleteResult sidetnfs_tnfs_file_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+{
+    SidetnfsFileDeleteResult r = tnfs_file_delete_exact(runtime_slot, tnfs_path, out_rc);
+    if (r == SIDETNFS_FILE_DELETE_NOT_FOUND && tnfs_case_resolve(runtime_slot, tnfs_path, false, s_case_path_a))
+    {
+        r = tnfs_file_delete_exact(runtime_slot, s_case_path_a, out_rc);
+    }
+    return r;
+}
+
+SidetnfsFileRenameResult sidetnfs_tnfs_file_rename(int runtime_slot, const char *old_path, const char *new_path,
+                                                    uint8_t *out_rc)
+{
+    if (tnfs_case_resolve(runtime_slot, new_path, true, s_case_path_b))
+    {
+        new_path = s_case_path_b;
+    }
+    SidetnfsFileRenameResult r = tnfs_file_rename_exact(runtime_slot, old_path, new_path, out_rc);
+    if (r == SIDETNFS_FILE_RENAME_NOT_FOUND && tnfs_case_resolve(runtime_slot, old_path, false, s_case_path_a))
+    {
+        r = tnfs_file_rename_exact(runtime_slot, s_case_path_a, new_path, out_rc);
+    }
+    return r;
+}
+
+SidetnfsDirCreateResult sidetnfs_tnfs_directory_create(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+{
+    if (tnfs_case_resolve(runtime_slot, tnfs_path, true, s_case_path_a))
+    {
+        tnfs_path = s_case_path_a;
+    }
+    return tnfs_directory_create_exact(runtime_slot, tnfs_path, out_rc);
+}
+
+SidetnfsDirDeleteResult sidetnfs_tnfs_directory_delete(int runtime_slot, const char *tnfs_path, uint8_t *out_rc)
+{
+    SidetnfsDirDeleteResult r = tnfs_directory_delete_exact(runtime_slot, tnfs_path, out_rc);
+    if (r == SIDETNFS_DIR_DELETE_PATH_NOT_FOUND && tnfs_case_resolve(runtime_slot, tnfs_path, false, s_case_path_a))
+    {
+        r = tnfs_directory_delete_exact(runtime_slot, s_case_path_a, out_rc);
+    }
+    return r;
 }
