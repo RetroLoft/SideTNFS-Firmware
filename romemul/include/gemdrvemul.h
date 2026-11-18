@@ -59,7 +59,11 @@
 
 #define DEFAULT_FOPEN_READ_BUFFER_SIZE 16384
 #define DEFAULT_FWRITE_BUFFER_SIZE 2048
-#define FIRST_FILE_DESCRIPTOR 16384
+// Fits in a signed byte, for programs that keep a handle in one (1st Word
+// Plus does: 16384 = $4000 has low byte 0 and it hung reading WORDPLUS.STR),
+// and above the handles TOS hands out. GEMDRIVE treats every handle from here
+// up as its own; negative device handles (CON: = -1, ...) go to TOS.
+#define FIRST_FILE_DESCRIPTOR 100
 #define PRG_STRUCT_SIZE 28 // Size of the GEMDOS structure in the executable header file (PRG)
 #define SHARED_VARIABLES_MAXSIZE 32
 #define SHARED_VARIABLES_SIZE 7

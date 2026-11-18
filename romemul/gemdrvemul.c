@@ -7031,11 +7031,22 @@ void init_gemdrvemul(bool safe_config_reboot)
         {
             uint32_t ndta = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0];
             DPRINTF("Releasing DTA: %x\n", ndta);
+            // GEMDRIVE now sends a DTA_RELEASE before EVERY Fsfirst that
+            // goes to a TOS drive (so a DTA left over from an emulated
+            // search can't hijack TOS's Fsnext). That makes these two
+            // events as frequent as DTA_EXIST, so they're gated the same
+            // way. The per-backend RELEASE_TNFS/FAKE/FATFS events inside
+            // gemdrive_backend_dta_release() still fire whenever a real
+            // search was actually released.
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
             sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_ENTER, ndta, NULL, NULL, NULL, 0, 0, 0, 0);
+#endif
             uint32_t release_count = gemdrive_backend_dta_release(ndta, memory_shared_address);
             WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_DTA_RELEASE, release_count);
+#if !SIDETNFS_DEBUG_SUPPRESS_DIR_DETAIL
             sidetnfs_diag_log(SIDETNFS_DIAG_DTA_RELEASE_RETURN, ndta, NULL, NULL, NULL, 0, 0, 0,
                                (uint8_t)release_count);
+#endif
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
