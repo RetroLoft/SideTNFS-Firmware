@@ -2774,6 +2774,9 @@ static void gemdrive_backend_fclose(uint16_t fclose_fd, uint32_t memory_shared_a
 // GEMDRVEMUL_READ_BUFF_CALL backend routing.
 static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pending_bytes_to_read, uint32_t memory_shared_address)
 {
+    // The whole buffer, unless the TNFS path below asks less of a distant
+    // server -- see SHARED_VARIABLE_READ_CHUNK.
+    set_shared_var(SHARED_VARIABLE_READ_CHUNK, DEFAULT_FOPEN_READ_BUFFER_SIZE, memory_shared_address);
 #if SIDETNFS_USE_TNFS_LISTING
     sidetnfs_diag_log(SIDETNFS_DIAG_FREAD_ENTER, readbuff_fd, NULL, NULL, NULL, 0,
                        (uint16_t)(readbuff_pending_bytes_to_read > 0xFFFFu ? 0xFFFFu : readbuff_pending_bytes_to_read), 0, 0);
@@ -2900,8 +2903,12 @@ static void gemdrive_backend_fread(uint16_t readbuff_fd, uint32_t readbuff_pendi
         WRITE_AND_SWAP_LONGWORD(memory_shared_address, GEMDRVEMUL_READ_BYTES, GEMDOS_EIHNDL);
         return;
     }
-    uint16_t buff_size = readbuff_pending_bytes_to_read > DEFAULT_FOPEN_READ_BUFFER_SIZE
-                              ? DEFAULT_FOPEN_READ_BUFFER_SIZE
+    // A distant server gets less per command, so all its READ rounds fit in
+    // the time the Atari waits for one command; GEMDRIVE then asks again.
+    uint16_t read_chunk = sidetnfs_probe_read_chunk_for_slot(file->runtime_slot);
+    set_shared_var(SHARED_VARIABLE_READ_CHUNK, read_chunk, memory_shared_address);
+    uint16_t buff_size = readbuff_pending_bytes_to_read > read_chunk
+                              ? read_chunk
                               : (uint16_t)readbuff_pending_bytes_to_read;
 #if SIDETNFS_DEBUG_FOCUS_FILE_IO
     sidetnfs_diag_log(SIDETNFS_DIAG_READ_BUFF_REQUESTED, readbuff_fd, NULL, NULL, NULL, 0, buff_size, 0, 0);
@@ -4245,6 +4252,8 @@ void init_gemdrvemul(bool safe_config_reboot)
     // place -- other Pico-side code still reads them, and this table is
     // additive, not a replacement, in this phase.
     set_shared_var(SHARED_VARIABLE_PROTOCOL_VERSION, SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION, memory_shared_address);
+    set_shared_var(SHARED_VARIABLE_CODE_BUFFER, 0, memory_shared_address);
+    set_shared_var(SHARED_VARIABLE_READ_CHUNK, DEFAULT_FOPEN_READ_BUFFER_SIZE, memory_shared_address);
 
     // Builds g_runtime_drives (slot 0
     // = the already-active N: drive, slot 1 = the persisted O: config if
@@ -4873,6 +4882,10 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_PING:
         {
+            // A new Atari boot: GEMDRIVE's code buffer address, if any, is
+            // from before a warm reset. GEMDRIVE allocates a new one after
+            // this ping (see SHARED_VARIABLE_CODE_BUFFER).
+            set_shared_var(SHARED_VARIABLE_CODE_BUFFER, 0, memory_shared_address);
             if (!hd_folder_ready)
             {
 #if SIDETNFS_USE_TNFS_LISTING
@@ -5086,6 +5099,16 @@ void init_gemdrvemul(bool safe_config_reboot)
             payloadPtr += 2;                                                                  // Skip two words
             uint32_t shared_variable_value = ((uint32_t)payloadPtr[1] << 16) | payloadPtr[0]; // d4 register
             set_shared_var(shared_variable_index, shared_variable_value, memory_shared_address);
+            if (shared_variable_index == SHARED_VARIABLE_SVERSION)
+            {
+                // GEMDRIVE sends the TOS version as its very first command of
+                // a boot, before GEMDRVEMUL_PING: forget a code buffer
+                // address from before a warm reset as early as possible (see
+                // SHARED_VARIABLE_CODE_BUFFER). This command itself still ran
+                // from that old address, which at this point of the boot
+                // (cartridge init, before any disk boot) is free RAM.
+                set_shared_var(SHARED_VARIABLE_CODE_BUFFER, 0, memory_shared_address);
+            }
             write_random_token(memory_shared_address);
             active_command_id = 0xFFFF;
             break;
@@ -5947,6 +5970,11 @@ void init_gemdrvemul(bool safe_config_reboot)
         }
         case GEMDRVEMUL_FLOPPY_SAVE_VECTORS:
         {
+            // First command of a boot with the floppy hooks: forget a code
+            // buffer address from before a warm reset (see
+            // SHARED_VARIABLE_CODE_BUFFER). Without GEMDRIVE nothing sets a
+            // new one, and the hooks keep using _dskbufp as before.
+            set_shared_var(SHARED_VARIABLE_CODE_BUFFER, 0, memory_shared_address);
             // Request: old_hdv_bpb(4) + old_hdv_rw(4) + old_hdv_mediach(4)
             // -- sent once by the Atari's floppy-hook installer, before
             // it overwrites those three vectors. Pure storage, no backend

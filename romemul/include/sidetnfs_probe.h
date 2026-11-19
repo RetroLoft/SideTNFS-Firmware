@@ -326,7 +326,20 @@ typedef struct
     // argument. Keeping it per slot is also what stops two drives with
     // different hosts from overwriting each other's answer.
     sidetnfs_resolve_t resolve;
+
+    // Round-trip time of this slot's MOUNT, in ms (0 = not measured). Sets
+    // how long a TNFS round waits for its answer and how much one Atari
+    // Fread asks of this server, so a distant server (e.g. NZ -> NL, about
+    // 300 ms) works without slowing down a server on the LAN.
+    uint16_t rtt_ms;
 } sidetnfs_slot_tnfs_context_t;
+
+// Bytes one GEMDRVEMUL_READ_BUFF_CALL should fill for TNFS runtime slot
+// `slot`: the full 16 KB on a fast server, less on a distant one, so all
+// the TNFS READ rounds of one Atari command fit well inside the time the
+// Atari waits for the command (about 6 s on an 8 MHz 68000). Always a
+// multiple of 512, between 512 and 16384.
+uint16_t sidetnfs_probe_read_chunk_for_slot(int slot);
 
 // Populates slot `slot`'s host/port/mount_path/sd_path/backend/transport
 // from *cfg (a full copy, not a reference -- *cfg may be a stack-local

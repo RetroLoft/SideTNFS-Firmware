@@ -3011,23 +3011,122 @@ static void send_slot_mount_request(int slot)
     cyw43_arch_lwip_end();
 }
 
-// Bounded poll
-// wait for a single MOUNT response flag -- same shape/timeout as
-// fslisting_wait_for() (SIDETNFS_FS_WAIT_MAX_ITER * SIDETNFS_FS_WAIT_STEP_US
-// = 200ms), the already-proven bound for one UDP round trip to the
-// configured TNFS server on a LAN.
-static bool wait_for_mount_response(const bool *response_flag)
+// A MOUNT waits up to SIDETNFS_MOUNT_WAIT_MS for its answer and is sent at
+// most SIDETNFS_MOUNT_ATTEMPTS times. The old single 200 ms wait was a LAN
+// bound: from New Zealand the public server in the Netherlands answers
+// after about 300 ms, so its MOUNT always "timed out". A server that is
+// really down now costs 2 s per drive at boot instead of 200 ms.
+#define SIDETNFS_MOUNT_WAIT_MS 1000u
+#define SIDETNFS_MOUNT_ATTEMPTS 2
+
+// Bounded poll for a single MOUNT response flag. Returns true when the
+// flag came up within timeout_ms; *out_elapsed_ms then holds how long it
+// took (the round-trip time, to about a millisecond).
+static bool wait_for_mount_response(const bool *response_flag, uint32_t timeout_ms, uint32_t *out_elapsed_ms)
 {
-    for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
+    uint32_t start_us = time_us_32();
+    for (;;)
     {
         cyw43_arch_poll();
+        uint32_t elapsed_us = time_us_32() - start_us;
         if (*response_flag)
         {
+            *out_elapsed_ms = elapsed_us / 1000u;
             return true;
+        }
+        if (elapsed_us >= timeout_ms * 1000u)
+        {
+            return false; // bounded-wait timeout
         }
         sleep_us(SIDETNFS_FS_WAIT_STEP_US);
     }
-    return false; // bounded-wait timeout
+}
+
+// Sends runtime slot `slot`'s MOUNT and waits for the answer, sending it
+// once more if the first one goes unanswered (a lost packet, or ARP not
+// yet resolved right after WiFi came up). Records the round-trip time in
+// the slot's rtt_ms. Returns whether any answer arrived; whether it was
+// TNFS_OK is in the slot's own session_established/mount_result, as before.
+static bool mount_slot_and_measure(int slot)
+{
+    bool responded = false;
+    for (int attempt = 0; attempt < SIDETNFS_MOUNT_ATTEMPTS && !responded; attempt++)
+    {
+        if (slot == 0)
+        {
+            sidetnfs_send_mount_probe();
+        }
+        else
+        {
+            send_slot_mount_request(slot);
+        }
+        uint32_t elapsed_ms = 0;
+        responded = wait_for_mount_response(&s_slot_contexts[slot].response_received, SIDETNFS_MOUNT_WAIT_MS,
+                                            &elapsed_ms);
+        if (responded)
+        {
+            // At least 1 ms, so 0 keeps meaning "not measured".
+            s_slot_contexts[slot].rtt_ms = (uint16_t)(elapsed_ms == 0 ? 1u : elapsed_ms);
+        }
+    }
+    if (s_mount_pending_slot == slot)
+    {
+        s_mount_pending_slot = -1;
+    }
+    return responded;
+}
+
+// How long one TNFS round (request -> matching response) of a slot whose
+// MOUNT took rtt_ms waits: three round trips plus 100 ms, between 200 ms
+// (the old fixed value, so a LAN server behaves exactly as before) and
+// 1200 ms. The upper bound keeps an operation with its few network retries
+// inside the time the Atari waits for one command.
+#define SIDETNFS_ROUND_WAIT_MIN_MS 200u
+#define SIDETNFS_ROUND_WAIT_MAX_MS 1200u
+static uint32_t round_wait_ms_for_rtt(uint16_t rtt_ms)
+{
+    uint32_t ms = 3u * (uint32_t)rtt_ms + 100u;
+    if (ms < SIDETNFS_ROUND_WAIT_MIN_MS)
+    {
+        ms = SIDETNFS_ROUND_WAIT_MIN_MS;
+    }
+    if (ms > SIDETNFS_ROUND_WAIT_MAX_MS)
+    {
+        ms = SIDETNFS_ROUND_WAIT_MAX_MS;
+    }
+    return ms;
+}
+
+// Time one Atari Fread command may spend on TNFS READ rounds. The Atari
+// gives up on a command after about 6 s (8 MHz 68000); 2.5 s leaves room
+// for a retried round and for slower links than measured at MOUNT.
+#define SIDETNFS_READ_COMMAND_BUDGET_MS 2500u
+
+uint16_t sidetnfs_probe_read_chunk_for_slot(int slot)
+{
+    const uint32_t full = 16384u; // DEFAULT_FOPEN_READ_BUFFER_SIZE / GEMDRIVE's BUFFER_READ_SIZE
+    if (slot < 0 || slot >= SIDETNFS_PROBE_MAX_RUNTIME_SLOTS)
+    {
+        return (uint16_t)full;
+    }
+    uint32_t rtt = s_slot_contexts[slot].rtt_ms;
+    if (rtt == 0)
+    {
+        return (uint16_t)full; // not measured: behave as before
+    }
+    // One READ round costs about one round trip, plus a few ms on the
+    // server and in lwIP.
+    uint32_t rounds = SIDETNFS_READ_COMMAND_BUDGET_MS / (rtt + 5u);
+    uint32_t bytes = rounds * SIDETNFS_TNFS_READ_CHUNK_MAX;
+    if (bytes < SIDETNFS_TNFS_READ_CHUNK_MAX)
+    {
+        bytes = SIDETNFS_TNFS_READ_CHUNK_MAX;
+    }
+    if (bytes > full)
+    {
+        bytes = full;
+    }
+    return (uint16_t)bytes;
 }
 
 // Mounts every
@@ -3060,19 +3159,10 @@ void sidetnfs_probe_mount_runtime_slots(void)
         // host_unresolvable, which the status layer reports as DNS FAILED.
         if (ensure_slot_address(0))
         {
-        sidetnfs_send_mount_probe();
-        bool slot0_ok = wait_for_mount_response(&s_slot_contexts[0].response_received);
-        // Clear the pending marker once
-        // this slot's bounded wait is over, whether it actually got a
-        // response or timed out -- an accepted response already cleared
-        // it to -1 inside tnfs_recv_callback(), so this is then a no-op;
-        // on a timeout it's the only place that clears it, so a late
-        // straggler arriving after we've moved on to the next slot can
-        // never be mistaken for the slot that's pending next.
-        if (s_mount_pending_slot == 0)
-        {
-            s_mount_pending_slot = -1;
-        }
+        // mount_slot_and_measure() also clears the pending marker once the
+        // bounded wait is over, so a late straggler arriving after we've
+        // moved on to the next slot can never be mistaken for that slot.
+        bool slot0_ok = mount_slot_and_measure(0);
         DPRINTF("TNFS mount slot 0 (%s) path=%s: %s rc=%u sid=0x%04X\n",
                 s_slot_contexts[0].host, s_slot_contexts[0].mount_path,
                 slot0_ok ? "responded" : "TIMED OUT",
@@ -3095,12 +3185,7 @@ void sidetnfs_probe_mount_runtime_slots(void)
         {
             continue; // unresolvable host -- reported as DNS FAILED, other slots unaffected
         }
-        send_slot_mount_request(slot);
-        bool ok = wait_for_mount_response(&s_slot_contexts[slot].response_received);
-        if (s_mount_pending_slot == slot)
-        {
-            s_mount_pending_slot = -1;
-        }
+        bool ok = mount_slot_and_measure(slot);
         DPRINTF("TNFS mount slot %d (%s) path=%s: %s rc=%u sid=0x%04X\n",
                 slot, s_slot_contexts[slot].host, s_slot_contexts[slot].mount_path,
                 ok ? "responded" : "TIMED OUT",
@@ -3131,12 +3216,7 @@ bool sidetnfs_probe_mount_slot(int slot)
     {
         return false; // unresolvable host -- slot's own host_unresolvable is already set
     }
-    send_slot_mount_request(slot);
-    bool ok = wait_for_mount_response(&s_slot_contexts[slot].response_received);
-    if (s_mount_pending_slot == slot)
-    {
-        s_mount_pending_slot = -1;
-    }
+    bool ok = mount_slot_and_measure(slot);
     DPRINTF("TNFS mount slot %d (%s) path=%s: %s rc=%u sid=0x%04X\n",
             slot, s_slot_contexts[slot].host, s_slot_contexts[slot].mount_path,
             ok ? "responded" : "TIMED OUT",
@@ -5028,8 +5108,11 @@ static bool fslisting_wait_for(const sidetnfs_slot_tnfs_context_t *ctx, uint8_t 
     s_fslisting_expected_port = ctx->port;
     s_fslisting_expected_sid = ctx->session_id;
 
+    // 200 ms on a LAN server, longer for a distant one -- see
+    // round_wait_ms_for_rtt(). Same 1 ms polling step as before.
+    uint32_t max_iter = round_wait_ms_for_rtt(ctx->rtt_ms) * 1000u / SIDETNFS_FS_WAIT_STEP_US;
     s_fslisting_waiting = true;
-    for (int i = 0; i < SIDETNFS_FS_WAIT_MAX_ITER; i++)
+    for (uint32_t i = 0; i < max_iter; i++)
     {
         cyw43_arch_poll();
         if (s_fslisting_resp.response_ready)

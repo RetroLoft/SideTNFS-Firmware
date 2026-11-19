@@ -97,6 +97,19 @@
 #define SHARED_VARIABLE_PROTOCOL_VERSION SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 5
 #define SHARED_VARIABLE_DRIVE_COUNT SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 6
 #define SHARED_VARIABLE_DRIVE_NUMBER_TABLE SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 7
+// Bytes the last GEMDRVEMUL_READ_BUFF_CALL was allowed to fill. GEMDRIVE's
+// Fread loop takes a reply shorter than this as end of file, and asks again
+// after a full one. 16384 (the whole buffer) except on a distant TNFS
+// server, see sidetnfs_probe_read_chunk_for_slot(). Index 32: the shared
+// variable block is 256 bytes (64 entries); +5..+15 hold the drive table.
+#define SHARED_VARIABLE_READ_CHUNK SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 16
+// Address of the RAM GEMDRIVE allocates at boot for its token wait code, so
+// it no longer copies that code into _dskbufp, which hard disk drivers use
+// (0 = not allocated: GEMDRIVE uses _dskbufp). GEMDRIVE sets it with
+// GEMDRVEMUL_SET_SHARED_VAR; this side clears it whenever a new Atari boot
+// starts (GEMDRVEMUL_PING, GEMDRVEMUL_FLOPPY_SAVE_VECTORS), because after a
+// warm reset the address belongs to the previous boot.
+#define SHARED_VARIABLE_CODE_BUFFER SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 17
 #define GEMDRVEMUL_SIDETNFS_MAX_RUNTIME_DRIVES (SIDETNFS_MAX_DRIVES + 1)
 #define SIDETNFS_GEMDOS_SLOT_PROTOCOL_VERSION 1
 
