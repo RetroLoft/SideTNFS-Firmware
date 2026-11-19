@@ -52,6 +52,12 @@
 #define LWIP_TCP 1
 #define LWIP_UDP 1
 #define LWIP_DNS 1
+// Resolve "name.local" by multicast DNS (224.0.0.251:5353), so a TNFS server
+// on the LAN can be given as e.g. "nas.local". lwIP asks from an ordinary
+// (non-5353) port, so responders such as Avahi, macOS and Windows answer
+// with a plain unicast reply ("legacy unicast", RFC 6762 6.7): no IGMP
+// group join is needed to receive it.
+#define LWIP_DNS_SUPPORT_MDNS_QUERIES 1
 #define LWIP_TCP_KEEPALIVE 0
 #define LWIP_NETIF_TX_SINGLE_PBUF 0
 #define DHCP_DOES_ARP_CHECK 0

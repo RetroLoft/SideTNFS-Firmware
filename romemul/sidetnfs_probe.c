@@ -2759,9 +2759,21 @@ static bool ensure_slot_address(int slot)
     sidetnfs_resolve_reset(&ctx->resolve, slot);
     sidetnfs_resolve_begin(&ctx->resolve, request_id);
 
+    // Host names are case-insensitive, but lwIP only sends a name ending in
+    // exactly ".local" by multicast DNS: ask in lower case, so "NAS.LOCAL"
+    // typed on the Atari works as well.
+    char host_lc[SIDETNFS_HOST_LEN];
+    size_t host_len = strnlen(ctx->host, sizeof(host_lc) - 1);
+    for (size_t i = 0; i < host_len; i++)
+    {
+        char c = ctx->host[i];
+        host_lc[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    host_lc[host_len] = '\0';
+
     ip_addr_t resolved;
     cyw43_arch_lwip_begin();
-    err_t err = dns_gethostbyname(ctx->host, &resolved, slot_dns_found_callback,
+    err_t err = dns_gethostbyname(host_lc, &resolved, slot_dns_found_callback,
                                    (void *)(uintptr_t)request_id);
     cyw43_arch_lwip_end();
 
