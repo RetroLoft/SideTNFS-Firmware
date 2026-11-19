@@ -4,6 +4,26 @@ All notable changes to SideTNFS are documented here. Older entries here describe
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-19
+
+### Added
+- TNFS servers can be given by their local network name, e.g. `myserver.local` (multicast DNS), besides an IP address or a regular DNS name.
+- Names on a TNFS server with small letters are now shown (in capitals, e.g. `ICDPro` as `ICDPRO`) and found again in their real spelling: opening, saving, renaming, deleting and folders all work. A new file is never created next to an existing one that differs only in case.
+- Names with characters like `ü` are converted between the Atari character set and the server's UTF-8. A name with a character the Atari doesn't have stays hidden, like a long name.
+- SIDETNFS.PRG v1.1.0: in a drive letter field a typed letter replaces the old one; a warning when a letter after P: is chosen (the original TOS only knows A: to P:).
+
+### Changed
+- The Settings disk now defaults to drive **I:** instead of S:, since the original TOS only knows A: to P:. Existing configurations keep their letter.
+- TNFS waits now adapt to the server's round trip: a distant server (for example the public RetroLoft server from New Zealand) works, while a server on the LAN behaves exactly as before. One Atari file read asks less of a distant server, so it fits in the time the Atari waits.
+- GEMDRIVE no longer uses the disk buffer `_dskbufp`, which hard disk drivers use for their own data: its wait code runs from its own memory and its temporary data goes on the stack.
+
+### Fixed
+- A hard disk window could show only its first file after a TNFS window had been opened (the desktop reuses one DTA for all windows).
+- Show info / free space on TNFS and SD drives returned garbage (Dfree copied its result from the wrong address).
+- Device handles such as CON: were taken for SideTNFS handles; Fdatime decided on the current drive instead of the file handle.
+- File handles start at 100 instead of 16384, which hung programs that keep a handle in a byte (1st Word Plus).
+- On a 68030, calls made in user mode read their arguments 2 bytes off.
+
 ## [1.1.0] - 2026-09-07
 
 ### Added

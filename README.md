@@ -69,7 +69,9 @@ A popular, actively maintained TNFS server implementation is **tnfsd**, part of 
 
 https://github.com/FujiNetWIFI/tnfsd
 
-It runs on Linux, macOS, and Windows, and only needs a folder on your computer to share — point it at that folder, start it, and then add it as a drive from **SIDETNFS.PRG** using your computer's IP address on your LAN. See that project's own documentation for installation and configuration details.
+It runs on Linux, macOS, and Windows, and only needs a folder on your computer to share — point it at that folder, start it, and then add it as a drive from **SIDETNFS.PRG** using your computer's IP address on your LAN, or its local network name such as `myserver.local` (mDNS). See that project's own documentation for installation and configuration details.
+
+The Atari only knows short **8.3** file names (up to 8 characters, a dot and up to 3 more). Names on the server that fit 8.3 are shown in capitals, whatever their case on the server, and characters such as `ü` are converted between the Atari character set and the server's UTF-8. Longer names, names with spaces, and names with characters the Atari doesn't have are not shown yet.
 
 ### A Note on TNFS Security
 
